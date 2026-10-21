@@ -20,7 +20,7 @@ from logdash.cache.store import CacheStore
 from logdash.ingest.normalize import EVENT_COLUMNS
 
 KEY = "overview"
-STAT_COLUMNS = tuple(c for c in EVENT_COLUMNS if c not in ("malformed", "hour"))
+STAT_COLUMNS = tuple(c for c in EVENT_COLUMNS if c not in ("malformed", "hour", "masked_hash"))
 APPROX_DISTINCT = frozenset({"ts", "request_id", "payload"})  # too many values for exact counts
 HEADLINE_COLUMNS = {"hosts": "host", "services": "program", "requests": "request_id"}
 

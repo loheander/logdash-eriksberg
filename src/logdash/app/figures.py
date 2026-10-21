@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from datetime import datetime
 
 import numpy as np
 import plotly.graph_objects as go
@@ -115,3 +116,13 @@ def choose_bin_seconds(start_s: float, end_s: float, max_points: int = MAX_POINT
         if math.ceil(span / size) <= max_points:
             return size
     return BIN_LADDER[-1]
+
+
+def fill_bins(
+    df: pl.DataFrame, lo: datetime, hi: datetime, bin_s: int, value: str = "n"
+) -> pl.DataFrame:
+    """Reindex a ``(bin, value)`` frame onto every bin of ``[lo, hi]``, filling gaps with 0."""
+    grid = pl.datetime_range(
+        lo.replace(microsecond=0), hi, interval=f"{bin_s}s", eager=True, time_unit="us"
+    ).to_frame("bin")
+    return grid.join(df, on="bin", how="left").with_columns(pl.col(value).fill_null(0)).sort("bin")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from logdash.ingest.masking import mask_sql
+
 LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "UNKNOWN")
 
 LEVEL_MAP: dict[str, str] = {
@@ -34,6 +36,7 @@ EVENT_COLUMNS = (
     "pid",
     "src_id",
     "payload",
+    "masked_hash",
     "malformed",
     "hour",
 )
@@ -98,6 +101,7 @@ def normalized_select(source: str) -> str:
     SELECT
         ts, level, level_raw, host, program, logger, python_module, request_id, user_id,
         tenant_id, user_domain, project_domain, pid, src_id, payload,
+        CASE WHEN payload IS NOT NULL THEN hash({mask_sql("payload")}) END AS masked_hash,
         (host IS NULL AND program IS NULL AND payload IS NULL) AS malformed,
         lpad(CAST(COALESCE(date_part('hour', ts), 0) AS VARCHAR), 2, '0') AS hour
     FROM t

@@ -14,6 +14,12 @@ DEFAULT_MEMORY_LIMIT = "8GB"
 DEFAULT_THREADS = 8
 DEFAULT_BURST_K = 6.0
 DEFAULT_GAP_MINUTES = 10
+DEFAULT_DRAIN_SIM_TH = 0.4
+DEFAULT_DRAIN_DEPTH = 4
+DEFAULT_TEMPLATE_TOP_K = 50
+DEFAULT_PARAM_SAMPLE = 2000
+DEFAULT_RARE_THRESHOLD = 5
+DEFAULT_NOVEL_FRACTION = 0.1
 
 
 @dataclass(frozen=True)
@@ -26,6 +32,12 @@ class Settings:
     threads: int = DEFAULT_THREADS
     burst_k: float = DEFAULT_BURST_K  # bursts: count above rolling median + k robust sigmas
     gap_minutes: int = DEFAULT_GAP_MINUTES  # a silent run at least this long is a gap
+    drain_sim_th: float = DEFAULT_DRAIN_SIM_TH  # Drain3 similarity threshold
+    drain_depth: int = DEFAULT_DRAIN_DEPTH  # Drain3 parse tree depth
+    template_top_k: int = DEFAULT_TEMPLATE_TOP_K  # templates with parameter extraction
+    param_sample: int = DEFAULT_PARAM_SAMPLE  # raw payloads sampled per top template
+    rare_threshold: int = DEFAULT_RARE_THRESHOLD  # templates with at most this many events are rare
+    novel_fraction: float = DEFAULT_NOVEL_FRACTION  # first seen in the last fraction of the span
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -37,6 +49,12 @@ class Settings:
             threads=int(env.get("LOGDASH_THREADS", DEFAULT_THREADS)),
             burst_k=float(env.get("LOGDASH_BURST_K", DEFAULT_BURST_K)),
             gap_minutes=int(env.get("LOGDASH_GAP_MINUTES", DEFAULT_GAP_MINUTES)),
+            drain_sim_th=float(env.get("LOGDASH_DRAIN_SIM_TH", DEFAULT_DRAIN_SIM_TH)),
+            drain_depth=int(env.get("LOGDASH_DRAIN_DEPTH", DEFAULT_DRAIN_DEPTH)),
+            template_top_k=int(env.get("LOGDASH_TEMPLATE_TOP_K", DEFAULT_TEMPLATE_TOP_K)),
+            param_sample=int(env.get("LOGDASH_PARAM_SAMPLE", DEFAULT_PARAM_SAMPLE)),
+            rare_threshold=int(env.get("LOGDASH_RARE_THRESHOLD", DEFAULT_RARE_THRESHOLD)),
+            novel_fraction=float(env.get("LOGDASH_NOVEL_FRACTION", DEFAULT_NOVEL_FRACTION)),
         )
 
     def with_overrides(self, **overrides: Any) -> Settings:
