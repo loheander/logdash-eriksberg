@@ -314,6 +314,20 @@ Status: **Phase 1 done** (steps 1 to 9).
   the limit in the per-service 1-minute log1p fit; in the per-host grid the spike is absorbed by a
   retained component, so it is not above the limit there. A synthetic 230k x 281 fit takes about 4 s;
   the slow benchmark has not been run on the real cache yet.
+- Module 6 framework (issue 3) done: `detectors/base.py` (the `Detector` protocol, a registry and
+  score normalisation), `analyses/anomalies.py` (stage and page) and one real detector,
+  `detectors/structural_pca.py`, the PCA residual part of the structural type (issue 6 adds the
+  Isolation Forest beside it). Every module in `detectors/` is imported, so a detector is one new file
+  and the stage depends on what its detectors depend on. `cache/anomalies/anomalies.parquet` holds
+  `detector, type, bin, window_s, kind, entity, template_id, raw, score, evidence`; the score is the
+  raw value normalised per detector to `1 - threshold / (2 raw)` (0.5 at the detector's threshold, 1
+  far above), at most 20,000 rows per detector. On the real data the PCA detector finds 1,676 service
+  windows and 71,745 host windows above the limit (the Gaussian limit flags 31 % of host windows) and
+  keeps 5,000 per host grouping, 6,676 rows in 0.2 s. The page (timeline by type, type filter, table
+  sorted by score, time, type or entity, explorer links) answers in under 60 ms warm (at most 134 ms on a first request) on the real
+  cache. The test of injected anomalies is parametrised over expected types: the volume,
+  novel and sequence cases are skipped until issues 4, 7 and 8 register detectors, contextual and
+  severity wait for synthetic injections (issues 5 and 9).
 
 ## 9. Open decisions
 
