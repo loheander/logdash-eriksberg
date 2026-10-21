@@ -333,7 +333,7 @@ Status: **Phase 1 done** (steps 1 to 9).
   and the page answers in at most 61 ms (cold or warm) on the real cache. The test of
   injected anomalies checks type and rank (the PCA spike and the novel template, bounded to ten
   minutes after its first line, are in the top 10 and 15); the sequence case
-  passes since issue 8, severity waits for a synthetic injection (issue 9).
+  passes since issue 8, severity since issue 9.
   A stub detector of a new type on a new kind is tested end to end.
 - Volume detector (issue 4) done: `detectors/volume.py` uses `find_bursts`, `find_drops` and
   `find_gaps` of `analyses/temporal.py` on `rate_60` (spikes and drops per service and host) and
@@ -418,6 +418,20 @@ Status: **Phase 1 done** (steps 1 to 9).
   peak 2.8 GB; the top row is `GET -> returned with HTTP` seen 51 of 190,285 times
   (P = 0.0003). The combined top 100 holds 8 sequence rows (25 PCA, 25 forest, 16 volume, 9 contextual, 9 rare,
   8 novel); the first is at position 12.
+- Severity detector (issue 9) done: `detectors/severity.py`, kind `service` only (`rate_60` is the one table with a
+  level). WARNING and ERROR+CRITICAL series per service through `find_bursts` (new `min_excess` parameter, default
+  unchanged). One score scale: the tail `P(X >= peak)` as a Gaussian-equivalent z, Poisson at rate `max(median, mean
+  outside incidents, 0.1)` or negative binomial when the rolling MAD exceeds `sqrt(rate)`; p printed as `P≈1e-412`
+  below float range. Floors: none on the peak (the burst gate needs 7 lines at zero baseline), excess 300 for WARNING
+  (volume default) and 30 for ERROR (chosen, documented as binding). Periodic episodes are merged first with the volume
+  detector's `merge_periodic` (demoted to the threshold); the rest are merged into one incident per service and level
+  when less than 60 minutes apart, scored against the baseline with the incident interpolated out. The shared fleet
+  filter is not used (the meta records the most distinct services starting a burst in one minute). Synthetic injection:
+  `error_rows=600` ERROR lines of neutron-l3-agent on the context host in two minutes at 80 % of the span (own generator,
+  seed + 4000; a host and service no other injection uses, because a large injection raises that host's own 99.5 %
+  structural level and hides another injection: README "Known limitations"). The strict xfail is gone.
+  Real data: 5 incidents (barbican-api 7 bursts in one row), 0.1 s; the combined top 100 holds 5 severity rows (47
+  structural, 16 volume, 16 novel and rare, 8 contextual, 8 sequence).
 - Module 7 (hosts and services, issue 10) done: `analyses/hosts.py` from `templates/template_counts_host.parquet`
   and one aggregate over `events` (service x host lines). A host's profile is its template mix over the whole
   span, compared as `sqrt(share)` (Hellinger). Display clusters: k-means (fixed seed) chooses k in 2..10 by

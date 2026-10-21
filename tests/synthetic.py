@@ -98,6 +98,15 @@ REQUEST_STEPS = [
 OUT_OF_ORDER_STEPS = (1, 0)
 REQUEST_HOST = HOSTS[1]
 CONTEXT_HOST = HOSTS[5]
+# The ERROR burst gets a host and a service that no other injection uses. A large injection on an
+# entity raises that entity's own 99.5 % structural level (``_episodes.entity_level``), so a
+# burst of 600 lines on the host of another injection (earlier: haproxy, whose windows the novel
+# template needs, then libvirt on HOSTS[3], which also hosts the rare template) hides that
+# injection from the structural detectors. This is a known limit of per-entity levels on real data
+# too (README, "Known limitations"); the injections are kept on separate entities.
+ERROR_HOST = HOSTS[5]
+ERROR_SERVICE = SERVICES[1]  # neutron-l3-agent: hosts no other injection (its WARNING is periodic)
+ERROR_TEMPLATE = "internal error: connection {n} closed unexpectedly by peer {ip}"
 CONTEXT_TEMPLATE = 0  # in the window the host logs only this template (of the first service)
 
 
@@ -110,6 +119,9 @@ class SyntheticSpec:
     spike_rows: int = 2_500
     n_requests: int = 150
     n_swapped: int = 5
+    # ERROR lines of one service on one host in a two-minute window (0: none), drawn from a
+    # generator of their own so the rest of the data is unchanged
+    error_rows: int = 600
     # Host-specific template-mix deviation (0: none). It needs a busy host (extra rows, enough
     # lines for 1-minute windows) and shifts the structural fits of the shared data, so only the
     # contextual tests ask for it (``tests/unit/test_contextual.py``, a dataset of their own).
@@ -141,6 +153,9 @@ class GroundTruth:
     context_host: str = CONTEXT_HOST
     context_start: datetime = START
     context_end: datetime = START
+    error_start: datetime = START
+    error_end: datetime = START
+    error_service: str = ERROR_SERVICE[0]
 
 
 def _fill(rng: random.Random, template: str) -> str:
@@ -250,6 +265,16 @@ def generate_rows(spec: SyntheticSpec) -> tuple[list[dict], GroundTruth]:
     for i in range(2):
         ts = truth.rare_first_seen + timedelta(seconds=10 * i)
         rows.append(_row(ts, rare, HOSTS[3], SERVICES[3], _fill(rare, RARE_TEMPLATE)))
+
+    # A burst of ERROR lines from one service (the baseline ERROR share is about 1 %).
+    err = random.Random(spec.seed + 4000)
+    truth.error_start = START + (end - START) * 0.80
+    truth.error_end = truth.error_start + timedelta(minutes=2)
+    for _ in range(spec.error_rows):
+        ts = _random_time(err, truth.error_start, truth.error_end)
+        row = _row(ts, err, ERROR_HOST, ERROR_SERVICE, _fill(err, ERROR_TEMPLATE))
+        row["log_level"] = "ERROR"
+        rows.append(row)
 
     request_service = ("nova-api", "openstack.nova", "nova.api.openstack", [])
     for r in range(spec.n_requests):

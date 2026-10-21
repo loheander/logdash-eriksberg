@@ -223,8 +223,14 @@ def rolling_baseline(
     return median, scale
 
 
-def find_bursts(x: np.ndarray, k: float, min_peak: int = MIN_BURST) -> list[dict[str, Any]]:
-    """Runs of bins above rolling median + k robust sigmas; one dict per run."""
+def find_bursts(
+    x: np.ndarray, k: float, min_peak: int = MIN_BURST, min_excess: float = MIN_EXCESS
+) -> list[dict[str, Any]]:
+    """Runs of bins above rolling median + k robust sigmas; one dict per run.
+
+    A run needs ``min_peak`` events in its peak bin and ``min_excess`` events above its baseline
+    over the whole run (a rare series, such as ERROR lines, asks for less than the default).
+    """
     median, scale = rolling_baseline(x)
     flagged = (x > median + k * scale) & (x >= min_peak)
     if MERGE_BINS:
@@ -233,7 +239,7 @@ def find_bursts(x: np.ndarray, k: float, min_peak: int = MIN_BURST) -> list[dict
     for first, last in runs(flagged):
         peak = first + int(np.argmax(x[first : last + 1]))
         excess = float(x[first : last + 1].sum() - median[first : last + 1].sum())
-        if excess < MIN_EXCESS:
+        if excess < min_excess:
             continue
         found.append(
             {
