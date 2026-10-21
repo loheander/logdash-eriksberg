@@ -785,7 +785,10 @@ def test_novel_and_rare_rows_do_not_overlap(stage, synthetic):
     assert not rare["evidence"].str.contains("bgp").any()  # 20 events: not rare
     assert not novel["evidence"].str.contains("Watchdog").any()  # mid-run: not novel
     cutoff = truth.end - (truth.end - truth.start) * Settings().novel_fraction
-    assert (novel["bin"] > ft.floor_window(naive(cutoff), 60)).all()
+    assert (novel["bin"] >= ft.floor_window(naive(cutoff), 60)).all()
+    # no (template, minute, service) is both a novel and a rare row (exact keys)
+    keys = ["template_id", "bin", "entity"]
+    assert novel.join(rare, on=keys, how="inner").is_empty()
     assert rare["raw"].min() >= 1.0
 
 

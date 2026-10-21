@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from logdash.config import Settings
 
 
@@ -36,3 +38,11 @@ def test_data_files_sorted(tmp_path):
 
 def test_fingerprint_params_ignore_resources():
     assert Settings(threads=1).fingerprint_params() == Settings(threads=9).fingerprint_params()
+
+
+@pytest.mark.parametrize("bad", ["0", "1", "-0.1", "1.5"])
+def test_novel_fraction_must_be_between_zero_and_one(bad):
+    with pytest.raises(ValueError, match="novel_fraction must be between 0 and 1"):
+        Settings.from_env({"LOGDASH_NOVEL_FRACTION": bad})
+    with pytest.raises(ValueError, match="novel_fraction"):
+        Settings().with_overrides(novel_fraction=float(bad))

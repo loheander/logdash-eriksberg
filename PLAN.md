@@ -389,12 +389,12 @@ Status: **Phase 1 done** (steps 1 to 9).
   (the busiest service of the template's first minute, or of each window), reading `templates.parquet`
   and `template_counts.parquet`. `novel_template`: one row per template first seen in the last
   `novel_fraction` of the span (the templates page's rule), raw `-b * log2(1 - u)` bits with `b` the
-  template's active minutes and `u` its first line's position in the span (the chance a steady template
+  template's runs of active minutes (gap over 10 minutes starts a new run) and `u` its first line's position in the span (the chance a steady template
   starts that late is `(1 - u) ** b`); threshold `log2(1 / novel_fraction)` is the gate for `b = 1`;
   evidence has the text, `p` and how many other templates appeared within 10 minutes (an operator episode
   reads as one story). `rare_template`: one row per (template, minute, service) of a template with at most
   `rare_threshold` events, raw `(rare_threshold + 0.5) / count`, threshold 1, the first window of a novel
-  template left out. The synthetic data gained a two-line rare template (`RARE_TEMPLATE`, mid-run, from its
+  template left out for the service the novel row names; `novel_fraction` is validated (0 < f < 1) in `Settings`. The synthetic data gained a two-line rare template (`RARE_TEMPLATE`, mid-run, from its
   own generator so the rest of the data is unchanged); the novel (rank under 10) and rare (under 15) cases
   replace the strict xfail. Hand-made tables test the boundaries, the burst-versus-spread score, settings
   overrides, empty input and a template without counts. Real data: 15 novel templates (13 in 22:03 to

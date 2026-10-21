@@ -186,7 +186,7 @@ follows the data (type filter, timeline, table, explorer links).
   (start and end only for kinds whose lines stay inside the window).
 
 `novel.py` has two detectors of type `novel` (kind `service`): `novel_template` (a template first seen in the
-last `LOGDASH_NOVEL_FRACTION` of the span, raw `-b * log2(1 - u)` bits with `b` its active minutes and `u` the
+last `LOGDASH_NOVEL_FRACTION` of the span, raw `-b * log2(1 - u)` bits with `b` its runs of active minutes (a gap over 10 minutes starts a new run) and `u` the
 position of its first line; threshold `log2(1 / fraction)`) and `rare_template` (a (template, minute, service)
 window of a template with at most `LOGDASH_RARE_THRESHOLD` events; raw `(threshold + 0.5) / count`, threshold 1).
 Real data: 15 novel rows (an operator episode at 22:03 to 22:10 and two at 23:54) and 166 rare ones.

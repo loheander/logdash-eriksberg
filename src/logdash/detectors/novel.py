@@ -5,17 +5,19 @@ template counts of the templates stage and has two detectors.
 
 ``novel_template``: one row per template first seen in the last ``novel_fraction`` of the span
 (the rule of the novel list on the templates page), at its first minute. A steady template with
-``b`` active minutes has its first event after the fraction ``u`` of the span with probability
-``(1 - u) ** b``, so the raw score is ``-b * log2(1 - u)`` bits. ``b`` counts distinct minutes,
-not events, so a one-minute burst of many lines is not inflated; a template that was active for
-many minutes and still appeared only late is stronger evidence than one that fired once. The
-threshold ``log2(1 / novel_fraction)`` is exactly the gate for ``b = 1``.
+``b`` independent active periods has its first event after the fraction ``u`` of the span with
+probability ``(1 - u) ** b``, so the raw score is ``-b * log2(1 - u)`` bits. ``b`` counts runs of
+active minutes (a gap of more than ``CLUSTER_MINUTES`` starts a new run), not minutes or events:
+consecutive minutes are one operation, not independent draws, so a burst is not inflated; a
+template that came back in several separate episodes and still appeared only late is stronger
+evidence than one that fired once. The threshold ``log2(1 / novel_fraction)`` is exactly the gate
+for ``b = 1``.
 
 ``rare_template``: one row per (template, minute, service) of a template with at most
 ``rare_threshold`` events in all (the rare list of the page). The raw score is
 ``(rare_threshold + 0.5) / count``, which is at least 1 exactly for the rare templates (no tuned
 constant) and larger for the rarer ones. The first window of a template that ``novel_template``
-reports is left out, so one event never gives two rows.
+reports is left out for the service that row names, so one event never gives two rows.
 
 The entity of both is the service, so the global service filter and the explorer link apply.
 Timestamps are UTC, naive, as in the template tables.
@@ -67,9 +69,19 @@ def novel_ids(templates: pl.DataFrame, lo: datetime, hi: datetime, fraction: flo
 
 
 def first_windows(counts: pl.DataFrame) -> pl.DataFrame:
-    """Per template: first minute, active minutes and the service busiest in the first minute."""
-    first = counts.group_by("template_id").agg(
-        bin=pl.col("bin").min(), minutes=pl.col("bin").n_unique()
+    """Per template: first minute, active minutes and runs, busiest service in the first minute."""
+    gap = timedelta(minutes=CLUSTER_MINUTES)
+    first = (
+        counts.select("template_id", "bin")
+        .unique()
+        .sort("template_id", "bin")
+        .group_by("template_id", maintain_order=True)
+        .agg(
+            bin=pl.col("bin").min(),
+            minutes=pl.len(),
+            runs=1 + (pl.col("bin").diff() > gap).sum(),
+        )
+        .with_columns(pl.col("runs").cast(pl.Int64))
     )
     busiest = (
         counts.join(first.select("template_id", "bin"), on=["template_id", "bin"])
@@ -94,8 +106,8 @@ def novel_rows(
     rows = []
     for r in joined.iter_rows(named=True):
         others = sum(1 for f in firsts if abs(f - r["first_seen"]) <= near) - 1
-        p = (1 - r["u"]) ** r["minutes"]
-        raw = -r["minutes"] * math.log2(1 - r["u"])
+        p = (1 - r["u"]) ** r["runs"]
+        raw = -r["runs"] * math.log2(1 - r["u"])
         rows.append(
             {
                 "bin": r["bin"],
@@ -106,8 +118,10 @@ def novel_rows(
                 "evidence": (
                     f"novel template, first seen {r['first_seen']:%H:%M:%S} "
                     f"({r['u']:.1%} into the span): {short(r['template'], 120)}; "
-                    f"{r['count']} events in {r['minutes']} min, p = {p:.2g} for a steady "
-                    f"template; {others} other new templates within {CLUSTER_MINUTES} min"
+                    f"{r['count']} events in {r['minutes']} min ({r['runs']} "
+                    f"{'run' if r['runs'] == 1 else 'runs'}), p = {p:.2g} if a steady template "
+                    f"started its runs independently; {others} other new templates "
+                    f"within {CLUSTER_MINUTES} min"
                 ),
                 "template_id": r["template_id"],
             }
@@ -118,16 +132,16 @@ def novel_rows(
 def rare_rows(
     templates: pl.DataFrame, counts: pl.DataFrame, threshold: int, novel: pl.DataFrame
 ) -> pl.DataFrame:
+    """``novel``: the ``novel_rows`` output, whose (template, minute, service) rows are left out."""
     rare = rare_templates(templates, threshold)
     if rare.is_empty():
         return pl.DataFrame(schema=SCHEMA)
-    first = counts.group_by("template_id").agg(first_bin=pl.col("bin").min())
-    skip = novel.select("template_id").join(first, on="template_id").with_columns(skip=True)
+    skip = novel.select("template_id", "bin", program=pl.col("entity")).with_columns(skip=True)
     found = (
         rare.select("template_id", "template", "count")
         .join(counts, on="template_id")
-        .join(skip, on="template_id", how="left")
-        .filter(~(pl.col("skip").fill_null(False) & (pl.col("bin") == pl.col("first_bin"))))
+        .join(skip, on=["template_id", "bin", "program"], how="left")
+        .filter(pl.col("skip").is_null())
     )
     return found.select(
         pl.col("bin"),
@@ -150,7 +164,7 @@ class NovelTemplate:
     key = "novel_template"
     type = "novel"
     title = "Novel template"
-    version = "1"
+    version = "2"
     setting_names: tuple[str, ...] = ("novel_fraction",)
     depends_on: tuple[str, ...] = (tpl.KEY,)
     threshold = math.log2(1 / DEFAULT_NOVEL_FRACTION)
@@ -172,7 +186,7 @@ class RareTemplate:
     key = "rare_template"
     type = "novel"
     title = "Rare template"
-    version = "1"
+    version = "2"
     setting_names: tuple[str, ...] = ("rare_threshold", "novel_fraction")
     depends_on: tuple[str, ...] = (tpl.KEY,)
     threshold = 1.0  # raw = (rare_threshold + 0.5) / count: at least 1 for a rare template
@@ -181,7 +195,7 @@ class RareTemplate:
         templates = ctx.store.read_parquet(tpl.KEY, "templates.parquet")
         counts = ctx.store.read_parquet(tpl.KEY, "template_counts.parquet")
         lo, hi = read_span(ctx)
-        novel = novel_ids(templates, lo, hi, ctx.settings.novel_fraction)
+        novel = novel_rows(templates, counts, lo, hi, ctx.settings.novel_fraction)
         rows = rare_rows(templates, counts, ctx.settings.rare_threshold, novel)
         ctx.log(f"rare_template: {rows.height} windows")
         return rows
