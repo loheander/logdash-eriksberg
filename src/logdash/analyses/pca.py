@@ -7,7 +7,7 @@ non-empty windows of the whole span, and writes for each fit:
 
 - ``fit_<group>_<s>_<scaling>.json``: explained variance ratios, ``k`` (components that keep
   95 % of the variance), the SPE control limit, the template ids and the first loadings;
-- ``scores_<group>_<s>_<scaling>.parquet``: ``row, bin, entity, pc1..pc3, spe, limit`` per
+- ``scores_<group>_<s>_<scaling>.parquet``: ``row, bin, entity, pc1..pc3, spe, limit, ratio`` per
   window, rows as in the features index (the input of the anomaly module);
 - ``residuals_<group>_<s>_<scaling>.parquet``: ``row, rank, template_id, residual, share`` with
   the templates that contribute most to the residual of each window (the evidence for the
@@ -15,7 +15,11 @@ non-empty windows of the whole span, and writes for each fit:
 
 The SPE (squared prediction error, Q-statistic) of a window is the squared norm of what the
 first ``k`` components do not explain (Xu et al., 2009); its control limit is the
-Jackson-Mudholkar approximation at confidence ``1 - ALPHA`` from the residual eigenvalues. The
+Jackson-Mudholkar approximation at confidence ``1 - ALPHA`` from the residual eigenvalues. That
+limit assumes Gaussian data: the windows are heavy-tailed counts that include the anomalies, so
+``ALPHA`` is not the false-alarm rate and the share above the limit is typically far larger.
+Treat the limit as a reference line and rank windows by ``ratio = spe / limit`` (``load_spe``).
+Without residual variance the limit is infinite and no window is above it. The
 page only reads these files: it never fits, and it samples the plotted windows. Time range and
 entity filter select windows, and loads are memoised per file version.
 """
@@ -59,7 +63,9 @@ KEY = "pca"
 UPSTREAM = "features"
 VARIANCE_TARGET = 0.95  # share of the variance the retained components keep
 MAX_K = 30  # most components kept for the SPE
-ALPHA = 0.001  # SPE control limit confidence is 1 - ALPHA
+ALPHA = 0.001  # Gaussian-theory SPE limit quantile 1 - ALPHA, not a false-alarm rate
+RESIDUAL_TOLERANCE = 1e-9  # residual variance below this share of the total counts as none
+MAX_FLAGGED = 0.25  # share of windows above the limit that is logged as a warning
 N_PROJ = 3  # stored scores per window
 MAX_LOADINGS = 10  # stored components with their loadings
 MAX_SCREE = 30  # components in the scree plot
@@ -91,11 +97,12 @@ def spe_limit(eigenvalues: np.ndarray, alpha: float = ALPHA) -> float:
     With ``theta_i`` the sums of the ``i``-th powers of the eigenvalues not kept and ``c`` the
     normal quantile at ``1 - alpha``, the limit is
     ``theta1 * (c sqrt(2 theta2 h0^2) / theta1 + 1 + theta2 h0 (h0 - 1) / theta1^2) ^ (1 / h0)``
-    with ``h0 = 1 - 2 theta1 theta3 / (3 theta2^2)``. Without residual variance the limit is 0.
+    with ``h0 = 1 - 2 theta1 theta3 / (3 theta2^2)``. It assumes Gaussian data. Without residual
+    variance the limit is infinite, so that rounding noise in the SPE never exceeds it.
     """
     theta1, theta2, theta3 = (float(np.sum(eigenvalues**i)) for i in (1, 2, 3))
     if theta1 <= 0 or theta2 <= 0:
-        return 0.0
+        return math.inf
     c = NormalDist().inv_cdf(1 - alpha)
     h0 = 1 - 2 * theta1 * theta3 / (3 * theta2**2)
     if abs(h0) < 1e-6:  # the exponent blows up; use the normal approximation of the SPE
@@ -141,7 +148,7 @@ def fit_model(scaled: sparse.csr_matrix, template_ids: np.ndarray) -> Model:
         return Model(
             np.zeros(0),
             0,
-            0.0,
+            math.inf,
             np.zeros((0, n_cols)),
             np.zeros((n_rows, N_PROJ)),
             np.zeros(n_rows),
@@ -153,7 +160,9 @@ def fit_model(scaled: sparse.csr_matrix, template_ids: np.ndarray) -> Model:
     explained = np.nan_to_num(pca.explained_variance_ / total) if total > 0 else np.zeros(0)
     k = components_kept(explained) if total > 0 else 1
     kept = pca.components_[:k]
-    limit = spe_limit(np.maximum(pca.explained_variance_[k:], 0.0))
+    residual_variance = np.maximum(pca.explained_variance_[k:], 0.0)
+    no_residual = residual_variance.sum() <= RESIDUAL_TOLERANCE * max(total, 0.0)
+    limit = math.inf if no_residual else spe_limit(residual_variance)
     scores = np.zeros((n_rows, N_PROJ))
     spe = np.zeros(n_rows)
     blocks: list[pl.DataFrame] = []
@@ -205,6 +214,7 @@ def compute_all(
             matrix = features.load_matrix(store, group, window_s)
             for scaling in SCALINGS:
                 scaled = features.load_scaled(store, group, window_s, scaling)
+                assert scaled.shape[0] == len(matrix.bins), "scaled matrix and index differ"
                 model = fit_model(scaled, matrix.template_ids)
                 write_fit(out_dir, group, window_s, scaling, matrix, model)
                 flagged = int((model.spe > model.limit).sum())
@@ -213,8 +223,15 @@ def compute_all(
                     f"{group} x {window_s // 60} min, {scaling}: k={model.k}, "
                     f"{flagged} of {len(model.spe)} windows above the SPE limit"
                 )
+                if flagged > MAX_FLAGGED * len(model.spe):
+                    log("  warning: the Gaussian limit flags many windows; rank by spe / limit")
     features.clear_caches()  # the matrices are large; the page loads what it needs
     return rows
+
+
+def ratios(spe: np.ndarray, limit: float) -> np.ndarray:
+    """SPE relative to the control limit; zero when there is no limit (no residual variance)."""
+    return spe / limit if math.isfinite(limit) and limit > 0 else np.zeros(len(spe))
 
 
 def write_fit(
@@ -234,6 +251,7 @@ def write_fit(
             **{f"pc{i + 1}": model.scores[:, i] for i in range(N_PROJ)},
             "spe": model.spe,
             "limit": np.full(len(model.spe), model.limit),
+            "ratio": ratios(model.spe, model.limit),
         },
         schema_overrides={"entity": pl.String, "bin": pl.Datetime("us")},
     )
@@ -244,7 +262,7 @@ def write_fit(
     description = {
         "n_windows": len(model.spe),
         "k": model.k,
-        "limit": model.limit,
+        "limit": model.limit if math.isfinite(model.limit) else None,
         "alpha": ALPHA,
         "explained": model.explained[:MAX_SCREE].tolist(),
         "template_ids": [int(i) for i in matrix.template_ids],
@@ -308,10 +326,12 @@ def load_fit(
             entities,
             scores.select(f"pc{i + 1}" for i in range(N_PROJ)).to_numpy(),
             scores["spe"].to_numpy(),
-            float(info["limit"]),
+            math.inf if info["limit"] is None else float(info["limit"]),
             int(info["k"]),
             np.asarray(info["explained"], dtype=np.float64),
-            np.asarray(info["loadings"], dtype=np.float64).reshape(-1, len(info["template_ids"])),
+            np.asarray(info["loadings"], dtype=np.float64).reshape(
+                len(info["loadings"]), len(info["template_ids"])
+            ),
             np.asarray(info["template_ids"], dtype=np.int64),
             store.read_parquet(KEY, fit_name("residuals", group, window_s, scaling)),
             window_s,
@@ -326,9 +346,13 @@ def load_spe(
     window_s: int = DEFAULT_WINDOW,
     scaling: str = DEFAULT_SCALING,
 ) -> pl.DataFrame:
-    """``row, bin, entity, spe, limit`` of one grid (what the anomaly module reads)."""
+    """``row, bin, entity, spe, limit, ratio`` of one grid (what the anomaly module reads).
+
+    ``ratio = spe / limit`` is the comparable score; the limit is Gaussian theory, so prefer the
+    ratio or its rank over ``spe > limit``.
+    """
     scores = store.read_parquet(KEY, fit_name("scores", group, window_s, scaling))
-    return scores.select("row", "bin", "entity", "spe", "limit")
+    return scores.select("row", "bin", "entity", "spe", "limit", "ratio")
 
 
 def load_residuals(
@@ -367,7 +391,7 @@ def sample_rows(rows: np.ndarray, spe: np.ndarray, n: int) -> np.ndarray:
 
 def score_ratio(fit: Fit, rows: np.ndarray) -> np.ndarray:
     """SPE relative to the control limit (above 1 is above the limit)."""
-    return fit.spe[rows] / fit.limit if fit.limit > 0 else np.zeros(len(rows))
+    return ratios(fit.spe[rows], fit.limit)
 
 
 def label(template_id: int) -> str:
@@ -431,7 +455,8 @@ def spe_figure(fit: Fit, rows: np.ndarray, scheme: str | None) -> go.Figure:
                 hovertemplate="%{text}<extra></extra>",
             )
         )  # fmt: skip
-    fig.add_hline(y=fit.limit, line_dash="dash", line_color=figures.PALETTE[1])
+    if math.isfinite(fit.limit):
+        fig.add_hline(y=fit.limit, line_dash="dash", line_color=figures.PALETTE[1])
     fig.update_yaxes(title="SPE", type="log")
     flagged = int((fit.spe[rows] > fit.limit).sum())
     figures.add_note(fig, f"{flagged} of {len(rows)} windows above the limit {fit.limit:.3g}")
@@ -569,8 +594,6 @@ def unavailable(store: CacheStore, group: str, window_s: int, scaling: str) -> s
         UPSTREAM, "meta.json"
     ):
         return "The PCA stage is not built; run `logdash build`."
-    if store.read_json(KEY, fit_name("fit", group, window_s, scaling))["n_windows"] < 2:
-        return "Too few windows to fit a PCA."
     return None
 
 
@@ -590,6 +613,10 @@ def draw_pca(
         empty = figures.empty_figure(problem, scheme)
         return empty, empty, empty, empty, empty, dmc.Text(problem), ""
     fit = load_fit(store, group, window_s, scaling)
+    if len(fit.spe) < 2:
+        message = "Too few windows to fit a PCA."
+        empty = figures.empty_figure(message, scheme)
+        return empty, empty, empty, empty, empty, dmc.Text(message), ""
     lo, hi = features.visible_range(store, filters, window_s)
     rows = select_windows(fit, lo, hi, features.entity_filter(filters, group))
     texts = features.template_texts(store)
@@ -671,7 +698,12 @@ class Pca:
             description=(
                 "PCA of the window x template matrix, fitted at build time over all windows. The "
                 "time range and the service or host filter select the plotted windows; the "
-                "SPE control limit is fixed per fit. Large selections are sampled."
+                "SPE control limit is fixed per fit and comes from Gaussian theory, so read it "
+                "as a reference line, not a false-alarm rate. The SPE depends on the "
+                "components kept (95 % of the variance): a pattern that a kept component "
+                "captures, such as a "
+                "volume spike in the per-host fit, is not above the limit. Large selections are "
+                "sampled."
             ),
         )
 

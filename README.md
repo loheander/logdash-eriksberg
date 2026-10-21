@@ -75,9 +75,9 @@ Screenshots (`docs/screenshots/`):
 The `pca` stage keeps, for every grouping (`service`, `host`), window (60, 300, 900 s) and
 scaling (`log1p`, `tfidf`), the per-window SPE (squared norm of what the first `k`
 components, keeping 95 % of the variance, do not explain) with its Jackson-Mudholkar control
-limit at 99.9 %, and the three templates that contribute most to each window's residual.
+limit (Gaussian theory at 99.9 %: a reference line, not a false-alarm rate), and the three templates that contribute most to each window's residual.
 Downstream modules read them with `pca.load_spe(store, group, window_s, scaling)`
-(`row, bin, entity, spe, limit`) and `pca.load_residuals(...)`
+(`row, bin, entity, spe, limit, ratio`; rank by `ratio = spe / limit` rather than the flag) and `pca.load_residuals(...)`
 (`row, rank, template_id, residual, share`); `row` is the row of the features index.
 
 ## Adding an analysis

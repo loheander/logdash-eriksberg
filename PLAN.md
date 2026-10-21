@@ -304,10 +304,11 @@ Status: **Phase 1 done** (steps 1 to 9).
   window and scaling (12 fits) scikit-learn PCA (covariance eigendecomposition on the sparse matrix) is
   fitted over the non-empty windows of the whole span at build time. The stage stores per fit
   `fit_*.json` (explained variance, `k` for 95 %, SPE control limit, loadings of the first 10
-  components), `scores_*.parquet` (`row, bin, entity, pc1..pc3, spe, limit`) and `residuals_*.parquet`
+  components), `scores_*.parquet` (`row, bin, entity, pc1..pc3, spe, limit, ratio`) and `residuals_*.parquet`
   (top 3 templates per window by residual, signed, with share of the SPE) for the anomaly module and the
   structural detector (`load_spe`, `load_residuals`). The SPE control limit is Jackson-Mudholkar at
-  99.9 %. The page reads these files only (memoised per file version), applies the time range and
+  99.9 % under Gaussian theory (a reference line; downstream detectors use `ratio = spe / limit`); it is
+  infinite when the residual space has no variance. The page reads these files only (memoised per file version), applies the time range and
   service or host filter by selecting windows and samples at most 5,000 (2D) or 3,000 (3D) points, always
   keeping the highest-SPE quarter. On the synthetic data the volume spike and the novel template exceed
   the limit in the per-service 1-minute log1p fit; in the per-host grid the spike is absorbed by a

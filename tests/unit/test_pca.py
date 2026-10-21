@@ -109,13 +109,16 @@ def test_spe_limit_has_the_requested_false_alarm_rate():
     kept = pca.components_[:k]
     centered = data[50_000:] - pca.mean_
     spe = ((centered - centered @ kept.T @ kept) ** 2).sum(axis=1)
-    assert (spe > limit).mean() == pytest.approx(pc.ALPHA, abs=pc.ALPHA)
+    assert 0.0005 < (spe > limit).mean() < 0.002
+    loose = pc.spe_limit(pca.explained_variance_[k:], 0.05)
+    assert loose < limit
+    assert (spe > loose).mean() == pytest.approx(0.05, abs=0.005)
     assert pc.spe_limit(np.array([1.0]), 0.5) > 0
 
 
 def test_spe_limit_degenerate_cases():
-    assert pc.spe_limit(np.zeros(3)) == 0.0
-    assert pc.spe_limit(np.zeros(0)) == 0.0
+    assert pc.spe_limit(np.zeros(3)) == np.inf
+    assert pc.spe_limit(np.zeros(0)) == np.inf
     assert np.isfinite(pc.spe_limit(np.array([2.0, 1.0, 0.5, 0.25])))
 
 
@@ -142,7 +145,7 @@ def test_components_kept():
 def test_fit_model_small_and_degenerate():
     ids = np.array([5, 7, 9])
     empty = pc.fit_model(sparse.csr_matrix((0, 3)), ids)
-    assert empty.k == 0 and empty.limit == 0.0 and empty.residuals.height == 0
+    assert empty.k == 0 and empty.limit == np.inf and empty.residuals.height == 0
     assert pc.fit_model(sparse.csr_matrix((4, 0)), np.zeros(0, dtype=int)).spe.shape == (4,)
     constant = pc.fit_model(sparse.csr_matrix(np.ones((5, 3))), ids)
     assert constant.k == 1 and np.allclose(constant.spe, 0) and constant.residuals.height == 0
@@ -153,6 +156,19 @@ def test_fit_model_small_and_degenerate():
         two.scores.shape == (40, pc.N_PROJ) and (two.residuals["template_id"].is_in([5, 7])).all()
     )
     assert two.residuals.group_by("row").len()["len"].max() <= 2
+
+
+def test_empty_residual_space_raises_no_alarms():
+    rng = np.random.default_rng(5)
+    ids = np.arange(10)
+    data = sparse.csr_matrix(rng.poisson(1.0, size=(500, 10)).astype(float))
+    # components kept cover every direction (k >= rank): the SPE is rounding noise
+    full = pc.fit_model(data, ids)
+    assert full.k == 10 and full.limit == np.inf and full.spe.max() < 1e-20
+    assert not (full.spe > full.limit).any()
+    tiny = pc.fit_model(sparse.csr_matrix(np.outer(rng.poisson(3, 50), np.ones(3)) + 0.0), ids[:3])
+    assert tiny.limit == np.inf and not (tiny.spe > tiny.limit).any()
+    assert (pc.ratios(tiny.spe, tiny.limit) == 0).all()
 
 
 def test_residual_blocks_cover_every_window(monkeypatch):
@@ -191,7 +207,7 @@ def test_load_fit_is_memoised_and_follows_files(stage):
     assert first.bins.shape == first.spe.shape and first.scores.shape[1] == pc.N_PROJ
     assert first.loadings.shape[1] == len(first.template_ids)
     spe = pc.load_spe(stage)
-    assert spe.columns == ["row", "bin", "entity", "spe", "limit"]
+    assert spe.columns == ["row", "bin", "entity", "spe", "limit", "ratio"]
     assert pc.load_residuals(stage).columns == ["row", "rank", "template_id", "residual", "share"]
 
 
@@ -278,6 +294,16 @@ def test_flagged_table(stage, synthetic):
     assert links and all("host=" in h for h in links)
 
 
+def test_host_fit_absorbs_the_spike(stage, synthetic):
+    # recorded expectation (PLAN.md): a retained component captures the per-host spike
+    truth = synthetic.truth
+    spe = pc.load_spe(stage, "host", 60, "log1p")
+    spike = spe.filter(
+        pl.col("bin").is_between(window_of(truth.spike_start), naive(truth.spike_end))
+    )
+    assert spike["spe"].max() <= spike["limit"][0]
+
+
 def test_draw_pca(stage, synthetic):
     out = pc.draw_pca(stage, Filters(), 60, "service", "log1p", "time", 1, "light")
     assert len(out) == 7 and all(f.data for f in out[:5]) and out[6] == ""
@@ -291,10 +317,8 @@ def test_draw_pca(stage, synthetic):
     timed = Filters(start=start.isoformat(), end=(start + timedelta(minutes=5)).isoformat())
     narrowed = pc.draw_pca(stage, timed, 60, "service", "log1p", "entity", 1, None)
     assert sum(len(t.x) for t in narrowed[2].data) < sum(len(t.x) for t in out[2].data)
-    assert (
-        "limit" in str(pc.draw_pca(stage, timed, 60, "service", "log1p", "time", 1, None)[5])
-        or True
-    )
+    table = pc.draw_pca(stage, timed, 60, "service", "log1p", "time", 1, None)[5]
+    assert "neutron-openvswitch-agent" in str(table) and "/explorer?start=" in str(table)
     one = pc.draw_pca(
         stage, Filters(services=("haproxy",)), 60, "service", "log1p", "time", 1, None
     )
