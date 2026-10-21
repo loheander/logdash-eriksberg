@@ -41,7 +41,8 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | overview, distributions, temporal, templates, explorer | under 8 s each (measured before the templates stage also wrote the per-host counts) |
 | features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
 | pca | 12 fits (group x window x scaling); about 4 s for a synthetic 230k-window x 281-template matrix at 3 % density (not yet measured on the real data) |
-| total | 1 min 58 s |
+| anomalies | 0.2 s (one detector: PCA residual; 73,421 windows above the limit, 11,446 kept: at most 100 per service or host) |
+| total | 1 min 58 s (measured before the features, pca and anomalies stages existed) |
 
 `cache/` is 622 MB (281 templates from 73,583 unique masked lines).
 
@@ -55,10 +56,11 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | Templates | Drain3 templates: top, volume over time, parameter distributions, rare and novel lists |
 | Features | window x template count matrix (1, 5, 15 min; per service or host; log1p or TF-IDF): template correlation heatmap, template-entity association, variance ranking, mutual information |
 | PCA | PCA of the window x template matrix (precomputed per grouping, window and scaling): scree plot, 2D and 3D projections coloured by time, service or host, or SPE; loadings per component; residual SPE per window against its control limit, and the windows above it with their top residual templates |
+| Anomalies | every registered detector's anomalies: score timeline coloured by type, per-type filter, table sortable (the whole selection) by score, time, type or entity, "N of M kept" per type, with a link per row to the raw lines of its window in the explorer |
 | Explorer | paged grid over raw events with filters, template, request id and text search; other pages link here |
 
 Global filters (date range, level, service, host) live in the sidebar. The time
-range is respected by Temporal, Templates, Features, PCA and Explorer; the other pages state which
+range is respected by Temporal, Templates, Features, PCA, Anomalies and Explorer; the other pages state which
 filters they honour.
 
 Screenshots (`docs/screenshots/`):
@@ -79,6 +81,57 @@ limit (Gaussian theory at 99.9 %: a reference line, not a false-alarm rate), and
 Downstream modules read them with `pca.load_spe(store, group, window_s, scaling)`
 (`row, bin, entity, spe, limit, ratio`; rank by `ratio = spe / limit` rather than the flag) and `pca.load_residuals(...)`
 (`row, rank, template_id, residual, share`); `row` is the row of the features index.
+
+## Adding an anomaly detector
+
+Anomaly detection (module 6) has a framework and a page; the detectors are plug-ins. Create
+`src/logdash/detectors/<name>.py` with a class implementing `Detector` from
+`detectors/base.py` and decorate it with `@register`. Nothing else changes: the package imports
+every module in `detectors/`, the `anomalies` stage runs all registered detectors, and the page
+follows the data (type filter, timeline, table, explorer links).
+
+- Attributes: `key` (value of the `detector` column), `type` (anomaly type; several detectors
+  may share one, for example `structural`), `title`, `version`, `depends_on` (analyses whose
+  cache it reads; the stage depends on the union and is rebuilt when a version changes, so put
+  the module constants that change the output into `version`), `threshold` (raw score at which a
+  row counts as anomalous, above 0) and `setting_names` (settings that enter the cache
+  fingerprint, `()` if none). A detector whose threshold depends on settings may define
+  `threshold_for(settings)`. The registry checks the class against the `Detector` protocol.
+- `detect(ctx)` gets a `DetectContext` (`store`, `settings`, `log`) and returns a polars frame
+  with `bin` (window start, UTC), `window_s`, `kind` (what `entity` is, see below), `entity`,
+  `raw` (larger is more anomalous), `evidence` (text) and optionally `template_id`. Return every
+  row you consider anomalous and do not sort and cut first: the framework caps per entity.
+  Read other stages through `ctx.store` (for example `pca.load_spe`). Do not import
+  `analyses.anomalies` from a detector (import cycle).
+- Entity kinds are declared once, in `detectors/base.py`: `declare_kind(name, link_param,
+  filter_field, link_window)` says which explorer parameter the entity goes into, which global
+  filter (`services`, `hosts`) restricts rows of that kind, and whether the explorer link is
+  limited to the anomaly's window (not for a request, whose lines lie outside it). Declared:
+  `service`, `host`, `request`. A detector returning an undeclared kind makes the stage record
+  an error naming the detector and the kind; the declaration is validated against the
+  explorer's parameters and `Filters`. The page, links and filters follow the declaration.
+- `cache/anomalies/anomalies.parquet` has one row per anomaly: `detector, type, bin, window_s,
+  kind, entity, template_id, raw, score, evidence`. The framework drops rows with `raw` below
+  the detector's threshold (null, NaN, zero and negative values too; `+inf` counts as far above
+  it), scores the rest, keeps the 100 highest per (kind, entity) so that a sustained incident on
+  a few hosts does not hide an isolated anomaly on a quiet one, and then the 20,000 highest per
+  detector.
+- The score is in `[0, 1]`: `0.5 * percentile + 0.5 * magnitude`. `percentile` is the row's rank
+  among the detector's rows of the same kind (ties share the average rank); `magnitude` is
+  `log2(raw / threshold)` (raw clipped at 1024 times the threshold) divided by the excess at the
+  99th percentile of the same kind and clipped to 1. It keeps its spread, does not saturate,
+  and puts service and host rows of the same standing side by side; it orders rows within a
+  detector and kind and compares them across detectors by position, it is not a probability.
+- `meta.json` lists each detector with `above_threshold`, `rows` (kept), `dropped`, `seconds`
+  and, for a detector that raised, `error`: a failing detector is logged and skipped, the others
+  still run, and the page names it. The page shows "kept N of M" per type.
+- The page links each row to `/explorer?[start=&end=&]service=|host=|request_id=[&template=]`
+  (start and end only for kinds whose lines stay inside the window).
+
+The one detector so far, `structural_pca.py`, is the PCA residual half of the structural type:
+windows of the per-service and per-host 1-minute log1p fits with `spe / limit` of at least 1,
+with the top residual templates as evidence (on the real data 73,421 windows, 11,446 kept). Issue 6 adds the
+Isolation Forest next to it.
 
 ## Adding an analysis
 
@@ -137,7 +190,7 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy src
 ```
 
 The benchmark times every page layout and callback (no filter, one hour, host,
-template, text search, brushing) and asserts each is under 300 ms; run it with `-s`
+template, text search, brushing, anomaly types and sorts) and asserts each is under 300 ms; run it with `-s`
 to see the timing table.
 
 ## Building elsewhere

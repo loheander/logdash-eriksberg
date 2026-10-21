@@ -314,6 +314,29 @@ Status: **Phase 1 done** (steps 1 to 9).
   the limit in the per-service 1-minute log1p fit; in the per-host grid the spike is absorbed by a
   retained component, so it is not above the limit there. A synthetic 230k x 281 fit takes about 4 s;
   the slow benchmark has not been run on the real cache yet.
+- Module 6 framework (issue 3) done: `detectors/base.py` (the `Detector` protocol, a registry,
+  declared entity kinds and scoring), `analyses/anomalies.py` (stage and page) and one real
+  detector, `detectors/structural_pca.py`, the PCA residual part of the structural type (issue 6
+  adds the Isolation Forest beside it). Every module in `detectors/` is imported, so a detector is
+  one new file and the stage depends on what its detectors depend on; a new entity kind is one
+  `declare_kind` call (explorer parameter, global filter, whether the link is time-limited),
+  an undeclared kind is rejected by name, and a detector that raises is logged, skipped and
+  recorded in `meta.json` without losing the others. `cache/anomalies/anomalies.parquet` holds
+  `detector, type, bin, window_s, kind, entity, template_id, raw, score, evidence`. The score in
+  [0, 1] is `0.5 * percentile + 0.5 * magnitude` (rank among the detector's rows of the same
+  kind; log-scale excess over the threshold relative to that kind's 99th percentile, raw clipped
+  at 1024x), replacing a saturating `1 - threshold / (2 raw)` whose median was 0.995 and under
+  which every host row outranked every service row. Rows are capped at 100 per service or host,
+  then 20,000 per detector. On the real data the PCA detector finds 1,676 service and 71,745
+  host windows above the limit (73,421), keeps 11,446 (all 34 services and 162 hosts, at most
+  100 each; 61,975 dropped, recorded in `meta.json` and shown as "kept N of M" on the page);
+  median score 0.50, the default top 100 holds 97 host and 3 service rows. The stage takes 0.2 s
+  and the page answers in at most 61 ms (cold or warm) on the real cache. The test of
+  injected anomalies checks type and rank (the PCA spike and the novel template, bounded to ten
+  minutes after its first line, are in the top 10 and 15); the volume, novel and sequence cases are
+  strict expected failures until issues 4, 7 and 8 register detectors (they fail when one does,
+  so the mark must go), contextual and severity wait for synthetic injections (issues 5 and 9).
+  A stub detector of a new type on a new kind is tested end to end.
 
 ## 9. Open decisions
 

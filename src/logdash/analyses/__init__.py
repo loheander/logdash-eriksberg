@@ -11,6 +11,7 @@ BUILTIN: tuple[str, ...] = (
     "templates",
     "features",
     "pca",
+    "anomalies",
     "explorer",
 )
 
