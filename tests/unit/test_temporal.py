@@ -65,7 +65,12 @@ def test_detectors_on_arrays():
     y = np.full(100, 7.0)
     y[10:40] = 0
     assert [(g["first"], g["last"]) for g in t.find_gaps(y, 10)] == [(10, 39)]
-    assert t.find_gaps(np.zeros(5), 10) == [] and t.find_gaps(np.zeros(12), 10)[0]["baseline"] == 0
+    assert t.find_gaps(np.zeros(5), 10) == [] and t.find_gaps(np.zeros(12), 10) == []
+    late = np.concatenate(
+        [np.zeros(100), np.full(50, 7.0), np.zeros(30), np.full(20, 7.0), np.zeros(40)]
+    )
+    assert [(g["first"], g["last"]) for g in t.find_gaps(late, 10)] == [(150, 179)]
+    assert t.find_drops(np.zeros(50), 6) == []
     assert t.runs(np.array([0, 1, 1, 0, 1])) == [(1, 2), (4, 4)]
     assert t.detect_anomalies(pl.DataFrame(), pl.DataFrame(), 6, 10).is_empty()
 

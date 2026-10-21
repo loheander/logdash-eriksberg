@@ -41,7 +41,7 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | overview, distributions, temporal, templates, explorer | under 8 s each (measured before the templates stage also wrote the per-host counts) |
 | features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
 | pca | 12 fits (group x window x scaling); about 4 s for a synthetic 230k-window x 281-template matrix at 3 % density (not yet measured on the real data) |
-| anomalies | 0.2 s (one detector: PCA residual; 73,421 windows above the limit, 11,446 kept: at most 100 per service or host) |
+| anomalies | 0.5 s (two detectors: PCA residual, 73,421 windows above the limit, 11,446 kept: at most 100 per service or host; volume, 87 episodes) |
 | total | 1 min 58 s (measured before the features, pca and anomalies stages existed) |
 
 `cache/` is 622 MB (281 templates from 73,583 unique masked lines).
@@ -128,10 +128,23 @@ follows the data (type filter, timeline, table, explorer links).
 - The page links each row to `/explorer?[start=&end=&]service=|host=|request_id=[&template=]`
   (start and end only for kinds whose lines stay inside the window).
 
-The one detector so far, `structural_pca.py`, is the PCA residual half of the structural type:
+`structural_pca.py` is the PCA residual half of the structural type:
 windows of the per-service and per-host 1-minute log1p fits with `spe / limit` of at least 1,
 with the top residual templates as evidence (on the real data 73,421 windows, 11,446 kept). Issue 6 adds the
 Isolation Forest next to it.
+
+`volume.py` is the volume spike/drop type. It uses `find_bursts`, `find_drops` and `find_gaps` of
+`analyses/temporal.py` on the 1-minute rate tables. A row is an episode (`bin` its first minute,
+`window_s` its length). Spikes (per service and host) score the robust z-score at the peak
+(rolling median and MAD over one hour), threshold `burst_k`. Drops (per service and host) are the
+low side: minutes below the trailing hour's median minus `burst_k` robust sigmas and at most half
+of it, for entities whose baseline is at least 50 events/min, scored by the z-score at the trough
+(a busy service falling silent is a drop). Gaps (per host) are silent runs of at least
+`gap_minutes` and score `burst_k * minutes / gap_minutes`; gaps and drops never count the time
+before an entity's first or after its last line. Episodes of one entity and kind that recur at a
+fixed period are merged into the strongest one (evidence says how many and how often). On the real
+data this leaves 87 episodes of 42 entities (87 spikes, no drops or gaps: every host logs
+throughout the 24 hours); 426 before periodic repeats were merged.
 
 ## Adding an analysis
 

@@ -16,6 +16,7 @@ from logdash.analyses.explorer import fetch_page, link_from_query, merge_link
 from logdash.analyses.features import Features
 from logdash.analyses.pca import Pca
 from logdash.analyses.templates import Templates
+from logdash.analyses.temporal import Temporal
 from logdash.app.filters import Filters
 from logdash.cache.store import CacheStore
 from logdash.detectors import base
@@ -34,7 +35,7 @@ from tests.synthetic import GroundTruth, utc
 
 @pytest.fixture(scope="module")
 def stage(built):
-    build_with(built, Templates(), Features(), Pca(), Anomalies())
+    build_with(built, Templates(), Features(), Pca(), Temporal(), Anomalies())
     return built.store
 
 
@@ -217,7 +218,7 @@ def test_analysis_follows_the_registered_detectors():
     registry.add(Fake("other"))
     assert analysis.version != version and "other=1" in analysis.version
     assert analysis.version.startswith(f"{base.FRAMEWORK_VERSION}:{an.MAX_PER_ENTITY}:")
-    assert Anomalies().depends_on == ("pca", "templates")
+    assert Anomalies().depends_on == ("pca", "templates", "temporal")
 
 
 def run_stage(built, tmp_path, registry, log=None):
@@ -373,11 +374,16 @@ def test_built_table_and_manifest(stage):
     assert rows["score"].n_unique() > rows.height // 2  # the scores keep their spread
     assert rows["score"].to_list() == sorted(rows["score"].to_list(), reverse=True)
     assert (rows["raw"] >= DETECTORS.get("structural_pca").threshold).all()
-    assert set(rows["kind"]) == {"service", "host"} and rows["evidence"].str.contains("SPE").all()
-    assert rows.group_by("detector").len().height == 1
-    meta = stage.read_json("anomalies", "meta.json")
-    assert meta["detectors"][0]["rows"] == rows.height
-    assert meta["detectors"][0]["above_threshold"] >= rows.height
+    pca_rows = rows.filter(pl.col("detector") == "structural_pca")
+    assert (
+        set(pca_rows["kind"]) == {"service", "host"}
+        and pca_rows["evidence"].str.contains("SPE").all()
+    )
+    assert set(rows["detector"]) == {"structural_pca", "volume"}
+    meta = {d["key"]: d for d in stage.read_json("anomalies", "meta.json")["detectors"]}
+    for key, entry in meta.items():
+        assert entry["rows"] == rows.filter(pl.col("detector") == key).height
+        assert entry["above_threshold"] >= entry["rows"]
     assert rows.group_by("kind", "entity").len()["len"].max() <= an.MAX_PER_ENTITY
 
 
@@ -449,10 +455,8 @@ def pending(kind: str, issue: str) -> list[Any]:
 
 
 INJECTED = [
-    pytest.param("volume", spike_host, 20, id="volume spike", marks=pending("volume", "issue 4")),
-    pytest.param(
-        "volume", silent_host_gap, 20, id="silent host gap", marks=pending("volume", "issue 4")
-    ),
+    pytest.param("volume", spike_host, 20, id="volume spike"),
+    pytest.param("volume", silent_host_gap, 20, id="silent host gap"),
     pytest.param("structural", spike_service, 10, id="spike seen structurally"),
     pytest.param("structural", novel_template_window, 15, id="novel template seen structurally"),
     pytest.param(
@@ -493,8 +497,8 @@ def test_select_by_range_type_and_entity(stage):
     window = Filters(start=stamp(start), end=stamp(start + timedelta(minutes=1)))
     inside = an.select(rows, window, [])
     assert 0 < inside.height < rows.height and (inside["bin"] == start).all()
-    assert an.select(rows, Filters(), ["structural"]).height == rows.height
-    assert an.select(rows, Filters(), ["volume"]).is_empty()
+    assert an.select(rows, Filters(), ["structural"]).height == (rows["type"] == "structural").sum()
+    assert an.select(rows, Filters(), ["nonexistent"]).is_empty()
     by_service = an.select(rows, Filters(services=("haproxy",)), [])
     assert set(by_service.filter(pl.col("kind") == "service")["entity"]) == {"haproxy"}
     assert (by_service["kind"] == "host").any()  # the service filter leaves host rows alone
@@ -621,7 +625,8 @@ def test_links_drill_down_to_the_raw_lines(stage, synthetic):
 def test_timeline_figure(stage):
     rows = an.load_anomalies(stage)
     fig = an.timeline_figure(rows, ["structural"], "dark")
-    assert len(fig.data) == 1 and len(fig.data[0].x) == min(rows.height, an.MAX_POINTS)
+    structural = rows.filter(pl.col("type") == "structural")
+    assert len(fig.data) == 1 and len(fig.data[0].x) == min(structural.height, an.MAX_POINTS)
     assert fig.data[0].text[0].count("<br>") == 3
     assert an.timeline_figure(rows.head(0), ["structural"], None).layout.annotations
     shown = an.timeline_figure(rows, ["other", "structural"], None)
@@ -636,7 +641,7 @@ def test_draw_anomalies(stage):
     assert (
         "level filter" in an.draw_anomalies(stage, Filters(levels=("ERROR",)), [], "time", None)[2]
     )
-    nothing = an.draw_anomalies(stage, Filters(), ["volume"], "score", None)
+    nothing = an.draw_anomalies(stage, Filters(), ["nonexistent"], "score", None)
     assert nothing[0].layout.annotations and "no anomalies" in str(nothing[1])
     assert "0 anomalies" in nothing[2]
 
@@ -663,7 +668,9 @@ def test_layout_and_callback_over_http(stage, built):
     from logdash.app.main import create_app
 
     assert "anomalies-timeline" in str(Anomalies().layout(stage))
-    app = create_app(stage, build_with(built, Templates(), Features(), Pca(), Anomalies()))
+    app = create_app(
+        stage, build_with(built, Templates(), Features(), Pca(), Temporal(), Anomalies())
+    )
     client = app.server.test_client()
     assert client.get("/anomalies").status_code == 200
     outputs = ["anomalies-timeline", "anomalies-table", "anomalies-hint"]
@@ -691,4 +698,24 @@ def test_layout_and_callback_over_http(stage, built):
             "/_dash-update-component", data=json.dumps(body), content_type="application/json"
         ).status_code
         == 200
+    )
+
+
+def test_volume_rows_say_spike_or_gap_and_gaps_start_at_the_threshold(stage, synthetic):
+    truth = synthetic.truth
+    volume = an.load_anomalies(stage).filter(pl.col("detector") == "volume")
+    detector = DETECTORS.get("volume")
+    assert (volume["raw"] >= detector.threshold).all() and volume["window_s"].min() >= 60
+    spike = volume.filter(
+        during(truth.spike_start, truth.spike_end) & (pl.col("entity") == truth.spike_host)
+    )
+    assert spike.height and spike["evidence"].str.starts_with("spike: peak").all()
+    gap = volume.filter(
+        during(truth.gap_start, truth.gap_end) & (pl.col("entity") == truth.silent_host)
+    )
+    assert gap.height and (gap["kind"] == "host").all()
+    assert gap["evidence"].str.starts_with("silent for").any()
+    assert set(volume["kind"]) <= {"service", "host"}
+    assert (
+        not volume.filter(pl.col("kind") == "service")["evidence"].str.starts_with("silent").any()
     )
