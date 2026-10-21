@@ -286,6 +286,16 @@ Status: **Phase 1 done** (steps 1 to 9).
   column keeps the original level; shared widgets live in `app/ui.py`; the global time
   range is only respected by Temporal, Templates and Explorer.
 
+### Phase 2 status
+
+- Module 4 (features) done: `analyses/features.py`, built from `templates/template_counts*.parquet`
+  only. The templates stage now also writes `template_counts_host.parquet` (version 2). The
+  stage stores a sparse long-format matrix and row index per grouping (service, host) and
+  window (1, 5, 15 min) in `cache/features/`; `load_matrix` returns a CSR matrix for PCA and the
+  detectors. The page computes scaling (log1p, TF-IDF), correlation, variance and the mutual
+  information between "template occurs in a window" and the entity from that matrix in memory.
+  Latency on the real cache is covered by the slow benchmark but has not been measured yet.
+
 ## 9. Open decisions
 
 - Default window for matrices: 1 minute (switchable). Default grouping: per

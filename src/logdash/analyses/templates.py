@@ -6,7 +6,8 @@
 2. mask the one sample per group and feed the unique masked lines, most frequent
    first, to Drain3;
 3. map ``masked_hash`` to ``template_id`` (``assignments.parquet``) and join that small
-   table back onto ``events`` in DuckDB for ``template_counts.parquet``;
+   table back onto ``events`` in DuckDB for ``template_counts.parquet`` (per service) and
+   ``template_counts_host.parquet`` (per host), both per template and minute;
 4. sample raw payloads of the top templates and extract the masked-out values.
 """
 
@@ -186,6 +187,13 @@ def compute_all(
                   GROUP BY ALL ORDER BY bin)
             TO '{out_dir}/template_counts.parquet' (FORMAT parquet, COMPRESSION zstd)"""
     )
+    con.execute(
+        f"""COPY (SELECT a.template_id, time_bucket(INTERVAL '1 minute', e.ts) AS bin,
+                         coalesce(e.host, '{MISSING}') AS host, count(*)::BIGINT AS n
+                  FROM events e JOIN assign a USING (masked_hash)
+                  GROUP BY ALL ORDER BY bin)
+            TO '{out_dir}/template_counts_host.parquet' (FORMAT parquet, COMPRESSION zstd)"""
+    )
     params = sample_params(con, templates, settings)
     (out_dir / "params").mkdir(exist_ok=True)
     params.write_parquet(out_dir / "params" / "values.parquet", compression="zstd")
@@ -363,7 +371,7 @@ def volume_for(
 class Templates:
     key = KEY
     title = "Templates"
-    version = "1"
+    version = "2"
     depends_on: tuple[str, ...] = ()
     setting_names = SETTING_NAMES
 

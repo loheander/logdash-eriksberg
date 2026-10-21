@@ -189,6 +189,26 @@ def test_templates(store: CacheStore) -> None:
     )
 
 
+def test_features(store: CacheStore) -> None:
+    fns = _recorded(store, "features")
+    for name, filters in _cases(store).items():
+        for window, group, scale in (
+            ("60", "service", "log1p"),
+            ("60", "host", "log1p"),
+            ("60", "service", "tfidf"),
+            ("60", "host", "tfidf"),
+            ("900", "host", "log1p"),
+        ):
+            measure(
+                "features.draw",
+                f"{name}, {window} s, {group}, {scale}",
+                CALLBACK_BUDGET_S,
+                lambda f=filters, w=window, g=group, sc=scale: fns["draw"](
+                    w, g, sc, "40", f, "light"
+                ),  # type: ignore[misc]
+            )
+
+
 def test_explorer(store: CacheStore) -> None:
     con = store.connect()
 
