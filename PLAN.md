@@ -167,7 +167,7 @@ payload length; lines per request; request duration (first to last timestamp per
 
 **2. Temporal analysis**
 Event rate at selectable bins (1 s, 10 s, 1 m, 5 m), split by level, service or
-host; host × time heatmap; autocorrelation and FFT periodogram per service;
+host; host × time heatmap (one labelled row per host, dendrogram order, scrolling); autocorrelation and FFT periodogram per service;
 simple burst and gap detection (rolling median ± k·MAD, silent hosts).
 Brushing a time range updates the global filter used by all pages.
 
@@ -273,7 +273,7 @@ Status: **Phase 1 done** (steps 1 to 9).
   cache 622 MB, 281 templates from 73,583 unique masked lines.
 - Latency (`pytest -m slow --no-cov`, real cache): every page layout under 25 ms and
   every callback under 300 ms warm; worst are temporal rate by service on one hour
-  (about 190 ms), heatmap at 1 min (about 180 ms) and explorer text search (about 180 ms).
+  (about 190 ms), heatmap at 1 min (about 270 ms, one labelled row per host) and explorer text search (about 180 ms).
   Start-up (`create_app`) about 220 ms.
 - Tuning: explorer text search scanned all payloads (5 s); it now walks hour partitions
   in time order with a 150 ms budget and says where it stopped. Bursts within two

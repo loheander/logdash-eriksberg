@@ -42,7 +42,7 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
 | pca | 12 fits (group x window x scaling); about 4 s for a synthetic 230k-window x 281-template matrix at 3 % density (not yet measured on the real data) |
 | hosts | 3 s on the real data (162 hosts, 281 templates, 559 service x host pairs; one aggregate over `events` for the matrix) |
-| anomalies | 28 s (eight detectors: PCA residual, 1,232 windows above the entity's level, 377 episodes kept; Isolation Forest per entity, 25 s, 1,405 windows flagged, 438 episodes; volume, 87 episodes; contextual, 496 windows above the threshold, 456 kept; novel and rare templates, 15 and 166 rows, 0.03 s; sequence, 40 requests, 3 s; severity, 5 incidents, 0.1 s) |
+| anomalies | 28 s (eight detectors: PCA residual, 1,232 windows above the entity's level, 387 episodes kept; Isolation Forest per entity, 25 s, 1,405 windows flagged, 447 episodes; volume, 87 episodes; contextual, 496 windows above the threshold, 456 kept; novel and rare templates, 15 and 166 rows, 0.03 s; sequence, 40 requests, 3 s; severity, 5 incidents, 0.1 s) |
 | total | 1 min 58 s (measured before the features, pca and anomalies stages existed) |
 
 `cache/` is 622 MB (281 templates from 73,583 unique masked lines).
@@ -53,7 +53,7 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 |---|---|
 | Overview | data quality: rows, span, missing values per column, level normalisation, malformed rows |
 | Distributions | level, program, host, logger, module, tenant, payload length, lines per request, request duration, inter-arrival times; linear/log |
-| Temporal | event rate (1 s to 5 min bins by zoom), host x time heatmap, autocorrelation and periodogram, bursts and gaps; drag on the rate chart to set the global time range |
+| Temporal | event rate (1 s to 5 min bins by zoom), host x time heatmap (every host labelled, in dendrogram order from the hosts stage when built, in a scrolling area), autocorrelation and periodogram, bursts and gaps; drag on the rate chart to set the global time range |
 | Templates | Drain3 templates: top, volume over time, parameter distributions, rare and novel lists |
 | Features | window x template count matrix (1, 5, 15 min; per service or host; log1p or TF-IDF): template correlation heatmap, template-entity association, variance ranking, mutual information |
 | PCA | PCA of the window x template matrix (precomputed per grouping, window and scaling): scree plot, 2D and 3D projections coloured by time, service or host, or SPE; loadings per component; residual SPE per window against its control limit, and the windows above it with their top residual templates |

@@ -235,7 +235,7 @@ def test_layout_and_callbacks_over_http(tmp, built):
         [*base, ("temporal-split", "value", "service"), ("theme", "data", "dark")],
     )
     call(
-        [("temporal-heatmap", "figure")],
+        [("temporal-heatmap", "figure"), ("temporal-heatmap", "style")],
         [
             *base,
             ("temporal-hbin", "value", "60"),
@@ -289,6 +289,62 @@ def test_shorten_middle():
     assert len(out) == 20 and "…" in out and out.startswith("neutron-op")
 
 
-def test_heatmap_height_is_capped():
-    assert t.heatmap_height(3) == 320
-    assert t.heatmap_height(1000) == t.HEAT_MAX_HEIGHT
+def test_heatmap_height_follows_row_count():
+    assert t.heatmap_height(3) == 360
+    assert t.heatmap_height(162) >= 15 * 162
+    assert t.heatmap_height(1000) > 720
+
+
+def _many_hosts(n=162):
+    hosts = [f"host{i:03d}" for i in range(n)]
+    bins = [datetime(2023, 5, 21, 0, 0), datetime(2023, 5, 21, 0, 5)]
+    return pl.DataFrame(
+        {"bin": bins * n, "host": [h for h in hosts for _ in bins], "n": [3, 5] * n}
+    ), hosts
+
+
+def test_heatmap_labels_every_host():
+    df, hosts = _many_hosts()
+    fig = t.heatmap_figure(df, 300, "light")
+    assert fig.layout.yaxis.dtick == 1 and fig.layout.yaxis.type == "category"
+    assert fig.layout.yaxis.autorange == "reversed"
+    assert len(fig.data[0].y) == 162 and list(fig.data[0].text) == hosts
+    assert fig.layout.height >= 15 * 162
+
+
+def test_heatmap_order():
+    df, hosts = _many_hosts(5)
+    order = ["host003", "host001", "ghost"]
+    fig = t.heatmap_figure(df, 300, None, order=order)
+    assert list(fig.data[0].text) == ["host003", "host001", "host000", "host002", "host004"]
+    assert len(fig.data[0].y) == 5  # hosts missing from the order are kept
+    assert list(t.heatmap_figure(df, 300, None).data[0].text) == hosts
+
+
+def test_heatmap_uses_hosts_stage_order(tmp):
+    class NoHosts:
+        def exists(self, key, name):
+            return False
+
+    assert t.host_order(NoHosts()) is None  # the hosts stage is not built
+    hosts = tmp.read_json("temporal", "meta.json")["hosts"]
+    leaf = sorted(hosts, reverse=True)
+    frame = pl.DataFrame({"host": hosts, "leaf": [leaf.index(h) for h in hosts]})
+    saved = (
+        tmp.read_parquet("hosts", "hosts.parquet") if tmp.exists("hosts", "hosts.parquet") else None
+    )
+    tmp.write_parquet("hosts", "hosts.parquet", frame)
+    try:
+        fig = Temporal.heatmap(tmp, Filters(), 300, None)
+        assert list(fig.data[0].text) == [h for h in leaf if h in set(fig.data[0].text)]
+        assert t.host_order(tmp) == leaf
+    finally:
+        if saved is None:
+            tmp.path("hosts", "hosts.parquet").unlink()
+        else:
+            tmp.write_parquet("hosts", "hosts.parquet", saved)
+
+
+def test_heatmap_sits_in_a_scroll_area(tmp):
+    layout = str(Temporal().layout(tmp))
+    assert "ScrollArea" in layout and "h=720" in layout
