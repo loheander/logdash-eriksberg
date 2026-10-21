@@ -84,6 +84,7 @@ def test_duplicate_reserved_and_unknown():
 
 
 def test_register_decorator():
+    saved = dict(base.REGISTRY._items)
     base.REGISTRY.clear()
     try:
 
@@ -95,3 +96,4 @@ def test_register_decorator():
         assert Mine is not None and "mine" in base.REGISTRY
     finally:
         base.REGISTRY.clear()
+        base.REGISTRY._items.update(saved)

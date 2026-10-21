@@ -21,6 +21,7 @@ LEVEL_MAP: dict[str, str] = {
 EVENT_COLUMNS = (
     "ts",
     "level",
+    "level_raw",
     "host",
     "program",
     "logger",
@@ -79,6 +80,7 @@ def normalized_select(source: str) -> str:
         SELECT
             {ts_sql('"@timestamp"', '"Timestamp"')} AS ts,
             {level_sql("log_level")} AS level,
+            {clean_sql("log_level")} AS level_raw,
             {host} AS host,
             {clean_sql("programname")} AS program,
             {clean_sql("Logger")} AS logger,
@@ -94,7 +96,7 @@ def normalized_select(source: str) -> str:
         FROM {source}
     )
     SELECT
-        ts, level, host, program, logger, python_module, request_id, user_id,
+        ts, level, level_raw, host, program, logger, python_module, request_id, user_id,
         tenant_id, user_domain, project_domain, pid, src_id, payload,
         (host IS NULL AND program IS NULL AND payload IS NULL) AS malformed,
         lpad(CAST(COALESCE(date_part('hour', ts), 0) AS VARCHAR), 2, '0') AS hour

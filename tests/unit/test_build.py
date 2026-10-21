@@ -1,3 +1,4 @@
+from logdash.analyses.base import Registry
 from logdash.build import run_build
 from logdash.cache.store import CacheStore
 from logdash.cli import main
@@ -11,18 +12,22 @@ def settings_for(synthetic, cache):
 def test_build_then_fresh_then_force(synthetic, cache_dir):
     s = settings_for(synthetic, cache_dir)
     logs: list[str] = []
-    assert [r.status for r in run_build(s, log=logs.append)] == ["built"]
+    assert [r.status for r in run_build(s, registry=Registry(), log=logs.append)] == ["built"]
     entry = CacheStore(cache_dir).manifest().get("events")
     assert entry is not None and entry.rows["rows"] == synthetic.truth.n_rows
-    assert [r.status for r in run_build(s, log=logs.append)] == ["fresh"]
-    assert [r.status for r in run_build(s, force=True, log=logs.append)] == ["built"]
+    assert [r.status for r in run_build(s, registry=Registry(), log=logs.append)] == ["fresh"]
+    assert [r.status for r in run_build(s, registry=Registry(), force=True, log=logs.append)] == [
+        "built"
+    ]
     assert any("up to date" in line for line in logs)
 
 
 def test_strict_mode_rebuilds_on_changed_fingerprint(synthetic, cache_dir):
     s = settings_for(synthetic, cache_dir)
-    run_build(s, log=lambda _: None)
-    assert [r.status for r in run_build(s, strict=True, log=lambda _: None)] == ["built"]
+    run_build(s, registry=Registry(), log=lambda _: None)
+    assert [
+        r.status for r in run_build(s, registry=Registry(), strict=True, log=lambda _: None)
+    ] == ["built"]
 
 
 def test_cli_build_status_serve(synthetic, cache_dir, capsys):

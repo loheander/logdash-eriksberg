@@ -12,7 +12,7 @@ from logdash.cache.store import EVENTS_KEY, CacheStore
 from logdash.config import Settings
 from logdash.ingest.reader import ingest
 
-EVENTS_VERSION = "1"
+EVENTS_VERSION = "2"
 
 Log = Callable[[str], None]
 
