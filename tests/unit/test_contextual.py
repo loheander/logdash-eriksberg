@@ -27,7 +27,7 @@ from tests.conftest import Built, build_with
 from tests.synthetic import SyntheticSpec, write_dataset
 from tests.unit.test_anomalies import context_host_window, during
 
-SPEC = SyntheticSpec(context_minutes=6, context_busy_rows=12_000)
+SPEC = SyntheticSpec(context_minutes=6, context_busy_rows=12_000, error_rows=0)
 T0 = datetime(2023, 5, 21)
 K = 8  # templates of the hand-made fleets
 PROFILE = np.full(K, 1 / K)  # every peer centroid: the same uniform mix

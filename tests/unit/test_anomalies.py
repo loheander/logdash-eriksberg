@@ -621,6 +621,7 @@ def test_built_table_and_manifest(stage):
         "novel_template",
         "rare_template",
         "sequence",
+        "severity",
     }
     meta = {d["key"]: d for d in stage.read_json("anomalies", "meta.json")["detectors"]}
     assert set(meta) == {
@@ -631,6 +632,7 @@ def test_built_table_and_manifest(stage):
         "novel_template",
         "rare_template",
         "sequence",
+        "severity",
     }
     for key, entry in meta.items():
         assert entry["rows"] == rows.filter(pl.col("detector") == key).height
@@ -717,6 +719,16 @@ def rare_window(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
     )
 
 
+def error_burst(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
+    return first_match(
+        rows,
+        during(truth.error_start, truth.error_end)
+        & (pl.col("kind") == "service")
+        & (pl.col("entity") == truth.error_service)
+        & pl.col("evidence").str.starts_with("ERROR burst"),
+    )
+
+
 def out_of_order_requests(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
     ranks = [first_match(rows, pl.col("entity") == r) for r in truth.out_of_order_request_ids]
     return None if None in ranks else max(r for r in ranks if r is not None)
@@ -730,11 +742,11 @@ INJECTED = [
     pytest.param("novel", novel_first_seen, 10, id="novel template"),
     pytest.param("novel", rare_window, 15, id="rare template"),
     pytest.param("sequence", out_of_order_requests, 20, id="out-of-order request"),
+    pytest.param("severity", error_burst, 3, id="error burst"),
 ]
 # Types whose injection changes the structural fits of the shared data (a busy host), so their
 # case lives in tests/unit/test_contextual.py on a dataset of its own.
 OWN_DATASET = {"contextual"}
-NO_INJECTION = {"severity"}  # the synthetic data has none yet (issue 9)
 
 
 @pytest.mark.parametrize(("kind", "found", "max_rank"), INJECTED)
@@ -793,8 +805,24 @@ def test_sequence_rows_are_the_out_of_order_request_only(stage, synthetic):
     assert "0 longer requests" in meta["sequence"]["info"]["note"]
 
 
+def test_severity_rows_are_the_error_burst_and_the_spike_warnings_only(stage, synthetic):
+    truth = synthetic.truth
+    rows = an.load_anomalies(stage).filter(pl.col("type") == "severity")
+    assert (rows["kind"] == "service").all() and rows["raw"].is_finite().all()
+    error = rows.filter(pl.col("evidence").str.starts_with("ERROR"))
+    assert error["entity"].to_list() == [truth.error_service]  # baseline ERROR (1 %): no row
+    assert error.filter(during(truth.error_start, truth.error_end)).height == 1
+    # the volume spike of the synthetic data is also a surge of WARNING lines (the one level
+    # the data has in bulk); nothing else: the steady WARNING rate (about 5/min) is no burst
+    warning = rows.filter(pl.col("evidence").str.starts_with("WARNING"))
+    assert warning["entity"].to_list() == ["neutron-openvswitch-agent"]
+    assert warning.filter(during(truth.spike_start, truth.spike_end)).height == 1
+    assert rows.height == 2
+    assert error["evidence"][0].count("z=") == 1 and "Poisson" in error["evidence"][0]
+
+
 def test_every_registered_type_has_an_expectation():
-    expected = {case.values[0] for case in INJECTED} | OWN_DATASET | NO_INJECTION
+    expected = {case.values[0] for case in INJECTED} | OWN_DATASET
     assert set(DETECTORS.types()) <= expected
 
 
