@@ -1,13 +1,17 @@
 import json
+import shutil
 from datetime import datetime, timedelta
 
+import dash_mantine_components as dmc
 import numpy as np
 import polars as pl
 import pytest
 
 from logdash.analyses import temporal as t
 from logdash.analyses.temporal import Temporal
+from logdash.app import ui
 from logdash.app.filters import Filters
+from logdash.cache.store import CacheStore
 from tests.conftest import build_with
 from tests.synthetic import utc
 
@@ -234,15 +238,28 @@ def test_layout_and_callbacks_over_http(tmp, built):
         [("temporal-rate", "figure")],
         [*base, ("temporal-split", "value", "service"), ("theme", "data", "dark")],
     )
-    call(
-        [("temporal-heatmap", "figure"), ("temporal-heatmap", "style")],
+    heat = [("temporal-heatmap", "figure"), ("temporal-heatmap", "style")]
+    out = call(
+        heat,
         [
             *base,
             ("temporal-hbin", "value", "60"),
             ("temporal-hscale", "value", "absolute"),
             ("theme", "data", "dark"),
         ],
-    )
+    )["response"]
+    fig = out["temporal-heatmap"]["figure"]
+    assert out["temporal-heatmap"]["style"]["height"] == fig["layout"]["height"] > 320
+    out = call(
+        heat,
+        [
+            ("filters", "data", {"hosts": ["nope"]}),
+            ("temporal-hbin", "value", "60"),
+            ("temporal-hscale", "value", "relative"),
+            ("theme", "data", None),
+        ],
+    )["response"]
+    assert out["temporal-heatmap"]["style"]["height"] == 320  # empty figure: the fallback
     call(
         [("temporal-acf", "figure"), ("temporal-spectrum", "figure")],
         [("temporal-service", "value", "haproxy"), ("theme", "data", None)],
@@ -306,45 +323,65 @@ def _many_hosts(n=162):
 def test_heatmap_labels_every_host():
     df, hosts = _many_hosts()
     fig = t.heatmap_figure(df, 300, "light")
-    assert fig.layout.yaxis.dtick == 1 and fig.layout.yaxis.type == "category"
-    assert fig.layout.yaxis.autorange == "reversed"
-    assert len(fig.data[0].y) == 162 and list(fig.data[0].text) == hosts
+    yaxis = fig.layout.yaxis
+    assert yaxis.type == "category" and yaxis.autorange == "reversed"
+    assert yaxis.tickmode == "array"
+    assert list(fig.data[0].y) == list(yaxis.tickvals) == hosts
+    assert list(yaxis.ticktext) == hosts  # short names are not shortened
     assert fig.layout.height >= 15 * 162
+
+
+def test_heatmap_hover_and_ticks_use_full_and_short_names():
+    long = "neutron-openvswitch-agent-very-long-host-name"
+    df = pl.DataFrame({"bin": [datetime(2023, 5, 21)] * 2, "host": [long, "b"], "n": [3, 5]})
+    fig = t.heatmap_figure(df, 300, None)
+    assert list(fig.data[0].y) == ["b", long]  # hover shows %{y}: the full name
+    assert "%{y}" in fig.data[0].hovertemplate and "%{text}" not in fig.data[0].hovertemplate
+    assert list(fig.layout.yaxis.ticktext) == ["b", t.figures.shorten_middle(long, 30)]
+    assert len(fig.layout.yaxis.ticktext[1]) == 30
 
 
 def test_heatmap_order():
     df, hosts = _many_hosts(5)
     order = ["host003", "host001", "ghost"]
     fig = t.heatmap_figure(df, 300, None, order=order)
-    assert list(fig.data[0].text) == ["host003", "host001", "host000", "host002", "host004"]
-    assert len(fig.data[0].y) == 5  # hosts missing from the order are kept
-    assert list(t.heatmap_figure(df, 300, None).data[0].text) == hosts
+    expected = ["host003", "host001", "host000", "host002", "host004"]  # unlisted hosts kept
+    assert list(fig.data[0].y) == list(fig.layout.yaxis.tickvals) == expected
+    assert list(t.heatmap_figure(df, 300, None).data[0].y) == hosts
+    assert fig.data[0].z.shape[0] == 5
 
 
-def test_heatmap_uses_hosts_stage_order(tmp):
+def test_heatmap_empty_figure_has_no_rows():
+    empty = pl.DataFrame(schema={"bin": pl.Datetime, "host": pl.String, "n": pl.Int64})
+    fig = t.heatmap_figure(empty, 300, None)
+    assert not fig.data and fig.layout.annotations
+
+
+def test_heatmap_uses_hosts_stage_order(tmp, tmp_path):
     class NoHosts:
         def exists(self, key, name):
             return False
 
     assert t.host_order(NoHosts()) is None  # the hosts stage is not built
-    hosts = tmp.read_json("temporal", "meta.json")["hosts"]
+    shutil.copytree(tmp.module_dir("temporal"), tmp_path / "temporal")
+    store = CacheStore(tmp_path)  # own store: the shared fixture stays untouched
+    hosts = store.read_json("temporal", "meta.json")["hosts"]
     leaf = sorted(hosts, reverse=True)
     frame = pl.DataFrame({"host": hosts, "leaf": [leaf.index(h) for h in hosts]})
-    saved = (
-        tmp.read_parquet("hosts", "hosts.parquet") if tmp.exists("hosts", "hosts.parquet") else None
-    )
-    tmp.write_parquet("hosts", "hosts.parquet", frame)
-    try:
-        fig = Temporal.heatmap(tmp, Filters(), 300, None)
-        assert list(fig.data[0].text) == [h for h in leaf if h in set(fig.data[0].text)]
-        assert t.host_order(tmp) == leaf
-    finally:
-        if saved is None:
-            tmp.path("hosts", "hosts.parquet").unlink()
-        else:
-            tmp.write_parquet("hosts", "hosts.parquet", saved)
+    store.write_parquet("hosts", "hosts.parquet", frame)
+    fig = Temporal.heatmap(store, Filters(), 300, None)
+    shown = set(fig.data[0].y)
+    assert list(fig.data[0].y) == [h for h in leaf if h in shown]
+    assert t.host_order(store) == leaf
 
 
 def test_heatmap_sits_in_a_scroll_area(tmp):
-    layout = str(Temporal().layout(tmp))
-    assert "ScrollArea" in layout and "h=720" in layout
+    def walk(node):
+        yield node
+        children = getattr(node, "children", None)
+        for child in children if isinstance(children, list | tuple) else [children]:
+            if child is not None and not isinstance(child, str):
+                yield from walk(child)
+
+    areas = [c for c in walk(Temporal().layout(tmp)) if isinstance(c, dmc.ScrollArea)]
+    assert [a.h for a in areas] == [ui.TALL_PX]

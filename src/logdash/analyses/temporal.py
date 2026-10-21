@@ -557,15 +557,12 @@ def heatmap_figure(
     """
     if df.is_empty():
         return figures.empty_figure("no events in the visible range", scheme)
-    hosts = ordered_hosts(df["host"].unique().to_list(), order)
+    parts = {key[0]: sub for key, sub in df.partition_by("host", as_dict=True).items()}
+    hosts = ordered_hosts(list(parts), order)
     t0, t1 = span(df["bin"])
     length = int((t1 - t0).total_seconds() // bin_s) + 1
     z = np.vstack(
-        [
-            dense_series(sub["bin"], sub["n"], t0, bin_s, length)
-            for host in hosts
-            for sub in [df.filter(pl.col("host") == host)]
-        ]
+        [dense_series(parts[host]["bin"], parts[host]["n"], t0, bin_s, length) for host in hosts]
     )
     x = [t0 + timedelta(seconds=bin_s * i) for i in range(length)]
     relative = scale != "absolute"
@@ -593,17 +590,23 @@ def heatmap_figure(
     fig = go.Figure(
         go.Heatmap(
             x=x,
-            y=[figures.shorten_middle(h, 30) for h in hosts],
+            y=hosts,
             customdata=np.dstack([z, relative_ratio(z)]),
-            text=hosts,
             hovertemplate=(
-                "%{text} %{x}: %{customdata[0]:,.0f} events (×%{customdata[1]:.2f} median)"
+                "%{y} %{x}: %{customdata[0]:,.0f} events (×%{customdata[1]:.2f} median)"
                 "<extra></extra>"
             ),
             **scaling,
         )
     )
-    fig.update_yaxes(autorange="reversed", type="category", dtick=1, tickfont={"size": 10})
+    fig.update_yaxes(
+        autorange="reversed",
+        type="category",
+        tickmode="array",
+        tickvals=hosts,
+        ticktext=[figures.shorten_middle(h, 30) for h in hosts],
+        tickfont={"size": 10},
+    )
     fig.update_xaxes(side="top")
     return figures.style(fig, scheme, height=heatmap_height(len(hosts)))
 
