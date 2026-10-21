@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from logdash.analyses import features, load_builtin, pca
+from logdash.analyses import anomalies, features, load_builtin, pca
 from logdash.analyses.base import REGISTRY
 from logdash.analyses.explorer import fetch_page, search_page
 from logdash.analyses.temporal import Temporal
@@ -265,6 +265,34 @@ def test_pca_cold(store: CacheStore) -> None:
         results.append(("pca.draw (cold)", f"{window} s, {group}, {scale}", cold, warm))
         if cold >= LAYOUT_BUDGET_S:
             over.append(f"pca.draw cold [{window} s, {group}, {scale}] {cold * 1000:.0f} ms")
+
+
+ANOMALY_CASES = (([], "score"), (["structural"], "time"), ([], "type"), (["structural"], "entity"))
+
+
+def test_anomalies(store: CacheStore) -> None:
+    fns = _recorded(store, "anomalies")
+    for name, filters in _cases(store).items():
+        for types, sort in ANOMALY_CASES:
+            measure(
+                "anomalies.draw",
+                f"{name}, types={types or 'all'}, sort={sort}",
+                CALLBACK_BUDGET_S,
+                partial(fns["draw"], types, sort, filters, "light"),
+            )
+
+
+def test_anomalies_cold(store: CacheStore) -> None:
+    """First request after start-up: the table is read from the cache, not from memory."""
+    fns = _recorded(store, "anomalies")
+    anomalies.clear_caches()
+    draw = partial(fns["draw"], [], "score", None, "light")
+    t0 = time.perf_counter()
+    draw()
+    cold = time.perf_counter() - t0
+    results.append(("anomalies.draw (cold)", "no filters", cold, _time(draw)))
+    if cold >= LAYOUT_BUDGET_S:
+        over.append(f"anomalies.draw cold {cold * 1000:.0f} ms")
 
 
 def test_explorer(store: CacheStore) -> None:
