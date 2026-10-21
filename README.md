@@ -41,6 +41,7 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | overview, distributions, temporal, templates, explorer | under 8 s each (measured before the templates stage also wrote the per-host counts) |
 | features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
 | pca | 12 fits (group x window x scaling); about 4 s for a synthetic 230k-window x 281-template matrix at 3 % density (not yet measured on the real data) |
+| hosts | 3 s on the real data (162 hosts, 281 templates, 559 service x host pairs; one aggregate over `events` for the matrix) |
 | anomalies | 0.5 s (two detectors: PCA residual, 73,421 windows above the limit, 11,446 kept: at most 100 per service or host; volume, 87 episodes) |
 | total | 1 min 58 s (measured before the features, pca and anomalies stages existed) |
 
@@ -57,10 +58,11 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | Features | window x template count matrix (1, 5, 15 min; per service or host; log1p or TF-IDF): template correlation heatmap, template-entity association, variance ranking, mutual information |
 | PCA | PCA of the window x template matrix (precomputed per grouping, window and scaling): scree plot, 2D and 3D projections coloured by time, service or host, or SPE; loadings per component; residual SPE per window against its control limit, and the windows above it with their top residual templates |
 | Anomalies | every registered detector's anomalies: score timeline coloured by type, per-type filter, table sortable (the whole selection) by score, time, type or entity, "N of M kept" per type, with a link per row to the raw lines of its window in the explorer |
+| Hosts | host profiles (template mix per host): silhouette for every candidate k, 2D projection, cluster table, outlier hosts (and the hosts without peers) with the templates that deviate, Ward dendrogram (every host, or collapsed to the clusters) and the service x host matrix in dendrogram order |
 | Explorer | paged grid over raw events with filters, template, request id and text search; other pages link here |
 
 Global filters (date range, level, service, host) live in the sidebar. The time
-range is respected by Temporal, Templates, Features, PCA, Anomalies and Explorer; the other pages state which
+range is respected by Temporal, Templates, Features, PCA, Anomalies and Explorer; Hosts uses the whole span (its host and service filters select rows and columns); the other pages state which
 filters they honour.
 
 Screenshots (`docs/screenshots/`):
@@ -81,6 +83,54 @@ limit (Gaussian theory at 99.9 %: a reference line, not a false-alarm rate), and
 Downstream modules read them with `pca.load_spe(store, group, window_s, scaling)`
 (`row, bin, entity, spe, limit, ratio`; rank by `ratio = spe / limit` rather than the flag) and `pca.load_residuals(...)`
 (`row, rank, template_id, residual, share`); `row` is the row of the features index.
+
+## Host clusters
+
+The `hosts` stage (module 7) clusters hosts on their template mix over the whole span and finds
+every host's peers for the contextual detector. A host's profile is `h = sqrt(share)` of its
+template counts (Hellinger space). Two groupings are kept apart:
+
+- *clusters* (k-means, `k` from 2 to 10 by silhouette among the `k` where every cluster has at
+  least 3 hosts; the silhouette chart shows every candidate `k` and why an excluded one was left
+  out) are the overview of the fleet, with a Ward dendrogram on the same profiles. They can be
+  lopsided or have several modes, so hosts are not scored against them;
+- *peers* are a host's up to 8 nearest other hosts within a Hellinger distance of 0.15. A host
+  with fewer than 3 such hosts has no valid peer group (`peer_ok` false) and gets no peer
+  centroid or baseline. On the real data 23 of 162 hosts have none (idle hosts, the three-host
+  groups and the single very large hosts).
+
+An outlier host has no valid peer group and a robust z (median and MAD of its distance to its
+3rd nearest host within its cluster) above 3.5; clusters of fewer than 8 hosts get no z. A tight
+sub-population far from its cluster mean is therefore not a set of outliers.
+
+Files in `cache/hosts/`:
+
+| File | Content |
+|---|---|
+| `hosts.parquet` | `row, host, events, cluster, hier_cluster, distance, peer_distance, peers, peer_ok, z, outlier, leaf, x, y`: `distance` to the cluster centroid, `peer_distance` to the 3rd nearest host, `peers` the number of peers within the radius |
+| `clusters.parquet` | `cluster, n_hosts, scored, median_distance, median_peer_distance, scale, max_peer_distance, no_peers, outliers`; `z = (peer_distance - median_peer_distance) / scale` in a scored cluster |
+| `centroids.parquet` | long, `cluster, template_id, share, root`: `root` is the cluster centroid in `h` space, `share` the mean template share (display) |
+| `peers.parquet` | `host, peer, distance`, the peers of each host with a valid peer group |
+| `peer_centroids.parquet` | long, `host, template_id, root`: mean `h` of the host's peers (the host itself excluded) |
+| `baseline.parquet` | `host, windows, median_lines, median, mad`: median and scaled MAD of the host's 1-minute window distances to its peer centroid (windows with at least one line), and the median lines per window |
+| `deviations.parquet` | `row, host, rank, template_id, delta, share`: the three templates that contribute most to a host's squared distance to its peer centroid (cluster centroid without peers) |
+| `linkage.parquet`, `service_host.parquet`, `fit.json` | Ward linkage matrix, lines per host and service, chosen `k` and every candidate with its silhouette and exclusion reason, thresholds, template ids |
+
+To score a host window, build the window's counts (dense or sparse, one row per window, columns
+in the order of the template ids), then
+
+```python
+cen = hosts.load_peer_centroids(store)  # Centroids: .keys (hosts), .matrix, .rows(), .has()
+base = hosts.load_baseline(store)  # median, mad per host; hosts without a row have no peers
+d = hosts.centroid_distance(
+    counts, window_hosts, cen
+)  # KeyError for a host without a peer centroid
+```
+
+and compare `d` with the host's `median` and `mad` (a window of `n` lines is about `1 / sqrt(n)`
+noisier, `median_lines` gives the usual `n`). `Centroids.rows` maps ids to matrix rows, so cluster
+ids (1-based) and rows (0-based) are never mixed up; `hosts.load_centroids(store)` returns the
+cluster centroids the same way, `hosts.load_assignments(store)` the per-host columns.
 
 ## Adding an anomaly detector
 

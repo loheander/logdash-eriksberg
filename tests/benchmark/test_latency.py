@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from logdash.analyses import anomalies, features, load_builtin, pca
+from logdash.analyses import anomalies, features, hosts, load_builtin, pca
 from logdash.analyses.base import REGISTRY
 from logdash.analyses.explorer import fetch_page, search_page
 from logdash.analyses.temporal import Temporal
@@ -265,6 +265,35 @@ def test_pca_cold(store: CacheStore) -> None:
         results.append(("pca.draw (cold)", f"{window} s, {group}, {scale}", cold, warm))
         if cold >= LAYOUT_BUDGET_S:
             over.append(f"pca.draw cold [{window} s, {group}, {scale}] {cold * 1000:.0f} ms")
+
+
+HOSTS_CASES = (("full", "count"), ("full", "share"), ("collapsed", "count"))
+
+
+def test_hosts(store: CacheStore) -> None:
+    fns = _recorded(store, "hosts")
+    for name, filters in _cases(store).items():
+        for view, mode in HOSTS_CASES:
+            measure(
+                "hosts.draw",
+                f"{name}, {view}, {mode}",
+                CALLBACK_BUDGET_S,
+                partial(fns["draw"], view, mode, filters, "light"),
+            )
+
+
+def test_hosts_cold(store: CacheStore) -> None:
+    """First request after start-up: the stage files are read from the cache."""
+    fns = _recorded(store, "hosts")
+    hosts.clear_caches()
+    features.clear_caches()
+    draw = partial(fns["draw"], "full", "count", None, "light")
+    t0 = time.perf_counter()
+    draw()
+    cold = time.perf_counter() - t0
+    results.append(("hosts.draw (cold)", "full, count", cold, _time(draw)))
+    if cold >= LAYOUT_BUDGET_S:
+        over.append(f"hosts.draw cold {cold * 1000:.0f} ms")
 
 
 ANOMALY_CASES = (([], "score"), (["structural"], "time"), ([], "type"), (["structural"], "entity"))

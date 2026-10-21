@@ -348,6 +348,25 @@ Status: **Phase 1 done** (steps 1 to 9).
   87 episodes of 42 entities (426 before merging; 91 spikes before the full-hour baseline rule
   removed 4 start-up artefacts), no drops or gaps, 0.4 s. Framework score normalisation is
   unchanged: 2 of the top 100 anomalies are volume.
+- Module 7 (hosts and services, issue 10) done: `analyses/hosts.py` from `templates/template_counts_host.parquet`
+  and one aggregate over `events` (service x host lines). A host's profile is its template mix over the whole
+  span, compared as `sqrt(share)` (Hellinger). Display clusters: k-means (fixed seed) chooses k in 2..10 by
+  silhouette among the k where every cluster keeps at least 3 hosts (the silhouette chart lists every candidate
+  with the reason an excluded k was left out); Ward linkage on the same vectors gives the dendrogram. Scoring and
+  the contextual detector (issue 5) use a separate peer group: a host's up to 8 nearest hosts within a Hellinger
+  distance of 0.15 (`peers.parquet`, `peer_centroids.parquet`, leave-one-out); a host with fewer than 3 has no
+  valid peer group and none is stored. `baseline.parquet` holds, per host with peers, the median and MAD of its
+  1-minute window distances to its peer centroid and its median lines per window. An outlier host has no peer
+  group and a robust z of its distance to the 3rd nearest host above 3.5 within a cluster of at least 8 hosts,
+  so a tight second mode is not 26 outliers; the three most deviating templates against the peer centroid are the
+  evidence. Accessors `load_assignments`, `load_clusters`, `load_peers`, `load_baseline`, `load_centroids`,
+  `load_peer_centroids` (a `Centroids` object keyed by id, no index arithmetic) and `centroid_distance` (sparse
+  window counts without densifying). The page reads these files only: silhouette per k, a 2D projection, cluster
+  and outlier tables ("top 25 of N"), a tall scrolling dendrogram or one collapsed to the cut clusters, and the
+  service x host heatmap in dendrogram order. Whole span only (time and level filters do not apply). Real data:
+  162 hosts, k = 7 (silhouette 0.87; k = 8 to 10 excluded, a cluster of one host), clusters of 122, 18, 9, 4, 3,
+  3 and 3 hosts, k-means and Ward agree (ARI 1.0), 139 hosts have a valid peer group and 23 do not (the idle and
+  very large hosts and the three-host groups), one outlier host (eselda11u11s07, z 58); stage 4 s.
 
 ## 9. Open decisions
 
