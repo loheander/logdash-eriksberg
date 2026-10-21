@@ -1,4 +1,4 @@
-"""Module 7: host profiles, host clusters, outlier hosts and the service x host matrix.
+"""Module 7: host profiles, host clusters, peer groups, outlier hosts and the service x host matrix.
 
 Built from ``templates/template_counts_host.parquet`` (template x minute x host) and, for the
 service x host matrix, one aggregate over ``events``. The page only reads the files below.
@@ -6,40 +6,64 @@ service x host matrix, one aggregate over ``events``. The page only reads the fi
 A host *profile* is its template mix over the whole span: the share of each template among the
 host's lines. Profiles are compared in the Hellinger space ``h = sqrt(share)`` (the square root
 keeps a few dominant templates from deciding every distance; Euclidean distance there is the
-Hellinger distance between mixes, up to a constant). Everything stored lives in that space:
+Hellinger distance between mixes, up to a constant). Everything stored lives in that space.
+
+Two groupings are kept apart. *Clusters* (k-means, ``cluster``) are for display: the overview of
+the fleet. They can be lopsided (a cluster of three hosts that are not alike, a cluster with two
+modes), so they are not what a host is scored against. *Peers* are for scoring: a host's peers
+are its (up to) ``PEERS`` nearest other hosts that lie within ``PEER_RADIUS``. A host with fewer
+than ``MIN_PEERS`` such hosts has **no valid peer group** (``peer_ok`` false) and nothing is
+stored for it as a peer group: it is isolated, whatever cluster it was put in.
+
+Stored files:
 
 - ``hosts.parquet``, one row per host in the row order of ``linkage.parquet``: ``row, host,
-  events, cluster, hier_cluster, distance, z, outlier, leaf, x, y``. ``cluster`` is the k-means
-  cluster (1 is the largest), ``hier_cluster`` the Ward tree cut into the same number of
-  clusters, ``distance`` the Euclidean distance of the host's ``h`` to its cluster's centroid,
-  ``z`` its robust z-score among the cluster's hosts, ``outlier`` is ``z > OUTLIER_Z``, ``leaf``
-  the position in the dendrogram and ``x, y`` a PCA projection of ``h`` for plotting;
-- ``clusters.parquet``: ``cluster, n_hosts, median_distance, scale, max_distance, outliers``.
-  ``scale`` is ``max(1.4826 * MAD, 0.1 * median, 1e-9)`` of the member distances, so that
-  ``(distance - median_distance) / scale`` is ``z``. Every cluster has at least ``MIN_PEERS``
-  hosts, except when fewer than that many hosts exist (one cluster, ``z`` is 0: no peers);
+  events, cluster, hier_cluster, distance, peer_distance, peers, peer_ok, z, outlier, leaf, x,
+  y``. ``cluster`` is the k-means cluster (1 is the largest), ``hier_cluster`` the Ward tree cut
+  into the same number of clusters, ``distance`` the distance of the host's ``h`` to its
+  cluster's centroid, ``peer_distance`` its distance to its ``MIN_PEERS``-th nearest other host
+  (null with too few hosts), ``peers`` how many peers are within ``PEER_RADIUS`` (at most
+  ``PEERS``), ``z`` the robust z-score of ``peer_distance`` among the hosts of its cluster (0 in
+  a cluster of fewer than ``MIN_SCORED`` hosts: too small for a meaningful z) and ``outlier``
+  means ``z > OUTLIER_Z`` and the host has no valid peer group, so that a sub-population that is
+  tight but far from the cluster mean is not made of outliers; ``leaf`` is the position in the
+  dendrogram and ``x, y`` a PCA projection of ``h`` for plotting;
+- ``clusters.parquet``: ``cluster, n_hosts, scored, median_distance, median_peer_distance,
+  scale, max_peer_distance, no_peers, outliers``. ``scale`` is ``max(1.4826 * MAD, 0.1 * median,
+  1e-9)`` of the members' ``peer_distance``, so ``(peer_distance - median_peer_distance) / scale``
+  is ``z`` in a ``scored`` cluster; ``no_peers`` counts members without a valid peer group;
 - ``centroids.parquet``, long and sparse: ``cluster, template_id, share, root``. ``root`` is the
-  centroid in the clustering space (mean of the members' ``h``, what distances are measured to),
-  ``share`` the members' mean template share (what to show). Rows with both zero are left out;
-  read it as a matrix with ``load_centroids``, whose columns follow any template ids you give;
+  cluster centroid in the clustering space (mean of the members' ``h``), ``share`` the members'
+  mean template share (what to show). Rows with both zero are left out;
+- ``peers.parquet``: ``host, peer, distance``, the peers of every host with a valid peer group,
+  nearest first (the host itself is never its peer);
+- ``peer_centroids.parquet``, long and sparse: ``host, template_id, root``, the mean ``h`` of the
+  host's peers (leave-one-out: the host is not in it), for hosts with a valid peer group;
+- ``baseline.parquet``: ``host, windows, median_lines, median, mad``, per host with a valid peer
+  group, over its 1-minute windows that have at least one line: the median and the MAD (scaled
+  by 1.4826) of the window distances to the host's peer centroid, and the median lines per
+  window. A window of ``n`` lines is about ``1 / sqrt(n)`` noisier, so judge a window against
+  the host's baseline with ``n`` in mind;
 - ``deviations.parquet``: ``row, host, rank, template_id, delta, share``, the ``TOP_DEVIATIONS``
-  templates that contribute most to the squared distance of each host (``delta`` is
-  ``h - centroid`` for that template, ``share`` its part of the squared distance);
+  templates that contribute most to the squared distance of each host to its reference (the peer
+  centroid, or the cluster centroid when it has no valid peer group; ``delta`` is
+  ``h - reference`` for that template, ``share`` its part of the squared distance);
 - ``linkage.parquet``: the Ward linkage matrix ``left, right, distance, count`` (scipy format,
   indices refer to ``row``), ``service_host.parquet``: ``host, service, n`` and ``fit.json``
-  (chosen ``k``, silhouette per ``k``, agreement between the two clusterings, template ids).
+  (chosen ``k``, the silhouette of every candidate ``k`` with the reason it was excluded,
+  agreement between the two clusterings, template ids, thresholds).
 
-For the contextual detector (host windows against peers): a window's count vector ``c`` becomes
-``h = sqrt(c / sum(c))``, and its deviation is the distance to the centroid of the host's
-``cluster`` (``centroid_distance`` does this for sparse or dense rows). Windows are far noisier
-than a whole-span profile, so judge them against their own distribution (for example per
-cluster), not against ``clusters.parquet``, which describes whole-span host distances.
-Read it with ``load_assignments``, ``load_centroids`` and ``load_clusters``.
+For the contextual detector (host windows against peers): turn a window's counts into
+``h = sqrt(c / sum(c))`` and take its distance to the host's peer centroid with
+``centroid_distance(counts, hosts, load_peer_centroids(store))``, then compare it with that host's
+row of ``load_baseline`` (``median``, ``mad``). Hosts without a row have no valid peer group and
+are not scored. ``Centroids.rows`` maps ids to matrix rows, so no index arithmetic is needed
+(cluster ids are 1-based, rows 0-based). ``load_assignments`` gives the per-host columns.
 
-k-means (scikit-learn, fixed seed, ``N_INIT`` restarts) is tried for ``k`` from 2 to ``MAX_K`` and
-the ``k`` with the highest silhouette wins (the smaller one on a tie), among those where every
-cluster has at least ``MIN_PEERS`` hosts, so that a lone odd host is scored against peers
-instead of becoming a cluster of its own. With no such ``k`` all hosts form one cluster.
+k-means (scikit-learn, fixed seed, ``N_INIT`` restarts) is tried for ``k`` from 2 to ``MAX_K``
+and the ``k`` with the highest silhouette wins (the smaller one on a tie), among those where
+every cluster has at least ``MIN_PEERS`` hosts, so that a lone odd host is not a cluster of its
+own. Every candidate is stored with its silhouette and, if excluded, why.
 The dendrogram of the page is drawn from the stored linkage; with
 162 hosts it is a tall scrolling plot with every host named, or a collapsed view with one leaf
 per cluster of the cut.
@@ -50,7 +74,8 @@ from __future__ import annotations
 import json
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +87,7 @@ from dash import Dash, Input, Output
 from dash.development.base_component import Component
 from scipy import sparse
 from scipy.cluster.hierarchy import dendrogram, fcluster, leaves_list, linkage
+from scipy.spatial.distance import cdist
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.exceptions import ConvergenceWarning
@@ -79,7 +105,10 @@ from logdash.cache.store import CacheStore
 KEY = "hosts"
 UPSTREAM = "templates"
 MAX_K = 10  # largest k tried
-MIN_PEERS = 3  # every cluster has at least this many hosts (and so a z-score)
+MIN_PEERS = 3  # every cluster has at least this many hosts; fewer peers is no peer group
+MIN_SCORED = 8  # clusters of fewer hosts get no z-score (too few for a median and a MAD)
+PEERS = 8  # a host's peers: this many nearest hosts at most
+PEER_RADIUS = 0.15  # ... that lie within this Hellinger distance of it
 SEED = 0
 N_INIT = 10
 OUTLIER_Z = 3.5  # robust z-score above which a host is an outlier of its cluster
@@ -92,7 +121,9 @@ MODES = ("count", "share")
 DEFAULT_MODE = "count"
 ROW_PX = 15  # height of one host in the tall plots
 OUTLIER_ROWS = 25
-LABELED_OUTLIERS = 10
+LABELED_OUTLIERS = 6
+LABEL_SIDES = ("top center", "bottom center", "middle right", "middle left")
+EXCLUDED_COLOR = "#adb5bd"
 TEXT_CHARS = 60
 MEMBERS_SHOWN = 8
 EXAMPLES = 3
@@ -118,49 +149,93 @@ def root_mix(counts: np.ndarray) -> np.ndarray:
     return np.sqrt(counts / np.where(total > 0, total, 1.0))
 
 
-def centroid_distance(
-    counts: np.ndarray | sparse.spmatrix, clusters: np.ndarray, centroids: np.ndarray
-) -> np.ndarray:
-    """Distance of each count row's Hellinger vector to ``centroids[clusters[row]]``.
+@dataclass(frozen=True)
+class Centroids:
+    """Centroid rows keyed by id (cluster ids, or host names for peer centroids).
 
-    ``counts`` is ``rows x templates`` (dense or sparse), ``centroids`` is ``k x templates`` in
-    the same column order (``load_centroids``), ``clusters`` indexes its rows (0-based). Uses
-    ``|h - c|^2 = |h|^2 - 2 h.c + |c|^2`` with ``|h|^2 = 1`` for a non-empty row, so sparse
+    ``matrix[i]`` belongs to ``keys[i]``; always go through ``rows`` instead of computing an
+    index from an id.
+    """
+
+    keys: tuple[Any, ...]
+    matrix: np.ndarray
+
+    @cached_property
+    def index(self) -> dict[Any, int]:
+        return {key: i for i, key in enumerate(self.keys)}
+
+    def rows(self, keys: Any) -> np.ndarray:
+        """Matrix rows of ``keys``; ``KeyError`` for an id without a centroid."""
+        return np.array([self.index[key] for key in keys], dtype=np.int64)
+
+    def has(self, keys: Any) -> np.ndarray:
+        """Which of ``keys`` have a centroid."""
+        return np.array([key in self.index for key in keys], dtype=bool)
+
+
+def centroid_distance(
+    counts: np.ndarray | sparse.spmatrix, keys: Any, centroids: Centroids
+) -> np.ndarray:
+    """Distance of each count row's Hellinger vector to the centroid of its key.
+
+    ``counts`` is ``rows x templates`` (dense or sparse) in the column order of ``centroids``
+    (``load_centroids``, ``load_peer_centroids``), ``keys`` one id per row (cluster id or host).
+    Uses ``|h - c|^2 = |h|^2 - 2 h.c + |c|^2`` with ``|h|^2 = 1`` for a non-empty row, so sparse
     windows are never densified.
     """
-    clusters = np.asarray(clusters, dtype=np.int64)
+    rows = centroids.rows(keys)
+    matrix = centroids.matrix
     csr = sparse.csr_matrix(counts, dtype=np.float64)
     total = np.asarray(csr.sum(axis=1)).ravel()
     scaled = sparse.diags(1 / np.where(total > 0, total, 1.0)) @ csr
     scaled.data = np.sqrt(scaled.data)
-    dots = np.asarray(scaled @ centroids.T)
-    own = dots[np.arange(len(clusters)), clusters]
-    norm_c = (centroids**2).sum(axis=1)[clusters]
+    dots = np.asarray(scaled @ matrix.T)
+    own = dots[np.arange(len(rows)), rows]
+    norm_c = (matrix**2).sum(axis=1)[rows]
     norm_h = (total > 0).astype(np.float64)
     return np.sqrt(np.maximum(norm_h - 2 * own + norm_c, 0.0))
 
 
-def cluster_hosts(vectors: np.ndarray, k_max: int = MAX_K) -> tuple[np.ndarray, dict[int, float]]:
-    """k-means labels (0-based, unordered) with the best silhouette and the score per ``k``.
+def cluster_hosts(
+    vectors: np.ndarray, k_max: int = MAX_K
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """k-means labels (0-based, unordered) with the best silhouette and every candidate ``k``.
 
-    Only ``k`` for which every cluster keeps at least ``MIN_PEERS`` hosts is considered: a lone
-    odd host would otherwise form a cluster of its own (silhouette rewards that) and have no
-    peers to deviate from. Without such a ``k`` all hosts form one cluster.
+    Only ``k`` for which every cluster keeps at least ``MIN_PEERS`` hosts is eligible: a lone
+    odd host would otherwise form a cluster of its own (silhouette rewards that). Each candidate
+    is ``{k, silhouette, min_size, feasible, chosen, reason}``; ``reason`` says why a ``k`` was
+    left out. Without an eligible ``k`` all hosts form one cluster.
     """
     n = len(vectors)
-    scores: dict[int, float] = {}
-    best: tuple[float, np.ndarray] | None = None
-    for k in range(2, min(k_max, n // MIN_PEERS) + 1):
+    candidates: list[dict[str, Any]] = []
+    best: tuple[float, int, np.ndarray] | None = None
+    for k in range(2, min(k_max, n - 1) + 1):
         with warnings.catch_warnings():  # duplicate profiles cannot fill k clusters
             warnings.simplefilter("ignore", ConvergenceWarning)
             labels = KMeans(k, n_init=N_INIT, random_state=SEED).fit_predict(vectors)
         sizes = np.unique(labels, return_counts=True)[1]
-        if len(sizes) < k or sizes.min() < MIN_PEERS:
-            continue
-        scores[k] = float(silhouette_score(vectors, labels))
-        if best is None or scores[k] > best[0]:
-            best = (scores[k], labels)
-    return (best[1] if best else np.zeros(n, dtype=np.int64)), scores
+        entry: dict[str, Any] = {
+            "k": k, "silhouette": None, "min_size": int(sizes.min()), "feasible": False,
+            "chosen": False, "reason": "",
+        }  # fmt: skip
+        if len(sizes) < k:
+            entry["reason"] = f"k-means finds only {len(sizes)} distinct clusters"
+        else:
+            entry["silhouette"] = float(silhouette_score(vectors, labels))
+            if sizes.min() < MIN_PEERS:
+                entry["reason"] = f"a cluster has {sizes.min()} host(s), fewer than {MIN_PEERS}"
+            else:
+                entry["feasible"] = True
+                if best is None or entry["silhouette"] > best[0]:
+                    best = (entry["silhouette"], k, labels)
+        candidates.append(entry)
+    for entry in candidates:
+        if best is not None and entry["k"] == best[1]:
+            entry["chosen"] = True
+            entry["reason"] = "highest silhouette among the eligible k"
+        elif entry["feasible"]:
+            entry["reason"] = "lower silhouette"
+    return (best[2] if best else np.zeros(n, dtype=np.int64)), candidates
 
 
 def by_size(labels: np.ndarray) -> np.ndarray:
@@ -174,54 +249,96 @@ def by_size(labels: np.ndarray) -> np.ndarray:
 
 
 def centroids_of(vectors: np.ndarray, labels: np.ndarray) -> np.ndarray:
-    """Mean vector per cluster; row ``c - 1`` belongs to cluster ``c``."""
+    """Mean vector per cluster; row ``c - 1`` belongs to cluster ``c`` (labels are 1..k)."""
     k = int(labels.max()) if len(labels) else 0
     return np.array([vectors[labels == c].mean(axis=0) for c in range(1, k + 1)]).reshape(
         k, vectors.shape[1]
     )
 
 
-def robust_scores(distance: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, pl.DataFrame]:
-    """Robust z-score per host within its cluster and the per-cluster distance statistics."""
+def find_peers(vectors: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Nearest other hosts of every host.
+
+    Returns ``order, dist`` (``n x min(PEERS, n - 1)``, nearest first), ``count`` (how many of
+    them lie within ``PEER_RADIUS``) and ``kth`` (distance to the ``MIN_PEERS``-th nearest,
+    NaN when there are fewer hosts than that).
+    """
+    n = len(vectors)
+    m = min(PEERS, max(n - 1, 0))
+    if m == 0:
+        return (np.zeros((n, 0), np.int64), np.zeros((n, 0)), np.zeros(n, np.int64),
+                np.full(n, np.nan))  # fmt: skip
+    full = cdist(vectors, vectors)
+    np.fill_diagonal(full, np.inf)
+    order = np.argsort(full, axis=1, kind="stable")[:, :m]
+    dist = np.take_along_axis(full, order, axis=1)
+    kth = dist[:, MIN_PEERS - 1] if m >= MIN_PEERS else np.full(n, np.nan)
+    return order, dist, (dist <= PEER_RADIUS).sum(axis=1), kth
+
+
+def peer_means(vectors: np.ndarray, order: np.ndarray, count: np.ndarray) -> np.ndarray:
+    """Mean ``h`` of each host's peers (rows of hosts without a valid peer group are NaN)."""
+    out = np.full(vectors.shape, np.nan)
+    for i in np.flatnonzero(count >= MIN_PEERS):
+        out[i] = vectors[order[i, : count[i]]].mean(axis=0)
+    return out
+
+
+def score_hosts(
+    distance: np.ndarray, kth: np.ndarray, count: np.ndarray, labels: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, pl.DataFrame]:
+    """Robust z of the peer distance per host, the outlier flags and the cluster statistics.
+
+    Clusters of fewer than ``MIN_SCORED`` hosts are not scored (``z`` is 0): a median and a MAD
+    of three values say nothing. A host is an outlier when its ``z`` exceeds ``OUTLIER_Z`` and
+    it has no valid peer group, so a tight sub-population far from the cluster mean never is.
+    """
     z = np.zeros(len(distance))
+    ok = count >= MIN_PEERS
+    outlier = np.zeros(len(distance), dtype=bool)
     rows = []
     for c in range(1, int(labels.max()) + 1 if len(labels) else 1):
         members = labels == c
-        d = distance[members]
+        d = np.nan_to_num(kth[members], nan=0.0)  # NaN only with 3 hosts or fewer: never scored
+        scored = int(members.sum()) >= MIN_SCORED
         median = float(np.median(d))
         mad = float(np.median(np.abs(d - median)))
         scale = max(MAD_SCALE * mad, MAD_FLOOR * median, 1e-9)
-        if members.sum() >= MIN_PEERS:
+        if scored:
             z[members] = (d - median) / scale
+            outlier[members] = (z[members] > OUTLIER_Z) & ~ok[members]
         rows.append(
             {
                 "cluster": c,
                 "n_hosts": int(members.sum()),
-                "median_distance": median,
+                "scored": scored,
+                "median_distance": float(np.median(distance[members])),
+                "median_peer_distance": median,
                 "scale": scale,
-                "max_distance": float(d.max()),
-                "outliers": int((z[members] > OUTLIER_Z).sum()),
+                "max_peer_distance": float(d.max()),
+                "no_peers": int((~ok[members]).sum()),
+                "outliers": int(outlier[members].sum()),
             }
         )
     schema = {
-        "cluster": pl.Int64, "n_hosts": pl.Int64, "median_distance": pl.Float64,
-        "scale": pl.Float64, "max_distance": pl.Float64, "outliers": pl.Int64,
+        "cluster": pl.Int64, "n_hosts": pl.Int64, "scored": pl.Boolean,
+        "median_distance": pl.Float64, "median_peer_distance": pl.Float64, "scale": pl.Float64,
+        "max_peer_distance": pl.Float64, "no_peers": pl.Int64, "outliers": pl.Int64,
     }  # fmt: skip
-    return z, pl.DataFrame(rows, schema=schema)
+    return z, outlier, pl.DataFrame(rows, schema=schema)
 
 
 def top_deviations(
-    vectors: np.ndarray, labels: np.ndarray, centroids: np.ndarray, hosts: list[str],
-    template_ids: np.ndarray,
-) -> pl.DataFrame:  # fmt: skip
-    """Per host the templates that contribute most to its squared distance to the centroid."""
+    vectors: np.ndarray, reference: np.ndarray, hosts: list[str], template_ids: np.ndarray
+) -> pl.DataFrame:
+    """Per host the templates that contribute most to its squared distance to ``reference``."""
     schema = {
         "row": pl.Int64, "host": pl.String, "rank": pl.Int64, "template_id": pl.Int64,
         "delta": pl.Float64, "share": pl.Float64,
     }  # fmt: skip
     if len(vectors) == 0 or vectors.shape[1] == 0:
         return pl.DataFrame(schema=schema)
-    delta = vectors - centroids[labels - 1]
+    delta = vectors - reference
     square = delta**2
     n_top = min(TOP_DEVIATIONS, square.shape[1])
     best = np.argsort(-square, axis=1, kind="stable")[:, :n_top]
@@ -241,38 +358,82 @@ def top_deviations(
     return frame.filter(pl.col("delta") != 0)
 
 
-def centroid_frame(
-    centroids: np.ndarray, labels: np.ndarray, vectors: np.ndarray, counts: np.ndarray,
-    template_ids: np.ndarray,
+def long_centroids(
+    keys: list[Any], key_name: str, rows: list[np.ndarray], template_ids: np.ndarray,
+    shares: list[np.ndarray] | None = None,
 ) -> pl.DataFrame:  # fmt: skip
-    """Long centroids: ``cluster, template_id, share, root`` without all-zero entries."""
-    shares = counts / np.where(
-        counts.sum(axis=1, keepdims=True) > 0, counts.sum(1, keepdims=True), 1
-    )
+    """Long ``key, template_id[, share], root`` frame without entries that are zero everywhere."""
+    key_type = pl.String if key_name == "host" else pl.Int64
+    schema: dict[str, Any] = {key_name: key_type, "template_id": pl.Int64}
+    if shares is not None:
+        schema["share"] = pl.Float64
+    schema["root"] = pl.Float64
     parts = []
-    for c in range(1, len(centroids) + 1):
-        share = shares[labels == c].mean(axis=0)
-        keep = np.flatnonzero((share > 0) | (centroids[c - 1] > 0))
-        parts.append(
-            pl.DataFrame(
-                {
-                    "cluster": np.full(len(keep), c, dtype=np.int64),
-                    "template_id": template_ids[keep],
-                    "share": share[keep],
-                    "root": centroids[c - 1][keep],
-                },
-                schema={
-                    "cluster": pl.Int64,
-                    "template_id": pl.Int64,
-                    "share": pl.Float64,
-                    "root": pl.Float64,
-                },
-            )  # fmt: skip
-        )
-    return pl.concat(parts) if parts else pl.DataFrame(
-        schema={"cluster": pl.Int64, "template_id": pl.Int64, "share": pl.Float64,
-                "root": pl.Float64}
+    for i, key in enumerate(keys):
+        keep = np.flatnonzero((rows[i] > 0) | (shares[i] > 0 if shares is not None else False))
+        data: dict[str, Any] = {key_name: [key] * len(keep), "template_id": template_ids[keep]}
+        if shares is not None:
+            data["share"] = shares[i][keep]
+        data["root"] = rows[i][keep]
+        parts.append(pl.DataFrame(data, schema=schema))
+    return pl.concat(parts) if parts else pl.DataFrame(schema=schema)
+
+
+def cluster_centroid_frame(
+    centroids: np.ndarray, labels: np.ndarray, counts: np.ndarray, template_ids: np.ndarray
+) -> pl.DataFrame:
+    """Long cluster centroids: ``cluster, template_id, share, root``."""
+    totals = counts.sum(axis=1, keepdims=True)
+    shares = counts / np.where(totals > 0, totals, 1)
+    ids = list(range(1, len(centroids) + 1))
+    return long_centroids(
+        ids, "cluster", list(centroids), template_ids,
+        [shares[labels == c].mean(axis=0) for c in ids],
     )  # fmt: skip
+
+
+BASELINE_SCHEMA = {
+    "host": pl.String,
+    "windows": pl.Int64,
+    "median_lines": pl.Float64,
+    "median": pl.Float64,
+    "mad": pl.Float64,
+}
+
+
+def window_baseline(
+    counts: pl.DataFrame, template_ids: np.ndarray, peer_centroids: Centroids
+) -> pl.DataFrame:
+    """Per host with a peer centroid: median and MAD of its window distances to that centroid."""
+    chosen = counts.filter(pl.col("host").is_in(list(peer_centroids.keys)))
+    if chosen.is_empty():
+        return pl.DataFrame(schema=BASELINE_SCHEMA)
+    windows = chosen.select("host", "bin").unique().sort("host", "bin").with_row_index("w")
+    joined = chosen.join(windows, on=["host", "bin"])
+    cols = np.searchsorted(template_ids, joined["template_id"].to_numpy())
+    shape = (windows.height, len(template_ids))
+    matrix = sparse.csr_matrix(
+        (joined["n"].to_numpy().astype(np.float64), (joined["w"].to_numpy(), cols)), shape=shape
+    )
+    distance = centroid_distance(matrix, windows["host"].to_list(), peer_centroids)
+    lines = np.asarray(matrix.sum(axis=1)).ravel()
+    frame = windows.select("host").with_columns(
+        distance=pl.Series(distance), lines=pl.Series(lines)
+    )
+    med = pl.col("distance").median()
+    stats = frame.with_columns(dev=(pl.col("distance") - med.over("host")).abs())
+    return (
+        stats.group_by("host")
+        .agg(
+            pl.len().alias("windows"),
+            pl.col("lines").median().alias("median_lines"),
+            med.alias("median"),
+            (pl.col("dev").median() * MAD_SCALE).alias("mad"),
+        )
+        .sort("host")
+        .select(list(BASELINE_SCHEMA))
+        .cast(BASELINE_SCHEMA)  # type: ignore[arg-type]
+    )
 
 
 @dataclass(frozen=True)
@@ -282,20 +443,30 @@ class Result:
     hosts: pl.DataFrame
     clusters: pl.DataFrame
     centroids: pl.DataFrame
+    peers: pl.DataFrame
+    peer_centroids: pl.DataFrame
+    baseline: pl.DataFrame
     deviations: pl.DataFrame
     linkage: np.ndarray
     fit: dict[str, Any]
 
 
 def analyse(hosts: list[str], counts: np.ndarray, template_ids: np.ndarray) -> Result:
-    """Cluster the host profiles and score every host against its cluster."""
+    """Cluster the host profiles, find every host's peers and score it against them."""
     n = len(hosts)
     vectors = root_mix(counts)
-    raw, silhouette = cluster_hosts(vectors)
+    raw, candidates = cluster_hosts(vectors)
     labels = by_size(raw)
     centroids = centroids_of(vectors, labels)
-    distance = np.linalg.norm(vectors - centroids[labels - 1], axis=1) if n else np.zeros(0)
-    z, clusters = robust_scores(distance, labels)
+    own = centroids[labels - 1] if n else np.zeros((0, vectors.shape[1]))
+    distance = np.linalg.norm(vectors - own, axis=1) if n else np.zeros(0)
+    order, peer_dist, count, kth = find_peers(vectors)
+    z, outlier, clusters = score_hosts(distance, kth, count, labels)
+    ok = count >= MIN_PEERS
+    means = peer_means(vectors, order, count)
+    reference = np.where(ok[:, None], means, own)
+    keys = [h for h, valid in zip(hosts, ok, strict=True) if valid]
+    peer_roots = [means[i] for i in np.flatnonzero(ok)]
     k = int(labels.max()) if n else 0
     tree = linkage(vectors, "ward") if n >= 2 else np.zeros((0, 4))
     hier = by_size(fcluster(tree, k, "maxclust")) if n >= 2 and k >= 1 else np.ones(n, np.int64)
@@ -314,26 +485,44 @@ def analyse(hosts: list[str], counts: np.ndarray, template_ids: np.ndarray) -> R
             "cluster": labels,
             "hier_cluster": hier,
             "distance": distance,
+            "peer_distance": pl.Series(kth).fill_nan(None),
+            "peers": count.astype(np.int64),
+            "peer_ok": ok,
             "z": z,
-            "outlier": z > OUTLIER_Z,
+            "outlier": outlier,
             "leaf": leaf,
             "x": xy[:, 0],
             "y": xy[:, 1],
         },
         schema={
             "row": pl.Int64, "host": pl.String, "events": pl.Int64, "cluster": pl.Int64,
-            "hier_cluster": pl.Int64, "distance": pl.Float64, "z": pl.Float64,
-            "outlier": pl.Boolean, "leaf": pl.Int64, "x": pl.Float64, "y": pl.Float64,
+            "hier_cluster": pl.Int64, "distance": pl.Float64, "peer_distance": pl.Float64,
+            "peers": pl.Int64, "peer_ok": pl.Boolean, "z": pl.Float64, "outlier": pl.Boolean,
+            "leaf": pl.Int64, "x": pl.Float64, "y": pl.Float64,
         },
     )  # fmt: skip
+    peers = pl.DataFrame(
+        {
+            "host": [hosts[i] for i in np.flatnonzero(ok) for _ in range(count[i])],
+            "peer": [hosts[j] for i in np.flatnonzero(ok) for j in order[i, : count[i]]],
+            "distance": [d for i in np.flatnonzero(ok) for d in peer_dist[i, : count[i]]],
+        },
+        schema={"host": pl.String, "peer": pl.String, "distance": pl.Float64},
+    )
+    silhouette = {str(c["k"]): c["silhouette"] for c in candidates if c["feasible"]}
     fit = {
         "n_hosts": n,
         "n_templates": len(template_ids),
         "k": k,
-        "silhouette": {str(key): value for key, value in silhouette.items()},
+        "silhouette": silhouette,
+        "candidates": candidates,
         "ari": float(adjusted_rand_score(labels, hier)) if n >= 2 else None,
         "outlier_z": OUTLIER_Z,
         "min_peers": MIN_PEERS,
+        "min_scored": MIN_SCORED,
+        "peers": PEERS,
+        "peer_radius": PEER_RADIUS,
+        "no_peers": int((~ok).sum()),
         "projection_explained": planar.explained_variance_ratio_.tolist() if planar else [],
         "template_ids": [int(i) for i in template_ids],
         "transform": "sqrt(template share)",
@@ -341,8 +530,11 @@ def analyse(hosts: list[str], counts: np.ndarray, template_ids: np.ndarray) -> R
     return Result(
         frame,
         clusters,
-        centroid_frame(centroids, labels, vectors, counts, template_ids),
-        top_deviations(vectors, labels, centroids, hosts, template_ids),
+        cluster_centroid_frame(centroids, labels, counts, template_ids),
+        peers,
+        long_centroids(keys, "host", peer_roots, template_ids),
+        pl.DataFrame(schema=BASELINE_SCHEMA),
+        top_deviations(vectors, reference, hosts, template_ids),
         tree,
         fit,
     )
@@ -353,6 +545,9 @@ def write_result(out_dir: Path, result: Result) -> None:
         ("hosts", result.hosts),
         ("clusters", result.clusters),
         ("centroids", result.centroids),
+        ("peers", result.peers),
+        ("peer_centroids", result.peer_centroids),
+        ("baseline", result.baseline),
         ("deviations", result.deviations),
     ):
         frame.write_parquet(out_dir / f"{name}.parquet", compression="zstd")
@@ -365,14 +560,17 @@ def write_result(out_dir: Path, result: Result) -> None:
 def compute_all(
     ctx: ComputeContext, source_dir: Path, log: Callable[[str], None] = print
 ) -> dict[str, int]:
-    """Profiles, clusters and the service x host matrix; returns row counts."""
+    """Profiles, clusters, peers, window baselines and the service x host matrix."""
     template_ids = np.sort(
         pl.read_parquet(source_dir / "templates.parquet")["template_id"].to_numpy()
     )
     counts = pl.read_parquet(source_dir / "template_counts_host.parquet")
     hosts, matrix = profile_counts(counts, template_ids)
     result = analyse(hosts, matrix, template_ids)
-    write_result(ctx.out_dir, result)
+    baseline = window_baseline(
+        counts, template_ids, long_to_centroids(result.peer_centroids, "host", template_ids, "root")
+    )
+    write_result(ctx.out_dir, replace(result, baseline=baseline))
     pairs = ctx.con.execute(
         f"""SELECT coalesce(host, '{MISSING}') AS host,
                    coalesce(program, '{MISSING}') AS service, count(*)::BIGINT AS n
@@ -383,7 +581,8 @@ def compute_all(
     log(
         f"{len(hosts)} hosts, k={result.fit['k']} "
         f"(silhouette {max(result.fit['silhouette'].values(), default=0):.2f}), "
-        f"{outliers} outlier hosts, {pairs.height} service x host pairs"
+        f"{outliers} outlier hosts, {result.fit['no_peers']} without peers, "
+        f"{baseline.height} window baselines, {pairs.height} service x host pairs"
     )
     return {"hosts": len(hosts), "outliers": outliers, "pairs": pairs.height}
 
@@ -402,6 +601,8 @@ class Profile:
     linkage: np.ndarray
     service_host: pl.DataFrame
     fit: dict[str, Any]
+    peers: pl.DataFrame = field(default_factory=pl.DataFrame)
+    baseline: pl.DataFrame = field(default_factory=pl.DataFrame)
 
     @property
     def k(self) -> int:
@@ -409,8 +610,9 @@ class Profile:
 
 
 FILES = (
-    "hosts.parquet", "clusters.parquet", "centroids.parquet", "deviations.parquet",
-    "linkage.parquet", "service_host.parquet", "fit.json",
+    "hosts.parquet", "clusters.parquet", "centroids.parquet", "peers.parquet",
+    "peer_centroids.parquet", "baseline.parquet", "deviations.parquet", "linkage.parquet",
+    "service_host.parquet", "fit.json",
 )  # fmt: skip
 _PROFILES: Lru[Profile] = Lru(2)
 
@@ -433,47 +635,82 @@ def load_profile(store: CacheStore) -> Profile:
             link,
             store.read_parquet(KEY, "service_host.parquet"),
             store.read_json(KEY, "fit.json"),
+            store.read_parquet(KEY, "peers.parquet"),
+            store.read_parquet(KEY, "baseline.parquet"),
         )
 
     return _PROFILES.get((str(store.root), stamp), make)
 
 
 def load_assignments(store: CacheStore) -> pl.DataFrame:
-    """``host, cluster, distance, z, outlier, events``: the peer group of every host."""
+    """``host, cluster, distance, peer_distance, peers, peer_ok, z, outlier, events`` per host."""
     return store.read_parquet(KEY, "hosts.parquet").select(
-        "host", "cluster", "distance", "z", "outlier", "events"
-    )
+        "host", "cluster", "distance", "peer_distance", "peers", "peer_ok", "z", "outlier",
+        "events",
+    )  # fmt: skip
 
 
 def load_clusters(store: CacheStore) -> pl.DataFrame:
-    """``cluster, n_hosts, median_distance, scale, max_distance, outliers`` per cluster."""
+    """Per cluster statistics (see the module docstring)."""
     return store.read_parquet(KEY, "clusters.parquet")
+
+
+def load_peers(store: CacheStore) -> pl.DataFrame:
+    """``host, peer, distance`` of every host with a valid peer group, nearest first."""
+    return store.read_parquet(KEY, "peers.parquet")
+
+
+def load_baseline(store: CacheStore) -> pl.DataFrame:
+    """``host, windows, median_lines, median, mad`` of window distances to the peer centroid."""
+    return store.read_parquet(KEY, "baseline.parquet")
+
+
+def stage_template_ids(store: CacheStore, template_ids: np.ndarray | None) -> np.ndarray:
+    if template_ids is None:
+        return np.asarray(store.read_json(KEY, "fit.json")["template_ids"], dtype=np.int64)
+    return np.asarray(template_ids, dtype=np.int64)
+
+
+def long_to_centroids(
+    long: pl.DataFrame, key_name: str, template_ids: np.ndarray, column: str,
+    all_keys: list[Any] | None = None,
+) -> Centroids:  # fmt: skip
+    """Pivot a long centroid frame into ``Centroids`` with columns in ``template_ids`` order."""
+    keys = sorted(long[key_name].unique().to_list()) if all_keys is None else all_keys
+    matrix = np.zeros((len(keys), len(template_ids)))
+    lookup = {int(t): i for i, t in enumerate(template_ids)}
+    row_of = {key: i for i, key in enumerate(keys)}
+    cols = np.array([lookup.get(int(t), -1) for t in long["template_id"]], dtype=np.int64)
+    rows = np.array([row_of[key] for key in long[key_name]], dtype=np.int64)
+    known = cols >= 0
+    matrix[rows[known], cols[known]] = long[column].to_numpy()[known]
+    return Centroids(tuple(keys), matrix)
 
 
 def load_centroids(
     store: CacheStore, template_ids: np.ndarray | None = None, column: str = "root"
-) -> tuple[np.ndarray, np.ndarray]:
-    """Cluster ids (ascending) and their centroids as a ``k x templates`` matrix.
+) -> Centroids:
+    """Cluster centroids (keys are cluster ids) as a ``k x templates`` matrix.
 
-    ``column`` is ``root`` (clustering space, what ``centroid_distance`` expects) or ``share``.
-    Columns follow ``template_ids`` (default: the stage's own, from ``fit.json``); templates the
-    stage never saw are zero. Row ``i`` belongs to ``clusters[i]``; use ``clusters.searchsorted``
-    to turn a host's ``cluster`` into a row.
+    ``column`` is ``root`` (clustering space) or ``share``. Columns follow ``template_ids``
+    (default: the stage's own, from ``fit.json``); templates the stage never saw are zero.
+    These are for display: score windows against ``load_peer_centroids``.
     """
     long = store.read_parquet(KEY, "centroids.parquet")
-    ids = (
-        np.asarray(store.read_json(KEY, "fit.json")["template_ids"], dtype=np.int64)
-        if template_ids is None
-        else np.asarray(template_ids, dtype=np.int64)
-    )
-    clusters = np.sort(store.read_parquet(KEY, "clusters.parquet")["cluster"].to_numpy())
-    matrix = np.zeros((len(clusters), len(ids)))
-    lookup = {int(t): i for i, t in enumerate(ids)}
-    cols = np.array([lookup.get(int(t), -1) for t in long["template_id"]], dtype=np.int64)
-    known = cols >= 0
-    rows = np.searchsorted(clusters, long["cluster"].to_numpy())
-    matrix[rows[known], cols[known]] = long[column].to_numpy()[known]
-    return clusters, matrix
+    ids = stage_template_ids(store, template_ids)
+    clusters = sorted(store.read_parquet(KEY, "clusters.parquet")["cluster"].to_list())
+    return long_to_centroids(long, "cluster", ids, column, clusters)
+
+
+def load_peer_centroids(store: CacheStore, template_ids: np.ndarray | None = None) -> Centroids:
+    """Peer centroids (keys are host names) of the hosts that have a valid peer group.
+
+    The matrix is ``hosts x templates`` in the ``h = sqrt(share)`` space; hosts without a valid
+    peer group are absent (``Centroids.has`` tells).
+    """
+    long = store.read_parquet(KEY, "peer_centroids.parquet")
+    ids = stage_template_ids(store, template_ids)
+    return long_to_centroids(long, "host", ids, "root")
 
 
 # ----------------------------------------------------------------------- pure helpers
@@ -521,20 +758,43 @@ def deviation_text(profile: Profile, row: int) -> tuple[str, str]:
 
 
 def silhouette_figure(profile: Profile, scheme: str | None) -> go.Figure:
-    scores = {int(k): v for k, v in profile.fit["silhouette"].items()}
-    if not scores:
+    """Silhouette of every candidate k; excluded ones are grey with the reason on hover."""
+    cands = sorted(profile.fit.get("candidates", []), key=lambda c: c["k"])
+    if not cands:
         return figures.empty_figure("fewer than 3 hosts: one cluster", scheme)
-    ks = sorted(scores)
+    values = [c["silhouette"] or 0.0 for c in cands]
+    colors = [
+        figures.PALETTE[1] if c["chosen"] else figures.PALETTE[0] if c["feasible"]
+        else EXCLUDED_COLOR
+        for c in cands
+    ]  # fmt: skip
+    status = [
+        "chosen" if c["chosen"] else "eligible" if c["feasible"] else "excluded" for c in cands
+    ]
     fig = go.Figure(
         go.Bar(
-            x=ks, y=[scores[k] for k in ks],
-            marker_color=[figures.PALETTE[1] if k == profile.k else figures.PALETTE[0] for k in ks],
-            hovertemplate="k=%{x}: %{y:.3f}<extra></extra>",
+            x=[c["k"] for c in cands], y=values, marker_color=colors,
+            customdata=[
+                [s, "no silhouette" if c["silhouette"] is None else f"{c['silhouette']:.3f}",
+                 c["reason"], c["min_size"]]
+                for c, s in zip(cands, status, strict=True)
+            ],
+            hovertemplate=(
+                "k=%{x}: %{customdata[1]} (%{customdata[0]})<br>smallest cluster "
+                "%{customdata[3]} hosts<br>%{customdata[2]}<extra></extra>"
+            ),
         )
     )  # fmt: skip
     fig.update_xaxes(title="k (k-means clusters)", dtick=1)
-    fig.update_yaxes(title="silhouette", range=[min(0.0, min(scores.values())), 1])
-    figures.add_note(fig, f"k = {profile.k} has the highest silhouette ({scores[profile.k]:.2f})")
+    fig.update_yaxes(title="silhouette", range=[min(0.0, min(values)), 1])
+    excluded = [c["k"] for c in cands if not c["feasible"]]
+    note = f"k = {profile.k} has the highest silhouette among the eligible k"
+    if excluded:
+        note += (
+            f"; grey k ({', '.join(map(str, excluded))}) are excluded because a cluster would "
+            f"have fewer than {profile.fit.get('min_peers', MIN_PEERS)} hosts (hover for details)"
+        )
+    figures.add_note(fig, note)
     return figures.style(fig, scheme, height=320)
 
 
@@ -551,28 +811,34 @@ def projection_figure(profile: Profile, filters: Filters, scheme: str | None) ->
                 x=part["x"].to_list(), y=part["y"].to_list(), mode="markers",
                 name=cluster_label(profile, cluster), marker={"color": cluster_color(cluster)},
                 text=[
-                    f"{h}<br>distance {d:.3f}, z {z:.1f}"
-                    for h, d, z in part.select("host", "distance", "z").iter_rows()
+                    f"{h}<br>distance to cluster {d:.3f}, peers {p}, z {z:.1f}"
+                    for h, d, p, z in part.select("host", "distance", "peers", "z").iter_rows()
                 ],
                 hovertemplate="%{text}<extra></extra>",
             )
         )  # fmt: skip
-    top = hosts.filter(pl.col("outlier") & pl.col("host").is_in(chosen)).sort("z", descending=True)
+    top = hosts.filter(pl.col("outlier") & pl.col("host").is_in(chosen)).sort(
+        "z", "host", descending=[True, False]
+    )
     if top.height:
         top = top.head(LABELED_OUTLIERS)
         fig.add_trace(
             go.Scatter(
                 x=top["x"].to_list(), y=top["y"].to_list(), mode="markers+text", name="outliers",
                 text=[figures.shorten_middle(h, 20) for h in top["host"]],
-                textposition="top center", hoverinfo="skip",
+                textposition=[LABEL_SIDES[i % len(LABEL_SIDES)] for i in range(top.height)],
+                hoverinfo="skip",
                 marker={"symbol": "diamond-open", "size": 14, "color": figures.PALETTE[1]},
             )
         )  # fmt: skip
     share = profile.fit["projection_explained"]
     fig.update_xaxes(title="PC1 of the host profiles")
     fig.update_yaxes(title="PC2")
+    labelled = f"; the {LABELED_OUTLIERS} highest-z outliers are labelled" if top.height else ""
     figures.add_note(
-        fig, f"{len(chosen)} hosts; PC1 and PC2 keep {sum(share):.0%} of the profile variance"
+        fig,
+        f"{len(chosen)} hosts; PC1 and PC2 keep {sum(share):.0%} of the profile variance"
+        + labelled,
     )
     return figures.style(fig, scheme, height=420)
 
@@ -721,26 +987,47 @@ def matrix_figure(
 # ------------------------------------------------------------------------- tables
 
 
+def outlier_rows(profile: Profile, filters: Filters) -> pl.DataFrame:
+    """Outlier hosts (or the filtered hosts) by robust z, all of them."""
+    chosen = select_hosts(profile, filters)
+    rows = chosen if filters.hosts else chosen.filter(pl.col("outlier"))
+    return rows.sort("z", "host", descending=[True, False])
+
+
 def outlier_table(
     profile: Profile, filters: Filters, texts: dict[int, str]
 ) -> tuple[pl.DataFrame, list[str]]:
-    """Outlier hosts (or the filtered hosts) by robust z, with the deviating templates."""
-    chosen = select_hosts(profile, filters)
-    rows = chosen if filters.hosts else chosen.filter(pl.col("outlier"))
-    rows = rows.sort("z", "host", descending=[True, False]).head(OUTLIER_ROWS)
+    """The first ``OUTLIER_ROWS`` of ``outlier_rows`` with the deviating templates."""
+    rows = outlier_rows(profile, filters).head(OUTLIER_ROWS)
     devs = [deviation_text(profile, int(r)) for r in rows["row"]]
     table = pl.DataFrame(
         {
             "host": rows["host"],
             "cluster": rows["cluster"],
             "events": rows["events"],
-            "distance": rows["distance"].round(3),
+            "distance to cluster": rows["distance"].round(3),
+            "distance to peers": rows["peer_distance"].round(3),
             "z": rows["z"].round(1),
             "deviating templates": [d[0] for d in devs],
             "largest": [short_text(texts, int(d[1])) if d[1] else "" for d in devs],
         }
     )
     return table, [page_url("/explorer", host=h) for h in rows["host"]]
+
+
+def outlier_note(profile: Profile, filters: Filters) -> str:
+    """What the outlier table shows: the count, truncation, and hosts without peers."""
+    total = outlier_rows(profile, filters).height
+    shown = min(total, OUTLIER_ROWS)
+    what = "selected hosts" if filters.hosts else "outlier hosts"
+    text = f"Top {shown} of {total} {what}" if shown < total else f"{total} {what}"
+    isolated = int((~profile.hosts["peer_ok"]).sum())
+    unscored = int(profile.clusters.filter(~pl.col("scored"))["n_hosts"].sum())
+    return (
+        f"{text}, by z of the distance to the {MIN_PEERS}rd nearest host. {isolated} hosts have no "
+        f"peer group (fewer than {MIN_PEERS} hosts within {PEER_RADIUS}); {unscored} hosts lie in "
+        f"clusters of fewer than {MIN_SCORED} hosts, which get no z and so no outliers."
+    )
 
 
 def cluster_table(profile: Profile, texts: dict[int, str]) -> pl.DataFrame:
@@ -756,7 +1043,8 @@ def cluster_table(profile: Profile, texts: dict[int, str]) -> pl.DataFrame:
             {
                 "cluster": c,
                 "hosts": row["n_hosts"],
-                "outliers": row["outliers"],
+                "outliers": row["outliers"] if row["scored"] else None,
+                "no peers": row["no_peers"],
                 "median distance": round(row["median_distance"], 3),
                 "closest hosts": ", ".join(members_[:EXAMPLES]),
                 "main templates": "; ".join(
@@ -768,7 +1056,7 @@ def cluster_table(profile: Profile, texts: dict[int, str]) -> pl.DataFrame:
     return pl.DataFrame(
         out,
         schema={
-            "cluster": pl.Int64, "hosts": pl.Int64, "outliers": pl.Int64,
+            "cluster": pl.Int64, "hosts": pl.Int64, "outliers": pl.Int64, "no peers": pl.Int64,
             "median distance": pl.Float64, "closest hosts": pl.String, "main templates": pl.String,
         },
     )  # fmt: skip
@@ -780,15 +1068,21 @@ def stat_cards(profile: Profile) -> Component:
     return ui.grid(
         [
             ui.stat_card("hosts", ui.fmt_int(profile.hosts.height)),
-            ui.stat_card("services", ui.fmt_int(profile.service_host["service"].n_unique())),
+            ui.stat_card(
+                "services",
+                ui.fmt_int(
+                    profile.service_host.filter(pl.col("service") != MISSING)["service"].n_unique()
+                ),
+            ),
             ui.stat_card("k-means clusters", str(profile.k)),
             ui.stat_card(
                 "silhouette", f"{scores[str(profile.k)]:.2f}" if str(profile.k) in scores else "-"
             ),
             ui.stat_card("outlier hosts", ui.fmt_int(profile.hosts["outlier"].sum())),
+            ui.stat_card("hosts without peers", ui.fmt_int(profile.hosts["peer_ok"].not_().sum())),
             ui.stat_card("k-means vs tree (ARI)", "-" if ari is None else f"{ari:.2f}"),
         ],
-        cols={"base": 2, "md": 3, "lg": 6},
+        cols={"base": 2, "md": 4, "lg": 7},
     )
 
 
@@ -801,13 +1095,20 @@ def unavailable(store: CacheStore) -> str | None:
     return None
 
 
-def hint(filters: Filters) -> str:
+def hint(profile: Profile, filters: Filters) -> str:
     text = (
         "Profiles, clusters and the tree cover the whole span and every host, so the time range "
         "and level filters do not apply. "
     )
     if filters.hosts or filters.services:
-        text += "The host filter selects rows and the service filter columns of the matrix."
+        text += "The host filter selects rows and the service filter columns of the matrix. "
+    known = set(profile.hosts["host"].to_list())
+    lost = profile.service_host.filter(~pl.col("host").is_in(known))["n"].sum()
+    if lost:
+        text += (
+            f"{lost:,} lines have no host or no template and are not in the matrix or the "
+            f"profiles; the service '{MISSING}' is not counted among the services."
+        )
     return text
 
 
@@ -849,9 +1150,14 @@ def draw_hosts(
         style_for(tree_px),
         matrix_fig,
         style_for(matrix_px),
-        ui.link_table(outliers, hrefs) if outliers.height else dmc.Text("no outlier hosts"),
+        dmc.Stack(
+            [
+                dmc.Text(outlier_note(profile, filters), size="sm", c="dimmed"),
+                ui.link_table(outliers, hrefs) if outliers.height else dmc.Text("no outlier hosts"),
+            ]
+        ),
         ui.table(cluster_table(profile, texts)),
-        hint(filters),
+        hint(profile, filters),
     )
 
 
@@ -864,7 +1170,7 @@ def tall(graph_id: str) -> Component:
 class Hosts:
     key = KEY
     title = "Hosts"
-    version = "1"
+    version = "2"
     depends_on: tuple[str, ...] = (UPSTREAM,)
 
     def compute(self, ctx: ComputeContext) -> None:
@@ -900,16 +1206,18 @@ class Hosts:
                 cols={"base": 1, "lg": 2},
             ),
             ui.card("Clusters", dmc.Box(id="hosts-clusters")),
-            ui.card("Outlier hosts (distance to the cluster centroid)", dmc.Box(id="hosts-table")),
+            ui.card("Outlier hosts (no peers close by)", dmc.Box(id="hosts-table")),
             ui.card("Dendrogram (Ward linkage on the template mix)", tall("hosts-tree")),
             ui.card("Service x host matrix (hosts in dendrogram order)", tall("hosts-matrix")),
             dmc.Text(id="hosts-hint", size="sm", c="dimmed"),
             description=(
                 "A host's profile is its template mix over the whole span, compared as the "
                 "square root of the shares (Hellinger distance). k-means picks k by silhouette, "
-                "the tree is Ward linkage on the same profiles, and a host is an outlier when its "
-                "distance to its cluster's centroid is more than 3.5 robust standard deviations "
-                "above the cluster's median. The clusters feed the contextual detector."
+                "the tree is Ward linkage on the same profiles. A host's peers are its nearest "
+                "hosts within a fixed radius; it is an outlier when it has too few of them and its "
+                "distance to its third nearest host is more than 3.5 robust standard deviations "
+                "above the median of its cluster (clusters of few hosts are not scored). The peers "
+                "feed the contextual detector."
             ),
         )
 

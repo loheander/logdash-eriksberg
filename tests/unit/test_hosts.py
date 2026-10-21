@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta
 
 import numpy as np
 import polars as pl
@@ -71,31 +72,70 @@ def test_outlier_inside_a_cluster_is_flagged_with_evidence():
     assert dev["rank"].to_list() == [1, 2, 3] and dev["share"].sum() <= 1 + 1e-9
     assert dev["share"].to_list() == sorted(dev["share"], reverse=True)
     cluster = result.clusters.filter(pl.col("cluster") == row["cluster"]).row(0, named=True)
-    assert (row["distance"] - cluster["median_distance"]) / cluster["scale"] == pytest.approx(
-        row["z"]
-    )
-    assert cluster["outliers"] == 1
+    peer = (row["peer_distance"] - cluster["median_peer_distance"]) / cluster["scale"]
+    assert peer == pytest.approx(row["z"])
+    assert cluster["outliers"] == 1 and not row["peer_ok"] and cluster["no_peers"] == 1
 
 
-def test_small_clusters_have_no_scores():
-    labels = np.array([1, 1, 2, 3, 3, 3])
-    distance = np.array([0.1, 0.5, 0.0, 0.1, 0.1, 0.9])
-    z, clusters = hs.robust_scores(distance, labels)
-    assert (z[:3] == 0).all() and z[5] > hs.OUTLIER_Z  # a pair and a singleton get no z
-    assert clusters["n_hosts"].to_list() == [2, 1, 3]
+def test_small_clusters_have_no_scores_and_no_outliers():
+    """A three-member cluster has no meaningful z: its odd member is not an outlier."""
+    labels = np.array([1] * 3 + [2] * 10)
+    kth = np.array([0.01, 0.01, 0.9] + [0.02] * 9 + [0.9])
+    count = np.where(kth > hs.PEER_RADIUS, 0, hs.PEERS)
+    z, outlier, clusters = hs.score_hosts(np.zeros(13), kth, count, labels)
+    assert (z[:3] == 0).all() and not outlier[:3].any()
+    assert outlier[12] and outlier.sum() == 1 and z[12] > hs.OUTLIER_Z
+    assert clusters["scored"].to_list() == [False, True]
+    assert clusters["n_hosts"].to_list() == [3, 10] and clusters["no_peers"].to_list() == [1, 1]
     assert clusters["scale"].min() > 0  # never divides by zero
 
 
+def test_bimodal_cluster_is_a_sub_population_not_outliers():
+    """20 hosts and 8 more shifted equally: the 8 have peers, so nobody is an outlier."""
+    rng = np.random.default_rng(5)
+    base = np.array([60, 30, 5, 3, 2], dtype=float)
+    shifted = np.array([45, 30, 5, 3, 17], dtype=float)
+    counts = np.array(
+        [rng.poisson(base * 800) for _ in range(20)]
+        + [rng.poisson(shifted * 800) for _ in range(8)],
+        dtype=float,
+    )
+    result = hs.analyse([f"h{i:02d}" for i in range(28)], counts, np.arange(5))
+    frame = result.hosts
+    # forced into one cluster, the second mode is far from the mean and looks like 8 outliers
+    # by the distance to the cluster centroid ...
+    one = np.ones(28, dtype=np.int64)
+    mean = hs.centroids_of(hs.root_mix(counts), one)
+    dist = np.linalg.norm(hs.root_mix(counts) - mean[0], axis=1)
+    old_z = (dist - np.median(dist)) / (hs.MAD_SCALE * np.median(np.abs(dist - np.median(dist))))
+    assert (old_z[20:] > hs.OUTLIER_Z).all() or (old_z[:20] > hs.OUTLIER_Z).all()
+    # ... but each host has peers in its own mode, so nobody is an outlier
+    kth = frame["peer_distance"].to_numpy()
+    _, outlier, _ = hs.score_hosts(dist, kth, frame["peers"].to_numpy(), one)
+    assert frame["peer_ok"].all() and not outlier.any() and frame["outlier"].sum() == 0
+    peers = result.peers.filter(pl.col("host") == "h25")
+    assert set(peers["peer"]) <= {f"h{i}" for i in range(20, 28)}  # peers are its own mode
+    assert not result.peer_centroids.is_empty()
+
+
 def test_cluster_hosts_degenerate_inputs():
-    labels, scores = hs.cluster_hosts(np.zeros((2, 4)))
-    assert labels.tolist() == [0, 0] and scores == {}
-    labels, scores = hs.cluster_hosts(np.ones((8, 3)))  # identical profiles
-    assert set(labels.tolist()) == {0} and scores == {}
-    labels, scores = hs.cluster_hosts(np.eye(5))  # no k leaves every cluster MIN_PEERS hosts
-    assert set(labels.tolist()) == {0} and scores == {}
+    labels, cands = hs.cluster_hosts(np.zeros((2, 4)))
+    assert labels.tolist() == [0, 0] and cands == []
+    labels, cands = hs.cluster_hosts(np.ones((8, 3)))  # identical profiles
+    assert set(labels.tolist()) == {0} and not any(c["feasible"] for c in cands)
+    assert all("distinct" in c["reason"] for c in cands)
+    labels, cands = hs.cluster_hosts(np.eye(5))  # no k leaves every cluster MIN_PEERS hosts
+    assert set(labels.tolist()) == {0} and not any(c["feasible"] for c in cands)
+    assert [c["k"] for c in cands] == [2, 3, 4] and all(c["reason"] for c in cands)
     blobs = np.repeat(np.eye(3) * 5, 4, axis=0) + np.random.default_rng(0).normal(0, 0.1, (12, 3))
-    labels, scores = hs.cluster_hosts(blobs)
-    assert max(scores, key=lambda k: scores[k]) == 3 and np.bincount(labels).tolist() == [4, 4, 4]
+    labels, cands = hs.cluster_hosts(blobs)
+    assert [c["k"] for c in cands if c["chosen"]] == [3]
+    assert np.bincount(labels).tolist() == [4, 4, 4]
+    excluded = [c for c in cands if not c["feasible"]]  # every k is listed with its reason
+    assert [c["k"] for c in cands] == list(range(2, 11)) and all(c["reason"] for c in cands)
+    assert excluded and all(
+        c["min_size"] < hs.MIN_PEERS or c["silhouette"] is None for c in excluded
+    )
     assert min(np.unique(labels, return_counts=True)[1]) >= hs.MIN_PEERS
     assert hs.by_size(np.array([5, 7, 7, 7, 5, 9])).tolist() == [2, 1, 1, 1, 2, 3]
     assert hs.by_size(np.zeros(0)).tolist() == []
@@ -118,14 +158,21 @@ def test_root_mix_and_centroid_distance_agree_with_the_definition():
     rng = np.random.default_rng(3)
     counts = rng.poisson(0.7, size=(40, 12)).astype(float)
     counts[5] = 0  # an empty window
-    centroids = root_centroids = hs.root_mix(rng.poisson(3, size=(3, 12)).astype(float))
-    clusters = rng.integers(0, 3, size=40)
-    expected = np.linalg.norm(hs.root_mix(counts) - centroids[clusters], axis=1)
+    matrix = hs.root_mix(rng.poisson(3, size=(3, 12)).astype(float))
+    centroids = hs.Centroids((1, 2, 3), matrix)  # ids are 1-based, rows 0-based
+    clusters = rng.integers(1, 4, size=40)
+    expected = np.linalg.norm(hs.root_mix(counts) - matrix[clusters - 1], axis=1)
     assert hs.root_mix(counts)[5].sum() == 0
     for form in (counts, sparse.csr_matrix(counts), sparse.coo_matrix(counts)):
-        got = hs.centroid_distance(form, clusters, root_centroids)
+        got = hs.centroid_distance(form, clusters, centroids)
         assert np.allclose(got, expected, atol=1e-9)
     assert hs.centroid_distance(sparse.csr_matrix((0, 12)), clusters[:0], centroids).shape == (0,)
+    assert centroids.rows([3, 1]).tolist() == [2, 0] and centroids.has([1, 9]).tolist() == [
+        True,
+        False,
+    ]
+    with pytest.raises(KeyError):
+        hs.centroid_distance(counts[:1], [0], centroids)  # 0 is not an id: no silent row 0
 
 
 def test_profile_counts_aligns_templates():
@@ -177,31 +224,97 @@ def figures_short(text):
 def test_stored_format_serves_the_contextual_detector(stage):
     """Assignments, centroids and distances can be joined to template-count windows."""
     assignments = hs.load_assignments(stage)
-    assert assignments.columns == ["host", "cluster", "distance", "z", "outlier", "events"]
-    clusters = hs.load_clusters(stage)
-    assert clusters.columns == [
-        "cluster", "n_hosts", "median_distance", "scale", "max_distance", "outliers"
+    assert assignments.columns == [
+        "host", "cluster", "distance", "peer_distance", "peers", "peer_ok", "z", "outlier", "events"
     ]  # fmt: skip
-    ids, matrix = hs.load_centroids(stage)
-    assert ids.tolist() == clusters.sort("cluster")["cluster"].to_list()
+    clusters = hs.load_clusters(stage)
+    assert clusters["scored"].dtype == pl.Boolean and "median_peer_distance" in clusters.columns
+    cen = hs.load_centroids(stage)
+    assert list(cen.keys) == clusters.sort("cluster")["cluster"].to_list()
     profile = hs.load_profile(stage)
     template_ids = np.array(profile.fit["template_ids"])
-    assert matrix.shape == (len(ids), len(template_ids))
-    share_ids, share = hs.load_centroids(stage, template_ids[::-1], "share")
-    assert np.allclose(share.sum(axis=1), 1)
-    assert np.allclose(share[:, ::-1], hs.load_centroids(stage, column="share")[1])
-    # a host's profile is at its stored distance from its centroid
+    assert cen.matrix.shape == (len(cen.keys), len(template_ids))
+    share = hs.load_centroids(stage, template_ids[::-1], "share")
+    assert np.allclose(share.matrix.sum(axis=1), 1)
+    assert np.allclose(share.matrix[:, ::-1], hs.load_centroids(stage, column="share").matrix)
+    # a host's profile is at its stored distance from its (1-based) cluster centroid
     names, counts = hs.profile_counts(
         stage.read_parquet("templates", "template_counts_host.parquet"), template_ids
     )
     frame = assignments.sort("host")
     assert names == frame["host"].to_list()
-    rows = np.searchsorted(ids, frame["cluster"].to_numpy())
-    got = hs.centroid_distance(sparse.csr_matrix(counts), rows, matrix)
+    got = hs.centroid_distance(sparse.csr_matrix(counts), frame["cluster"].to_list(), cen)
     assert np.allclose(got, frame["distance"].to_numpy())
     # unknown templates are ignored, not an error
-    _, partial = hs.load_centroids(stage, np.array([-5, int(template_ids[0])]))
-    assert partial.shape == (len(ids), 2)
+    partial = hs.load_centroids(stage, np.array([-5, int(template_ids[0])]))
+    assert partial.matrix.shape == (len(cen.keys), 2)
+
+
+def test_peer_files_serve_window_scoring(stage):
+    """Windows are scored against the host's peer centroid and judged by its stored baseline."""
+    assignments = hs.load_assignments(stage)
+    peers, baseline = hs.load_peers(stage), hs.load_baseline(stage)
+    ok = assignments.filter(pl.col("peer_ok"))["host"].to_list()
+    assert sorted(baseline["host"].to_list()) == sorted(ok)
+    assert set(peers["host"]) == set(ok) and (peers["host"] != peers["peer"]).all()
+    assert (peers["distance"] <= hs.PEER_RADIUS).all()
+    cen = hs.load_peer_centroids(stage)
+    assert set(cen.keys) == set(ok)
+    counts = stage.read_parquet("templates", "template_counts_host.parquet")
+    ids = np.array(hs.load_profile(stage).fit["template_ids"])
+    again = hs.window_baseline(counts, ids, cen).sort("host")
+    assert again.equals(baseline.sort("host"))
+    if ok:
+        host = ok[0]
+        part = counts.filter(pl.col("host") == host)
+        windows = part.select("bin").unique().sort("bin")
+        matrix = sparse.csr_matrix(
+            (part["n"].to_numpy().astype(float),
+             (part["bin"].replace_strict({b: i for i, b in enumerate(windows["bin"])}).to_numpy(),
+              np.searchsorted(ids, part["template_id"].to_numpy()))),
+            shape=(windows.height, len(ids)),
+        )  # fmt: skip
+        dist = hs.centroid_distance(matrix, [host] * windows.height, cen)
+        row = baseline.filter(pl.col("host") == host).row(0, named=True)
+        assert row["windows"] == windows.height and row["median"] == pytest.approx(np.median(dist))
+        mad = 1.4826 * np.median(np.abs(dist - np.median(dist)))
+        assert row["mad"] == pytest.approx(mad) and row["median_lines"] >= 1
+    assert not cen.has(["nonexistent"]).any()
+
+
+def test_window_baseline_on_planted_peers():
+    """A host-specific deviation in one window stands out against the host's baseline."""
+    rng = np.random.default_rng(2)
+    base = np.array([60, 30, 5, 3, 2], dtype=float)
+    mat = rng.poisson(base * 300, size=(12, 5)).astype(float)
+    hosts = [f"h{i:02d}" for i in range(12)]
+    ids = np.arange(5) + 10
+    result = hs.analyse(hosts, mat, ids)
+    assert result.hosts["peer_ok"].all() and result.fit["no_peers"] == 0
+    cen = hs.long_to_centroids(result.peer_centroids, "host", ids, "root")
+    minutes = np.arange(40)
+    rows = []
+    for host in hosts[:3]:
+        for m in minutes:
+            mix = base.copy()
+            if host == "h01" and m == 17:
+                mix = np.array([5, 5, 5, 5, 80], dtype=float)  # a window only this host has
+            for t, v in enumerate(rng.poisson(mix * 3)):
+                if v:
+                    rows.append(
+                        (host, datetime(2026, 1, 1) + timedelta(minutes=int(m)), 10 + t, int(v))
+                    )
+    frame = pl.DataFrame(rows, schema=["host", "bin", "template_id", "n"], orient="row")
+    base_frame = hs.window_baseline(frame, ids, cen)
+    assert base_frame["host"].to_list() == hosts[:3]
+    got = base_frame.filter(pl.col("host") == "h01").row(0, named=True)
+    all_dist = hs.centroid_distance(
+        sparse.csr_matrix(np.array([[0, 0, 0, 0, 80], [60, 30, 5, 3, 2]], dtype=float)),
+        ["h01", "h01"],
+        cen,
+    )
+    assert all_dist[0] > got["median"] + 10 * got["mad"] > all_dist[1] - 10 * got["mad"] - 1
+    assert got["windows"] == 40 and got["median_lines"] > 0
 
 
 def test_figures_and_tables(stage):
@@ -238,6 +351,7 @@ def test_figures_and_tables(stage):
     assert table["deviating templates"][0].startswith("T")
     everything, _ = hs.outlier_table(profile, Filters(), texts)
     assert everything.height == int(profile.hosts["outlier"].sum())
+    assert "hosts have no peer group" in hs.outlier_note(profile, Filters())
     clusters = hs.cluster_table(profile, texts)
     assert clusters.height == profile.k and clusters["hosts"].sum() == 6
     assert "%" in clusters["main templates"][0]
