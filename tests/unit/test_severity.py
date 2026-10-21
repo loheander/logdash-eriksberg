@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import polars as pl
 import pytest
-from scipy import stats
+from scipy import special, stats
 
 from logdash.analyses import temporal
 from logdash.analyses.temporal import find_bursts
@@ -13,7 +13,7 @@ from logdash.cache.store import CacheStore
 from logdash.config import Settings
 from logdash.detectors import base, severity
 from logdash.detectors.base import DetectContext
-from logdash.detectors.severity import Severity, poisson_z
+from logdash.detectors.severity import Severity, p_text, tail_z
 
 T0 = datetime(2023, 5, 21)
 MINUTES = 600
@@ -57,31 +57,79 @@ def test_error_burst_on_a_zero_baseline_scores_the_poisson_tail(tmp_path):
     rows = detect(tmp_path, {("api", "ERROR"): x})
     assert rows.height == 1
     row = rows.row(0, named=True)
-    z, p = poisson_z(20, severity.MIN_RATE)
+    z, log_p = tail_z(20, severity.MIN_RATE)
     assert row["raw"] == pytest.approx(z) and z != 20
     assert row["bin"] == T0 + timedelta(minutes=300) and row["window_s"] == 180
     assert row["evidence"].startswith("ERROR burst: peak 20/min vs baseline 0/min (Poisson P=")
-    assert f"z={z:.1f}" in row["evidence"] and f"P={p:.1e}" in row["evidence"]
+    assert f"z={z:.1f}" in row["evidence"] and f"P{p_text(log_p)}" in row["evidence"]
     assert row["kind"] == "service" and row["entity"] == "api"
 
 
-def test_poisson_z_matches_the_tail_and_survives_underflow():
-    z, p = poisson_z(10, 2.0)
-    assert p == pytest.approx(stats.poisson.sf(9, 2.0)) and z == pytest.approx(stats.norm.isf(p))
-    huge, tiny = poisson_z(40_000, 4_000.0)  # scipy's logsf is -inf here
-    assert np.isfinite(huge) and huge > 300 and tiny == 0.0
-    assert poisson_z(5, 5.0)[0] < poisson_z(8, 5.0)[0] < poisson_z(20, 5.0)[0]
+def exact_log_tail(dist, peak: int) -> float:
+    """log P(X >= peak) as a logsumexp of the pmf over the tail (far beyond where it matters)."""
+    k = np.arange(peak, peak + 20_000)
+    return float(special.logsumexp(dist.logpmf(k)))
 
 
-def test_a_busy_baseline_keeps_the_robust_z(tmp_path):
+def test_tail_z_matches_the_tail_and_survives_underflow():
+    z, log_p = tail_z(10, 2.0)
+    p = stats.poisson.sf(9, 2.0)
+    assert np.exp(log_p) == pytest.approx(p) and z == pytest.approx(stats.norm.isf(p))
+    huge, log_tiny = tail_z(40_000, 4_000.0)  # scipy's logsf is -inf here
+    assert np.isfinite(huge) and huge > 300 and np.exp(log_tiny) == 0.0
+    assert tail_z(5, 5.0)[0] < tail_z(8, 5.0)[0] < tail_z(20, 5.0)[0]
+
+
+@pytest.mark.parametrize(
+    ("peak", "rate", "variance"),
+    [(188, 0.56, None), (442, 11.0, None), (1500, 300.0, None), (5000, 1.0, None)]
+    + [(442, 11.0, 60.0), (3000, 50.0, 400.0), (900, 5.0, 30.0)],
+)
+def test_the_first_term_bound_matches_an_exact_logsumexp_tail(peak, rate, variance):
+    z, log_p = tail_z(peak, rate, variance)
+    if variance is None:
+        dist = stats.poisson(rate)
+    else:
+        size = rate * rate / (variance - rate)
+        dist = stats.nbinom(size, size / (size + rate))
+    exact = exact_log_tail(dist, peak)
+    assert log_p == pytest.approx(exact, abs=0.05)
+    assert z == pytest.approx(-float(special.ndtri_exp(exact)), abs=0.05)
+
+
+def test_a_tiny_p_is_printed_as_a_power_of_ten():
+    assert p_text(np.log(3.2e-19)) == "=3.2e-19"
+    assert p_text(-950.0) == "≈1e-413"
+
+
+def test_a_busy_baseline_is_scored_by_the_over_dispersed_tail(tmp_path):
     x = poisson(1, 50)
     x[300:303] = 400
     rows = detect(tmp_path, {("api", "WARNING"): x})
     assert rows.height == 1
-    assert "robust z=" in rows["evidence"][0] and "Poisson" not in rows["evidence"][0]
-    found = find_bursts(x, 6.0)
-    assert rows["raw"][0] == pytest.approx(found[0]["score"])
-    assert f"robust z={found[0]['score']:.1f}" in rows["evidence"][0]
+    text = rows["evidence"][0]
+    assert "negative binomial P=" in text and "robust" not in text
+    assert f"z={rows['raw'][0]:.1f}" in text and rows["raw"][0] > 6.0
+
+
+def test_a_larger_excess_never_ranks_below_a_smaller_one_across_the_old_median_10_switch(tmp_path):
+    """One scale: the z of a burst grows with its peak at every baseline from 8 to 12 per min."""
+    for baseline in (8, 9.9, 11, 12):
+        previous = 0.0
+        for peak in (150, 300, 600, 1200, 2400):
+            x = poisson(5, baseline)
+            x[300:303] = peak
+            raw = detect(tmp_path / f"{baseline}-{peak}", {("api", "WARNING"): x})["raw"][0]
+            assert raw > previous
+            previous = raw
+    # and across baselines: the larger excess over a similar baseline ranks higher
+    small = poisson(5, 9.0)
+    small[300:303] = 200
+    big = poisson(5, 11.0)
+    big[300:303] = 800
+    a = detect(tmp_path / "a", {("api", "WARNING"): small})["raw"][0]
+    b = detect(tmp_path / "b", {("api", "WARNING"): big})["raw"][0]
+    assert b > a
 
 
 def test_level_floors_let_a_small_error_burst_through_but_not_warnings(tmp_path):
@@ -133,10 +181,40 @@ def test_periodic_warning_bursts_are_one_demoted_row(tmp_path):
     assert "ranked at the threshold" in text
 
 
-def test_the_same_bursts_at_irregular_spacing_stay_separate(tmp_path):
-    offsets = [100, 155, 260, 301, 470, 640, 653, 900, 1180]
+def test_irregular_bursts_stay_separate_unless_they_are_close(tmp_path):
+    offsets = [100, 380, 790, 1010, 1420, 1650, 1960]
     rows = detect(tmp_path, {("agent", "WARNING"): bursts_every(0, 0, offsets)})
-    assert rows.height == 9 and (rows["raw"] > 6.0).all()
+    assert rows.height == 7 and (rows["raw"] > 6.0).all()
+
+
+def test_nearby_episodes_of_a_service_are_one_incident_scored_without_itself(tmp_path):
+    x = poisson(6, 2)
+    for start, peak in ((200, 150), (230, 120), (262, 120), (290, 150)):  # gaps of 25 to 29 min
+        x[start : start + 3] = peak
+    x[480:483] = 150  # 190 minutes later: its own incident
+    rows = detect(tmp_path, {("barbican", "WARNING"): x}).sort("bin")
+    assert rows.height == 2
+    first = rows.row(0, named=True)
+    assert first["bin"] == T0 + timedelta(minutes=200) and first["window_s"] == 93 * 60
+    assert "in 4 bursts over 93 min (03:20 to 04:52)" in first["evidence"]
+    assert "burst" in rows["evidence"][1] and "bursts" not in rows["evidence"][1]
+
+
+def test_the_incident_is_interpolated_out_of_its_own_baseline():
+    x = np.full(300, 2.0)
+    x[100:200] = 500  # an incident that fills most of the rolling window
+    spans = [{"first": 100, "last": 199}]
+    assert temporal.rolling_baseline(x)[0][150] == 500  # scored against itself: no burst at all
+    assert (severity.without(x, spans) == 2.0).all()
+    assert severity.without(x, []) is x
+
+
+def test_periodic_bursts_closer_than_the_merge_gap_are_still_one_periodic_row(tmp_path):
+    rows = detect(tmp_path, {("agent", "WARNING"): bursts_every(30, 12)})
+    assert (
+        rows.height == 1
+        and "12 episodes in all, repeating about every 30 min" in rows["evidence"][0]
+    )
 
 
 def test_a_constant_high_rate_is_no_burst(tmp_path):
@@ -167,7 +245,7 @@ def test_min_excess_default_is_unchanged_for_find_bursts():
 
 def test_version_embeds_the_tunable_constants_and_the_threshold_follows_burst_k():
     version = Severity().version
-    for part in (severity.POISSON_BELOW, severity.MIN_RATE, temporal.MIN_EXCESS):
+    for part in (severity.MIN_RATE, severity.MERGE_GAP, temporal.MIN_EXCESS):
         assert str(part) in version
     assert "ERROR" in version and "30" in version
     assert Severity().threshold_for(Settings(burst_k=9.0)) == 9.0
@@ -196,3 +274,27 @@ def test_meta_counts_concurrent_services(tmp_path):
     ctx = DetectContext(store, store.settings, lambda _: None)
     rows = Severity().detect(ctx)
     assert rows.height == 3 and ctx.meta["max_services_starting_in_one_minute"] == 3
+
+
+def test_meta_counts_distinct_services_not_rows(tmp_path):
+    warn, err = np.zeros(MINUTES), np.zeros(MINUTES)
+    warn[300:303], err[300:303] = 500, 40  # one service, a WARNING and an ERROR burst, same minute
+    store = CacheStore(tmp_path, Settings(cache_dir=tmp_path))
+    frame = pl.concat(
+        [
+            pl.DataFrame(
+                {
+                    "bin": [T0 + timedelta(minutes=i) for i in (300, 301, 302)],
+                    "level": lv,
+                    "program": "api",
+                    "n": [n, n, n],
+                }
+            )
+            for lv, n in (("WARNING", 500), ("ERROR", 40))
+        ]
+        + [info(MINUTES)]
+    )
+    store.write_parquet(temporal.KEY, "rate_60.parquet", frame)
+    ctx = DetectContext(store, store.settings, lambda _: None)
+    assert Severity().detect(ctx).height == 2
+    assert ctx.meta["max_services_starting_in_one_minute"] == 1

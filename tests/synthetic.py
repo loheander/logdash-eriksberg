@@ -98,8 +98,14 @@ REQUEST_STEPS = [
 OUT_OF_ORDER_STEPS = (1, 0)
 REQUEST_HOST = HOSTS[1]
 CONTEXT_HOST = HOSTS[5]
-ERROR_HOST = HOSTS[3]
-ERROR_SERVICE = SERVICES[3]  # libvirt: not haproxy, whose own windows the novel template needs
+# The ERROR burst gets a host and a service that no other injection uses. A large injection on an
+# entity raises that entity's own 99.5 % structural level (``_episodes.entity_level``), so a
+# burst of 600 lines on the host of another injection (earlier: haproxy, whose windows the novel
+# template needs, then libvirt on HOSTS[3], which also hosts the rare template) hides that
+# injection from the structural detectors. This is a known limit of per-entity levels on real data
+# too (README, "Known limitations"); the injections are kept on separate entities.
+ERROR_HOST = HOSTS[5]
+ERROR_SERVICE = SERVICES[1]  # neutron-l3-agent: hosts no other injection (its WARNING is periodic)
 ERROR_TEMPLATE = "internal error: connection {n} closed unexpectedly by peer {ip}"
 CONTEXT_TEMPLATE = 0  # in the window the host logs only this template (of the first service)
 
