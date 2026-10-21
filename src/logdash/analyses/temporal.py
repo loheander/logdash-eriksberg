@@ -419,16 +419,48 @@ def rate_figure(
         )  # fmt: skip
     fig.update_yaxes(title=f"events per {_bin_label(bin_s)}")
     fig.update_xaxes(range=[lo, hi])
-    title = f"bin {_bin_label(bin_s)}" + (f" ({note})" if note else "")
-    return figures.style(fig, scheme, title=title, dragmode="zoom", height=380)
+    figures.add_note(fig, f"bin {_bin_label(bin_s)}" + (f" ({note})" if note else ""))
+    return figures.style(fig, scheme, dragmode="zoom", height=380)
 
 
 def _bin_label(seconds: int) -> str:
     return f"{seconds // 60} min" if seconds >= 60 else f"{seconds} s"
 
 
-def heatmap_figure(df: pl.DataFrame, bin_s: int, scheme: str | None) -> go.Figure:
-    """Host x time heatmap of log1p counts from a ``(bin, host, n)`` frame."""
+HEAT_MAX_HEIGHT = 720
+REL_CLIP = 3.0
+REL_TICKS = ("×1/8", "×1/4", "×1/2", "×1", "×2", "×4", "×8")
+
+
+def heatmap_height(n_hosts: int) -> int:
+    """Pixel height: one row per host up to ``HEAT_MAX_HEIGHT``; labels thin out beyond that."""
+    return min(HEAT_MAX_HEIGHT, max(320, 14 * n_hosts + 120))
+
+
+def relative_ratio(z: np.ndarray) -> np.ndarray:
+    """Each row's counts divided by that row's median (floored at 1); gaps give 0."""
+    med = np.maximum(np.median(z, axis=1, keepdims=True), 1.0)
+    return z / med
+
+
+def relative_scale(z: np.ndarray, clip: float = REL_CLIP) -> np.ndarray:
+    """log2 of the per-row ratio to the row median, clipped to ``[-clip, clip]``.
+
+    Zero counts (gaps) are mapped to ``-clip``, the strongest negative value.
+    """
+    with np.errstate(divide="ignore"):
+        out = np.log2(relative_ratio(z))
+    return np.clip(out, -clip, clip)
+
+
+def heatmap_figure(
+    df: pl.DataFrame, bin_s: int, scheme: str | None, scale: str = "relative"
+) -> go.Figure:
+    """Host x time heatmap from a ``(bin, host, n)`` frame.
+
+    ``relative``: log2 of the ratio to each host's median, diverging around 0.
+    ``absolute``: log1p of the counts.
+    """
     if df.is_empty():
         return figures.empty_figure("no events in the visible range", scheme)
     hosts = sorted(df["host"].unique().to_list())
@@ -442,18 +474,36 @@ def heatmap_figure(df: pl.DataFrame, bin_s: int, scheme: str | None) -> go.Figur
         ]
     )
     x = [t0 + timedelta(seconds=bin_s * i) for i in range(length)]
+    relative = scale != "absolute"
+    scaling: dict[str, Any] = (
+        {
+            "z": relative_scale(z),
+            "zmin": -REL_CLIP,
+            "zmax": REL_CLIP,
+            "zmid": 0,
+            "colorscale": "RdBu_r",
+            "colorbar": {
+                "title": "vs host median",
+                "tickvals": list(range(-3, 4)),
+                "ticktext": list(REL_TICKS),
+            },
+        }
+        if relative
+        else {"z": np.log1p(z), "colorscale": "Viridis", "colorbar": {"title": "log(1+n)"}}
+    )
     fig = go.Figure(
         go.Heatmap(
             x=x,
             y=hosts,
-            z=np.log1p(z),
-            customdata=z,
-            hovertemplate="%{y} %{x}: %{customdata:,.0f} events<extra></extra>",
-            colorbar={"title": "log(1+n)"},
-            colorscale="Viridis",
-        )  # fmt: skip
+            customdata=np.dstack([z, relative_ratio(z)]),
+            hovertemplate=(
+                "%{y} %{x}: %{customdata[0]:,.0f} events (×%{customdata[1]:.2f} median)"
+                "<extra></extra>"
+            ),
+            **scaling,
+        )
     )
-    return figures.style(fig, scheme, height=max(320, 14 * len(hosts) + 120))
+    return figures.style(fig, scheme, height=heatmap_height(len(hosts)))
 
 
 def acf_figure(acf: pl.DataFrame, service: str | None, scheme: str | None) -> go.Figure:
@@ -463,7 +513,9 @@ def acf_figure(acf: pl.DataFrame, service: str | None, scheme: str | None) -> go
     fig = go.Figure(go.Scatter(x=part["lag"].to_list(), y=part["acf"].to_list(), mode="lines"))
     fig.update_xaxes(title="lag (seconds)")
     fig.update_yaxes(title="autocorrelation", range=[-1, 1])
-    return figures.style(fig, scheme, title=f"{service}: autocorrelation of events per second")
+    return figures.style(
+        fig, scheme, title=f"{service}: autocorrelation of events per second", showlegend=False
+    )
 
 
 def spectrum_figure(
@@ -472,7 +524,11 @@ def spectrum_figure(
     part = spectrum.filter(pl.col("service") == service).sort("period")
     if part.is_empty():
         return figures.empty_figure("no periodogram for this service", scheme)
-    fig = go.Figure(go.Scatter(x=part["period"].to_list(), y=part["power"].to_list(), mode="lines"))
+    fig = go.Figure(
+        go.Scatter(
+            x=part["period"].to_list(), y=part["power"].to_list(), mode="lines", name="periodogram"
+        )
+    )
     top = peaks.filter(pl.col("service") == service)
     fig.add_scatter(
         x=top["period"].to_list(), y=top["power"].to_list(), mode="markers", name="peaks",
@@ -578,6 +634,7 @@ class Temporal:
     def layout(self, store: CacheStore, **_query: Any) -> Component:
         peaks = store.read_parquet(KEY, "peaks.parquet")
         services = [s for s in peaks["service"].unique().sort().to_list() if s != ALL]
+        meta = store.read_json(KEY, "meta.json")
         return ui.page(
             "Temporal analysis",
             dmc.Group(
@@ -595,14 +652,28 @@ class Temporal:
             ),  # fmt: skip
             ui.card(
                 "Host x time heatmap",
-                dmc.SegmentedControl(
-                    id="temporal-hbin",
-                    data=[{"label": "1 min", "value": "60"}, {"label": "5 min", "value": "300"}],
-                    value="300",
-                    size="xs",
+                dmc.Group(
+                    [
+                        dmc.SegmentedControl(
+                            id="temporal-hbin",
+                            data=[
+                                {"label": "1 min", "value": "60"},
+                                {"label": "5 min", "value": "300"},
+                            ],
+                            value="300",
+                            size="xs",
+                        ),
+                        dmc.Text("Scale", size="sm"),
+                        dmc.SegmentedControl(
+                            id="temporal-hscale",
+                            data=["relative", "absolute"],
+                            value="relative",
+                            size="xs",
+                        ),
+                    ],
                     mb="xs",
                 ),
-                ui.graph("temporal-heatmap", 420),
+                ui.graph("temporal-heatmap", heatmap_height(len(meta["hosts"]))),
             ),
             ui.card(
                 "Periodicity",
@@ -656,12 +727,18 @@ class Temporal:
             Output("temporal-heatmap", "figure"),
             Input(FILTER_STORE_ID, "data"),
             Input("temporal-hbin", "value"),
+            Input("temporal-hscale", "value"),
             Input(THEME_STORE_ID, "data"),
         )
         def draw_heatmap(
-            filters: dict[str, Any] | None, hbin: str | None, theme: str | None
+            filters: dict[str, Any] | None,
+            hbin: str | None,
+            hscale: str | None,
+            theme: str | None,
         ) -> go.Figure:
-            return self.heatmap(store, from_dict(filters), int(hbin or 300), theme)
+            return self.heatmap(
+                store, from_dict(filters), int(hbin or 300), theme, hscale or "relative"
+            )
 
         @app.callback(
             Output("temporal-acf", "figure"),
@@ -692,14 +769,20 @@ class Temporal:
         return rate_figure(df, lo, hi, size, split, theme, note)
 
     @staticmethod
-    def heatmap(store: CacheStore, filters: Filters, bin_s: int, theme: str | None) -> go.Figure:
+    def heatmap(
+        store: CacheStore,
+        filters: Filters,
+        bin_s: int,
+        theme: str | None,
+        scale: str = "relative",
+    ) -> go.Figure:
         meta = store.read_json(KEY, "meta.json")
         lo, hi = visible_range(filters, meta)
         if (hi - lo).total_seconds() / bin_s > HEAT_MAX_BINS:
             bin_s = 300
         name = f"host_{bin_s}.parquet"
         df = lazy_table(store, name).filter((pl.col("bin") >= lo) & (pl.col("bin") < hi)).collect()
-        return heatmap_figure(filter_frame(df, filters, host="host"), bin_s, theme)
+        return heatmap_figure(filter_frame(df, filters, host="host"), bin_s, theme, scale)
 
     @staticmethod
     def brushed(

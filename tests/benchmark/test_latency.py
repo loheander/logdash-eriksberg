@@ -134,12 +134,12 @@ def test_temporal(store: CacheStore) -> None:
                 CALLBACK_BUDGET_S,
                 lambda f=filters, s=split: fns["draw_rate"](f, s, "light"),  # type: ignore[misc]
             )
-        for hbin in ("60", "300"):
+        for hbin, hscale in (("60", "relative"), ("300", "relative"), ("300", "absolute")):
             measure(
                 "temporal.draw_heatmap",
-                f"{name}, bin={hbin}",
+                f"{name}, bin={hbin}, scale={hscale}",
                 CALLBACK_BUDGET_S,
-                lambda f=filters, b=hbin: fns["draw_heatmap"](f, b, "light"),  # type: ignore[misc]
+                lambda f=filters, b=hbin, h=hscale: fns["draw_heatmap"](f, b, h, "light"),  # type: ignore[misc]
             )
         measure(
             "temporal.draw_anomalies",

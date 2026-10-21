@@ -79,7 +79,7 @@ def test_histogram_zero_annotation():
 
 def test_bar_figure_vertical():
     counts = pl.DataFrame({"value": ["a"], "n": [1]})
-    assert d.bar_figure(counts, "t", False, None, horizontal=False).data[0].x == ("a",)
+    assert d.bar_figure(counts, False, None, horizontal=False).data[0].x == ("a",)
 
 
 def test_layout_and_callback(dist, built):

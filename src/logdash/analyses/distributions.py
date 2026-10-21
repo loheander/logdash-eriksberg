@@ -135,23 +135,31 @@ def collapse_bins(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
 
 
 def bar_figure(
-    counts: pl.DataFrame, title: str, log: bool, scheme: str | None, *, horizontal: bool = True
+    counts: pl.DataFrame, log: bool, scheme: str | None, *, horizontal: bool = True
 ) -> go.Figure:
     if counts.is_empty():
         return figures.empty_figure("no data for the current filters", scheme)
     labels, values = counts["value"].to_list(), counts["n"].to_list()
     fig = go.Figure(
-        go.Bar(x=values, y=labels, orientation="h") if horizontal else go.Bar(x=labels, y=values)
+        go.Bar(
+            x=values,
+            y=[figures.shorten_middle(str(v)) for v in labels],
+            orientation="h",
+            customdata=labels,
+            hovertemplate="%{customdata}: %{x:,}<extra></extra>",
+        )
+        if horizontal
+        else go.Bar(x=labels, y=values)
     )
     count_axis = fig.update_xaxes if horizontal else fig.update_yaxes
     count_axis(type=figures.axis_type(log), title="events")
     if horizontal:
         fig.update_yaxes(autorange="reversed")
-    return figures.style(fig, scheme, title=title, height=max(280, 24 * len(labels) + 120))
+    return figures.style(fig, scheme, height=max(280, 24 * len(labels) + 120))
 
 
 def histogram_figure(
-    df: pl.DataFrame, title: str, x_title: str, log: bool, scheme: str | None
+    df: pl.DataFrame, note: str, x_title: str, log: bool, scheme: str | None
 ) -> go.Figure:
     bins, zero = collapse_bins(df)
     if bins.is_empty():
@@ -169,15 +177,15 @@ def histogram_figure(
     fig.update_xaxes(type="log", title=x_title)
     fig.update_yaxes(type=figures.axis_type(log), title="count")
     if zero:
-        fig.add_annotation(
-            text=f"{zero:,} zero values not shown", xref="paper", yref="paper", x=1, y=1.12,
-            showarrow=False, xanchor="right",
-        )  # fmt: skip
-    return figures.style(fig, scheme, title=title, showlegend=False)
+        note = (
+            f"{note}; {zero:,} zero values not shown" if note else f"{zero:,} zero values not shown"
+        )
+    figures.add_note(fig, note)
+    return figures.style(fig, scheme, showlegend=False)
 
 
 def interarrival_figure(
-    df: pl.DataFrame, title: str, log: bool, scheme: str | None, lines: int = SERVICE_LINES
+    df: pl.DataFrame, log: bool, scheme: str | None, lines: int = SERVICE_LINES
 ) -> go.Figure:
     """One line per service (largest ``lines`` by event count) over log-spaced gap bins."""
     df = df.filter(pl.col("bin").is_not_null())
@@ -195,7 +203,7 @@ def interarrival_figure(
         )
     fig.update_xaxes(type="log", title="seconds between consecutive events")
     fig.update_yaxes(type=figures.axis_type(log), title="count")
-    return figures.style(fig, scheme, title=title)
+    return figures.style(fig, scheme)
 
 
 def build_figures(
@@ -203,18 +211,15 @@ def build_figures(
 ) -> dict[str, go.Figure]:
     """All page figures keyed by graph id; pure, so it is tested without a browser."""
     out: dict[str, go.Figure] = {}
-    for dim, (_, title) in DIMENSIONS.items():
+    for dim in DIMENSIONS:
         counts = category_counts(tables["categories"], dim, filters)
-        out[f"dist-{dim}"] = bar_figure(counts, title, log, scheme)
+        out[f"dist-{dim}"] = bar_figure(counts, log, scheme)
     payload = filter_frame(tables["payload"], filters, level="level", service="program")
-    out["dist-payload"] = histogram_figure(
-        payload, HISTOGRAMS["payload"], "characters", log, scheme
-    )
+    out["dist-payload"] = histogram_figure(payload, "", "characters", log, scheme)
     for name, x_title in (("lines", "lines"), ("duration", "seconds")):
-        title = f"{HISTOGRAMS[name]} (not filtered)"
-        out[f"dist-{name}"] = histogram_figure(tables[name], title, x_title, log, scheme)
+        out[f"dist-{name}"] = histogram_figure(tables[name], "not filtered", x_title, log, scheme)
     inter = filter_frame(tables["interarrival"], filters, service="program")
-    out["dist-interarrival"] = interarrival_figure(inter, HISTOGRAMS["interarrival"], log, scheme)
+    out["dist-interarrival"] = interarrival_figure(inter, log, scheme)
     return out
 
 

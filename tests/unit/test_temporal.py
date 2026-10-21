@@ -118,7 +118,7 @@ def test_rate_figures(tmp):
     filtered = Temporal.rate(tmp, Filters(services=("haproxy",), levels=("INFO",)), "service", None)
     assert [tr.name for tr in filtered.data] == ["haproxy"]
     note = Temporal.rate(tmp, Filters(hosts=("eselda14u05s02",), levels=("INFO",)), "level", None)
-    assert "ignored" in note.layout.title.text and len(note.data) == 1
+    assert "ignored" in note.layout.annotations[0].text and len(note.data) == 1
     hosts = Temporal.rate(tmp, Filters(hosts=("eselda14u05s02",)), "host", None)
     assert [tr.name for tr in hosts.data] == ["eselda14u05s02"]
     empty = Temporal.rate(tmp, Filters(services=("nope",)), "level", None)
@@ -129,7 +129,7 @@ def test_rate_uses_finer_bins_when_zoomed(tmp, synthetic):
     start = naive(synthetic.truth.spike_start).replace(microsecond=0)
     f = Filters(start=start.isoformat(" "), end=(start + timedelta(minutes=2)).isoformat(" "))
     fig = Temporal.rate(tmp, f, "service", None)
-    assert fig.layout.title.text.startswith("bin 1 s")
+    assert fig.layout.annotations[0].text.startswith("bin 1 s")
     assert max(max(tr.y) for tr in fig.data) > 10
 
 
@@ -231,7 +231,12 @@ def test_layout_and_callbacks_over_http(tmp, built):
     )
     call(
         [("temporal-heatmap", "figure")],
-        [*base, ("temporal-hbin", "value", "60"), ("theme", "data", "dark")],
+        [
+            *base,
+            ("temporal-hbin", "value", "60"),
+            ("temporal-hscale", "value", "absolute"),
+            ("theme", "data", "dark"),
+        ],
     )
     call(
         [("temporal-acf", "figure"), ("temporal-spectrum", "figure")],
@@ -251,3 +256,34 @@ def test_rate_figure_with_range_not_aligned_to_bins():
     )
     fig = t.rate_figure(df, lo, lo + timedelta(minutes=3), 60, "level", None)
     assert list(fig.data[0].y)[:2] == [5, 7]
+
+
+def test_relative_scale_centres_on_host_median_and_marks_gaps():
+    z = np.array([[10.0, 10.0, 80.0, 0.0, 10.0, 6.0]])
+    out = t.relative_scale(z)[0]
+    assert out[0] == 0.0
+    assert out[2] == 3.0  # x8 hits the clip
+    assert out[3] == -3.0  # a gap is the strongest negative value
+    assert -3.0 < out[5] < 0.0
+    assert np.all(np.abs(out) <= t.REL_CLIP)
+    assert t.relative_ratio(np.zeros((1, 3))).max() == 0.0
+
+
+def test_heatmap_scales(tmp):
+    rel = Temporal.heatmap(tmp, Filters(), 300, "light")
+    assert rel.data[0].zmid == 0 and rel.data[0].colorbar.ticktext[3] == "×1"
+    ab = Temporal.heatmap(tmp, Filters(), 300, "light", "absolute")
+    assert ab.data[0].zmid is None and ab.data[0].colorbar.title.text == "log(1+n)"
+
+
+def test_shorten_middle():
+    from logdash.app.figures import shorten_middle
+
+    assert shorten_middle("short") == "short"
+    out = shorten_middle("neutron-openvswitch-agent-very-long-name", 20)
+    assert len(out) == 20 and "…" in out and out.startswith("neutron-op")
+
+
+def test_heatmap_height_is_capped():
+    assert t.heatmap_height(3) == 320
+    assert t.heatmap_height(1000) == t.HEAT_MAX_HEIGHT

@@ -46,10 +46,10 @@ def template(scheme: str | None = LIGHT) -> go.layout.Template:
             "paper_bgcolor": colors["bg"],
             "plot_bgcolor": colors["bg"],
             "font": {"color": colors["text"]},
-            "xaxis": axis,
-            "yaxis": axis,
+            "xaxis": {**axis, "automargin": True},
+            "yaxis": {**axis, "automargin": True},
             "margin": {"l": 56, "r": 16, "t": 32, "b": 48},
-            "legend": {"orientation": "h", "y": -0.2},
+            "legend": {"orientation": "v", "x": 1.02, "xanchor": "left", "y": 1, "yanchor": "top"},
         }
     )
 
@@ -57,6 +57,25 @@ def template(scheme: str | None = LIGHT) -> go.layout.Template:
 def style(fig: go.Figure, scheme: str | None = LIGHT, **layout: object) -> go.Figure:
     """Apply the shared template (and optional layout overrides) to ``fig``."""
     fig.update_layout(template=template(scheme), **layout)
+    return fig
+
+
+def shorten_middle(text: str, limit: int = 28) -> str:
+    """Shorten ``text`` to ``limit`` characters with an ellipsis in the middle."""
+    if len(text) <= limit:
+        return text
+    head = (limit - 1 + 1) // 2
+    tail = limit - 1 - head
+    return f"{text[:head]}…{text[len(text) - tail :]}"
+
+
+def add_note(fig: go.Figure, text: str) -> go.Figure:
+    """Small dimmed note above the plot area, top left (never overlaps the plot)."""
+    if text:
+        fig.add_annotation(
+            text=text, xref="paper", yref="paper", x=0, y=1, xanchor="left", yanchor="bottom",
+            showarrow=False, font={"size": 12, "color": "#868e96"},
+        )  # fmt: skip
     return fig
 
 

@@ -256,7 +256,8 @@ def volume_figure(
     full = figures.fill_bins(binned, lo.replace(second=0), hi, size)
     fig = go.Figure(go.Bar(x=full["bin"].to_list(), y=full["n"].to_list()))
     fig.update_yaxes(title=f"events per {size // 60} min")
-    return figures.style(fig, scheme, title=f"Template {template_id}", height=320)
+    figures.add_note(fig, f"template {template_id}")
+    return figures.style(fig, scheme, height=320)
 
 
 def param_options(params: pl.DataFrame, template_id: int | None) -> list[dict[str, str]]:
@@ -293,10 +294,19 @@ def param_figure(
         fig.update_yaxes(title="sampled lines")
     else:
         top = part.sort("n", descending=True).head(PARAM_BARS)
-        fig = go.Figure(go.Bar(x=top["n"].to_list(), y=top["value"].to_list(), orientation="h"))
+        fig = go.Figure(
+            go.Bar(
+                x=top["n"].to_list(),
+                y=[figures.shorten_middle(str(v)) for v in top["value"]],
+                orientation="h",
+                customdata=top["value"].to_list(),
+                hovertemplate="%{customdata}: %{x:,}<extra></extra>",
+            )
+        )
         fig.update_yaxes(autorange="reversed", type="category")
         fig.update_xaxes(title="sampled lines")
-    return figures.style(fig, scheme, title=f"Parameter #{int(position) + 1} ({kind})", height=320)
+    figures.add_note(fig, f"parameter #{int(position) + 1} ({kind})")
+    return figures.style(fig, scheme, height=320)
 
 
 def grid_rows(templates: pl.DataFrame, limit: int = GRID_ROWS) -> list[dict[str, Any]]:
