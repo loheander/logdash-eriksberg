@@ -1,6 +1,7 @@
 """Latency benchmark on the real cache (``uv run pytest -m slow --no-cov``).
 
-Every callback must answer in under 300 ms; a first ``layout`` may take up to 1 s.
+Every callback must answer in under 300 ms; a first ``layout`` or a cold-cache request may
+take up to 1 s.
 Skipped when ``./cache`` has no built events.
 """
 
@@ -8,12 +9,13 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from logdash.analyses import load_builtin
+from logdash.analyses import features, load_builtin
 from logdash.analyses.base import REGISTRY
 from logdash.analyses.explorer import fetch_page, search_page
 from logdash.analyses.temporal import Temporal
@@ -189,24 +191,42 @@ def test_templates(store: CacheStore) -> None:
     )
 
 
+FEATURE_CASES = (
+    ("60", "service", "log1p"),
+    ("60", "host", "log1p"),
+    ("60", "service", "tfidf"),
+    ("60", "host", "tfidf"),
+    ("300", "service", "tfidf"),
+    ("900", "host", "log1p"),
+)
+
+
 def test_features(store: CacheStore) -> None:
     fns = _recorded(store, "features")
     for name, filters in _cases(store).items():
-        for window, group, scale in (
-            ("60", "service", "log1p"),
-            ("60", "host", "log1p"),
-            ("60", "service", "tfidf"),
-            ("60", "host", "tfidf"),
-            ("900", "host", "log1p"),
-        ):
-            measure(
-                "features.draw",
-                f"{name}, {window} s, {group}, {scale}",
-                CALLBACK_BUDGET_S,
-                lambda f=filters, w=window, g=group, sc=scale: fns["draw"](
-                    w, g, sc, "40", f, "light"
-                ),  # type: ignore[misc]
-            )
+        for window, group, scale in FEATURE_CASES:
+            for top in ("15", "40"):
+                measure(
+                    "features.draw",
+                    f"{name}, {window} s, {group}, {scale}, top {top}",
+                    CALLBACK_BUDGET_S,
+                    partial(fns["draw"], window, group, scale, top, filters, "light"),
+                )
+
+
+def test_features_cold(store: CacheStore) -> None:
+    """First request after start-up: the matrix and the statistics are not in memory."""
+    fns = _recorded(store, "features")
+    for window, group, scale in FEATURE_CASES:
+        features.clear_caches()
+        draw = partial(fns["draw"], window, group, scale, "40", None, "light")
+        t0 = time.perf_counter()
+        draw()
+        cold = time.perf_counter() - t0
+        warm = _time(draw)
+        results.append(("features.draw (cold)", f"{window} s, {group}, {scale}", cold, warm))
+        if cold >= LAYOUT_BUDGET_S:  # a first request may take as long as a first layout
+            over.append(f"features.draw cold [{window} s, {group}, {scale}] {cold * 1000:.0f} ms")
 
 
 def test_explorer(store: CacheStore) -> None:

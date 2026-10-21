@@ -38,8 +38,8 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | Stage | Time |
 |---|---|
 | events (normalised, hour-partitioned Parquet) | 97 s |
-| overview, distributions, temporal, templates, explorer | under 8 s each |
-| features | built from the template counts only (not yet measured on the real data) |
+| overview, distributions, temporal, templates, explorer | under 8 s each (measured before the templates stage also wrote the per-host counts) |
+| features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
 | total | 1 min 58 s |
 
 `cache/` is 622 MB (281 templates from 73,583 unique masked lines).

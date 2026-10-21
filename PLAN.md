@@ -291,10 +291,15 @@ Status: **Phase 1 done** (steps 1 to 9).
 - Module 4 (features) done: `analyses/features.py`, built from `templates/template_counts*.parquet`
   only. The templates stage now also writes `template_counts_host.parquet` (version 2). The
   stage stores a sparse long-format matrix and row index per grouping (service, host) and
-  window (1, 5, 15 min) in `cache/features/`; `load_matrix` returns a CSR matrix for PCA and the
-  detectors. The page computes scaling (log1p, TF-IDF), correlation, variance and the mutual
-  information between "template occurs in a window" and the entity from that matrix in memory.
-  Latency on the real cache is covered by the slow benchmark but has not been measured yet.
+  window (1, 5, 15 min) in `cache/features/`; `load_matrix` returns a `Matrix` with a CSR count matrix for PCA and the
+  detectors; `load_scaled` returns the log1p or TF-IDF variant. The page computes scaling,
+  correlation, variance and the mutual information between "template occurs in a window" and the
+  entity from that matrix in memory, memoised per (grid, range, filter, scaling), so a change of
+  theme or top-N only redraws. Bumping the templates version (per-host counts) forces a rebuild of
+  templates, features and everything downstream on the next `logdash build`. On a synthetic
+  matrix (300k windows x 300 templates, 3 % density, 30 entities) a cold request takes about
+  0.5 s, a theme or top-N change about 40 ms and a new scaling or range about 0.35 s; the slow
+  benchmark has not been run on the real cache yet.
 
 ## 9. Open decisions
 

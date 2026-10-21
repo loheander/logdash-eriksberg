@@ -8,15 +8,19 @@ host) and window (1, 5, 15 min), a sparse matrix in long format plus its row ind
 - ``matrix_<group>_<s>.parquet``: ``row, template_id, n`` (non-zero counts);
 - ``meta.json``: the template ids (columns, sorted) and the grids that were written.
 
-``load_matrix`` turns a pair into a ``scipy.sparse`` CSR matrix that PCA and the detectors can
-use directly. The page works on that matrix in memory: the visible range selects rows, scaling
-(log1p or TF-IDF) and statistics treat absent rows as zeros, so empty windows count.
+``load_matrix`` turns a pair into a ``Matrix`` whose ``counts`` is a ``scipy.sparse`` CSR matrix
+of raw counts; ``load_scaled`` returns the log1p or TF-IDF variant of the whole span for PCA and
+the detectors. The page works on that matrix in memory: the visible range selects rows, scaling
+(log1p or TF-IDF) and statistics treat absent rows as zeros, so empty windows count. Statistics
+are memoised per (cache version, grid, range, entity filter, scaling), so a change of theme or
+top-N only redraws the figures.
 """
 
 from __future__ import annotations
 
 import json
 import math
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -123,7 +127,32 @@ class Matrix:
     window_s: int
 
 
-_CACHE: dict[tuple[str, int, int], Matrix] = {}
+_CACHE: dict[tuple[str, str, int], tuple[tuple[int, ...], Matrix]] = {}
+_META: dict[str, tuple[int, dict[str, Any]]] = {}
+_TEXTS: dict[str, tuple[int, dict[int, str]]] = {}
+
+
+class Lru[T]:
+    """Tiny least-recently-used memo for computed statistics."""
+
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self.items: OrderedDict[Any, T] = OrderedDict()
+
+    def get(self, key: Any, make: Callable[[], T]) -> T:
+        if key in self.items:
+            self.items.move_to_end(key)
+            return self.items[key]
+        value = self.items[key] = make()
+        while len(self.items) > self.size:
+            self.items.popitem(last=False)
+        return value
+
+
+def clear_caches() -> None:
+    """Forget every in-memory matrix, statistic and text (the next call loads from disk)."""
+    for cache in (_CACHE, _META, _TEXTS, _STATS.items, _CORR.items):
+        cache.clear()
 
 
 def build_matrix(
@@ -132,7 +161,10 @@ def build_matrix(
     entities = sorted(index["entity"].unique().to_list())
     mapping = {name: i for i, name in enumerate(entities)}
     ids = np.asarray(template_ids, dtype=np.int64)
-    cols = np.searchsorted(ids, matrix["template_id"].to_numpy())
+    wanted = matrix["template_id"].to_numpy()
+    cols = np.searchsorted(ids, wanted)
+    if len(wanted) and (cols.max() >= len(ids) or not np.array_equal(ids[cols], wanted)):
+        raise ValueError("matrix holds template ids that are not in meta.json; rebuild features")
     counts = sparse.csr_matrix(
         (matrix["n"].to_numpy().astype(np.float64), (matrix["row"].to_numpy(), cols)),
         shape=(index.height, len(ids)),
@@ -144,15 +176,48 @@ def build_matrix(
 def load_matrix(
     store: CacheStore, group: str = DEFAULT_GROUP, window_s: int = DEFAULT_WINDOW
 ) -> Matrix:
-    """Matrix of one grid as written by the build; kept in memory per file version."""
-    path = store.path(KEY, grid_name("matrix", group, window_s))
-    key = (str(path), path.stat().st_mtime_ns, window_s)
-    if key not in _CACHE:
+    """Matrix of one grid as written by the build; kept in memory until a file changes."""
+    stamp = grid_stamp(store, group, window_s)
+    key = (str(store.root), group, window_s)
+    cached = _CACHE.get(key)
+    if cached is None or cached[0] != stamp:
         index = store.read_parquet(KEY, grid_name("index", group, window_s))
         matrix = store.read_parquet(KEY, grid_name("matrix", group, window_s))
-        ids = store.read_json(KEY, "meta.json")["template_ids"]
-        _CACHE[key] = build_matrix(index, matrix, ids, window_s)
-    return _CACHE[key]
+        ids = read_meta(store)["template_ids"]
+        cached = _CACHE[key] = (stamp, build_matrix(index, matrix, ids, window_s))
+    return cached[1]
+
+
+def grid_stamp(store: CacheStore, group: str, window_s: int) -> tuple[int, ...]:
+    """Modification times of the three files a grid is built from."""
+    names = (grid_name("index", group, window_s), grid_name("matrix", group, window_s), "meta.json")
+    return tuple(store.path(KEY, name).stat().st_mtime_ns for name in names)
+
+
+def read_meta(store: CacheStore) -> dict[str, Any]:
+    """``meta.json`` of the stage, re-read only when the file changes."""
+    path = store.path(KEY, "meta.json")
+    mtime = path.stat().st_mtime_ns
+    cached = _META.get(str(path))
+    if cached is None or cached[0] != mtime:
+        cached = _META[str(path)] = (mtime, json.loads(path.read_text()))
+    return cached[1]
+
+
+def load_scaled(
+    store: CacheStore,
+    group: str = DEFAULT_GROUP,
+    window_s: int = DEFAULT_WINDOW,
+    scaling: str = DEFAULT_SCALING,
+) -> sparse.csr_matrix:
+    """Scaled matrix of one grid over the whole data span, rows as in ``load_matrix``.
+
+    ``scaling`` is ``log1p`` or ``tfidf``; the TF-IDF idf counts all windows of the span for all
+    entities (empty ones included), exactly as the page does with no filter set.
+    """
+    lo, hi = visible_range(store, Filters(), window_s)
+    selection = select_rows(load_matrix(store, group, window_s), lo, hi)
+    return scale_counts(selection.counts, scaling, selection.n_rows)
 
 
 # ---------------------------------------------------------------------- pure helpers
@@ -177,18 +242,23 @@ class Selection:
 def select_rows(
     matrix: Matrix, lo: datetime, hi: datetime, entities: tuple[str, ...] = ()
 ) -> Selection:
-    """Restrict to ``bin`` in ``[lo, hi)`` and, if given, to the named entities."""
-    names = [e for e in matrix.entities if not entities or e in entities]
-    lookup = np.full(len(matrix.entities) + 1, -1, dtype=np.int64)
-    for local, name in enumerate(names):
-        lookup[matrix.entities.index(name)] = local
-    local_codes = lookup[matrix.codes]
+    """Restrict to ``bin`` in ``[lo, hi)`` and, if given, to the named entities.
+
+    Only entities with at least one row in the range are kept, so they do not dilute the
+    equal-weight mean of the mutual information or the variance.
+    """
+    allowed = np.array([not entities or e in entities for e in matrix.entities], dtype=bool)
     keep = (
         (matrix.bins >= np.datetime64(lo, "us"))
         & (matrix.bins < np.datetime64(hi, "us"))
-        & (local_codes >= 0)
+        & allowed[matrix.codes]
     )
     rows = np.flatnonzero(keep)
+    used = np.unique(matrix.codes[rows])  # entities without a row in the range are dropped
+    lookup = np.full(len(matrix.entities), -1, dtype=np.int64)
+    lookup[used] = np.arange(len(used))
+    names = [matrix.entities[i] for i in used]
+    local_codes = lookup[matrix.codes]
     n_windows = max(math.ceil((hi - lo).total_seconds() / matrix.window_s), 1)
     return Selection(matrix.counts[rows], local_codes[rows], names, n_windows, matrix.template_ids)
 
@@ -364,12 +434,16 @@ def association_figure(
         return figures.empty_figure("no templates in the range", scheme)
     by = stats.by_entity[columns]
     busiest = np.argsort(-stats.by_entity.sum(axis=0), kind="stable")[:MAX_ENTITIES]
-    share = by / by.sum(axis=1, keepdims=True)
+    share = (by / by.sum(axis=1, keepdims=True))[:, busiest]
     names = [figures.shorten_middle(sel.entities[i]) for i in busiest]
+    hidden = len(sel.entities) - len(busiest)
+    if hidden > 0:  # an 'other' column keeps every row at 1
+        share = np.column_stack([share, np.clip(1.0 - share.sum(axis=1), 0.0, 1.0)])
+        names.append(f"other ({hidden})")
     ids = sel.template_ids[columns]
     fig = go.Figure(
         go.Heatmap(
-            z=share[:, busiest].tolist(), x=names, y=[label(int(i)) for i in ids],
+            z=share.tolist(), x=names, y=[label(int(i)) for i in ids],
             text=[[t] * len(names) for t in _texts(ids, texts)], colorscale="Blues", zmin=0, zmax=1,
             hovertemplate="%{text}<br>%{x}: %{z:.0%} of its events<extra></extra>",
             colorbar={"title": "share", "tickformat": ".0%"},
@@ -377,7 +451,8 @@ def association_figure(
     )  # fmt: skip
     fig.update_xaxes(type="category", tickangle=-60)
     fig.update_yaxes(type="category", autorange="reversed")
-    figures.add_note(fig, f"share of each template per {group}, busiest {len(names)} {group}s")
+    shown = len(busiest)
+    figures.add_note(fig, f"share of each template per {group}, busiest {shown} {group}s")
     return figures.style(fig, scheme, height=560)
 
 
@@ -427,20 +502,96 @@ def floor_window(value: datetime, window_s: int) -> datetime:
     return datetime.fromtimestamp(seconds - seconds % window_s, UTC).replace(tzinfo=None)
 
 
+def ceil_window(value: datetime, window_s: int) -> datetime:
+    """Start of the first window at or after ``value``."""
+    start = floor_window(value, window_s)
+    return start if start == value else start + timedelta(seconds=window_s)
+
+
 def visible_range(store: CacheStore, filters: Filters, window_s: int) -> tuple[datetime, datetime]:
-    """Whole windows covering the filter's time range, clamped to the data span."""
-    meta = store.read_json(KEY, "meta.json")
+    """Whole windows covering the filter's time range, clamped to the data span.
+
+    The start is floored and the end ceiled, so a window that the range touches is included in
+    full (windows are half-open, ``[start, start + window)``).
+    """
+    meta = read_meta(store)
     first = floor_window(datetime.fromisoformat(meta["ts_min"]), window_s)
     last = floor_window(datetime.fromisoformat(meta["ts_max"]), window_s) + timedelta(
         seconds=window_s
     )
     lo = max(floor_window(parse_time(filters.start) or first, window_s), first)
-    hi = min(floor_window(parse_time(filters.end) or last, window_s), last)
+    hi = min(ceil_window(parse_time(filters.end) or last, window_s), last)
     return lo, max(hi, lo + timedelta(seconds=window_s))
 
 
 def entity_filter(filters: Filters, group: str) -> tuple[str, ...]:
     return filters.services if group == "service" else filters.hosts
+
+
+@dataclass(frozen=True)
+class Computed:
+    """Statistics and table for one (grid, range, entity filter, scaling); no figures."""
+
+    key: tuple[Any, ...]
+    stats: FeatureStats
+    table: pl.DataFrame
+
+
+_STATS: Lru[Computed] = Lru(8)
+_CORR: Lru[np.ndarray] = Lru(16)
+
+
+def unavailable(store: CacheStore, window_s: int, group: str) -> str | None:
+    """Why the page cannot draw (stage missing, empty or older than the templates), or None."""
+    files = [grid_name("index", group, window_s), grid_name("matrix", group, window_s)]
+    if not all(store.exists(KEY, n) for n in (*files, "meta.json")) or not store.exists(
+        UPSTREAM, "templates.parquet"
+    ):
+        return "The features stage is not built; run `logdash build`."
+    meta = read_meta(store)
+    if not meta.get("ts_min") or not meta.get("ts_max"):
+        return "No events in the cache."
+    if len(meta["template_ids"]) != len(template_texts(store)):
+        return "The features stage is older than the templates stage; run `logdash build`."
+    return None
+
+
+def ignored_filters(filters: Filters, group: str) -> str:
+    """Sidebar filters that do not apply to this page, as a hint (empty when none)."""
+    ignored = []
+    if group == "host" and filters.services:
+        ignored.append("service")
+    if group == "service" and filters.hosts:
+        ignored.append("host")
+    if filters.levels:
+        ignored.append("level")
+    if not ignored:
+        return ""
+    return f"The {' and '.join(ignored)} filter does not apply here."
+
+
+def compute_features(
+    store: CacheStore, filters: Filters, window_s: int, group: str, scaling: str
+) -> Computed:
+    """Selection, scaling and statistics; memoised, as none of it depends on theme or top-N."""
+    lo, hi = visible_range(store, filters, window_s)
+    entities = entity_filter(filters, group)
+    key = (
+        str(store.root),
+        group,
+        window_s,
+        grid_stamp(store, group, window_s),
+        lo,
+        hi,
+        entities,
+    ) + (scaling,)
+
+    def make() -> Computed:
+        selection = select_rows(load_matrix(store, group, window_s), lo, hi, entities)
+        stats = feature_stats(selection, scaling)
+        return Computed(key, stats, stats_table(stats, template_texts(store)))
+
+    return _STATS.get(key, make)
 
 
 def draw_features(
@@ -451,42 +602,52 @@ def draw_features(
     scaling: str,
     top: int,
     scheme: str | None,
-) -> tuple[go.Figure, go.Figure, go.Figure, go.Figure, Component]:
-    """Correlation heatmap, association heatmap, variance bars, MI bars and the table."""
-    lo, hi = visible_range(store, filters, window_s)
-    selection = select_rows(
-        load_matrix(store, group, window_s), lo, hi, entity_filter(filters, group)
-    )
-    stats = feature_stats(selection, scaling)
+) -> tuple[go.Figure, go.Figure, go.Figure, go.Figure, Component, str]:
+    """Correlation and association heatmaps, variance and MI bars, the table and a filter hint."""
+    problem = unavailable(store, window_s, group)
+    if problem is None:
+        try:
+            computed = compute_features(store, filters, window_s, group, scaling)
+        except ValueError as error:
+            problem = str(error)
+    if problem is not None:
+        empty = figures.empty_figure(problem, scheme)
+        return empty, empty, empty, empty, dmc.Text(problem), ""
+    stats, table = computed.stats, computed.table
+    selection = stats.selection
     texts = template_texts(store)
     columns = top_columns(stats, top)
-    table = stats_table(stats, texts)
+    corr = _CORR.get(
+        (computed.key, top), lambda: correlation(stats.scaled, columns, selection.n_rows)
+    )
     return (
-        correlation_figure(
-            correlation(stats.scaled, columns, selection.n_rows),
-            selection.template_ids[columns],
-            texts,
-            scaling,
-            scheme,
-        ),
+        correlation_figure(corr, selection.template_ids[columns], texts, scaling, scheme),
         association_figure(stats, columns, texts, group, scheme),
         ranking_figure(table, "variance", f"variance of the {scaling} features", scheme),
         ranking_figure(table, "mutual_information", "mutual information (bits)", scheme),
         stats_view(table),
+        ignored_filters(filters, group),
     )
 
 
-_TEXTS: dict[tuple[str, int], dict[int, str]] = {}
-
-
 def template_texts(store: CacheStore) -> dict[int, str]:
-    """Template id to template text, read once per cache version."""
-    path = store.path("templates", "templates.parquet")
-    key = (str(path), path.stat().st_mtime_ns)
-    if key not in _TEXTS:
+    """Template id to template text, read once per version of ``templates.parquet``."""
+    path = store.path(UPSTREAM, "templates.parquet")
+    mtime = path.stat().st_mtime_ns
+    cached = _TEXTS.get(str(path))
+    if cached is None or cached[0] != mtime:
         frame = pl.read_parquet(path, columns=["template_id", "template"])
-        _TEXTS[key] = dict(zip(frame["template_id"], frame["template"], strict=True))
-    return _TEXTS[key]
+        texts = dict(zip(frame["template_id"], frame["template"], strict=True))
+        cached = _TEXTS[str(path)] = (mtime, texts)
+    return cached[1]
+
+
+def window_value(value: str | None) -> int:
+    return int(value) if value in tuple(map(str, WINDOWS)) else DEFAULT_WINDOW
+
+
+def top_value(value: str | None) -> int:
+    return int(value) if value in tuple(map(str, TOP_CHOICES)) else DEFAULT_TOP
 
 
 def segmented(component_id: str, options: list[tuple[str, str]], value: str) -> Component:
@@ -542,6 +703,7 @@ class Features:
                 cols={"base": 1, "lg": 2},
             ),
             ui.card("Template statistics (busiest templates)", dmc.Box(id="features-table")),
+            dmc.Text(id="features-hint", size="sm", c="dimmed"),
             description=(
                 "Window x template count matrix from the template counts. The time range applies; "
                 "the service filter applies per service and the host filter per host. Empty "
@@ -556,6 +718,7 @@ class Features:
             Output("features-variance", "figure"),
             Output("features-mi", "figure"),
             Output("features-table", "children"),
+            Output("features-hint", "children"),
             Input("features-window", "value"),
             Input("features-group", "value"),
             Input("features-scale", "value"),
@@ -570,13 +733,19 @@ class Features:
             top: str | None,
             filters: dict[str, Any] | None,
             theme: str | None,
-        ) -> tuple[go.Figure, go.Figure, go.Figure, go.Figure, Component]:
+        ) -> tuple[go.Figure, go.Figure, go.Figure, go.Figure, Component, str]:
             return draw_features(
                 store,
                 from_dict(filters),
-                int(window or DEFAULT_WINDOW),
+                window_value(window),
                 group if group in GROUPS else DEFAULT_GROUP,
                 scaling if scaling in SCALINGS else DEFAULT_SCALING,
-                int(top or DEFAULT_TOP),
+                top_value(top),
                 theme,
             )
+
+        try:  # load the default grid now so that the first request does not read files
+            if unavailable(store, DEFAULT_WINDOW, DEFAULT_GROUP) is None:
+                load_matrix(store, DEFAULT_GROUP, DEFAULT_WINDOW)
+        except (OSError, ValueError):
+            pass

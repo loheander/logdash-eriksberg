@@ -1,4 +1,5 @@
 import json
+import math
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -27,6 +28,31 @@ def span(feat):
 
 def dense(counts):
     return counts.toarray()
+
+
+def matrix_windows(store):
+    """Non-empty (window, entity) rows of the service grid: the bound for ``windows``."""
+    return store.read_parquet("features", ft.grid_name("index", "service", 60)).height
+
+
+def hand_matrix(counts, window_s=60):
+    """Matrix of one entity per row group: ``counts[w][e]`` is a list over templates."""
+    rows, cells, bins, ents = 0, [], [], []
+    base = datetime(2024, 1, 1)
+    for w, per_entity in enumerate(counts):
+        for e, per_template in per_entity.items():
+            if not any(per_template):
+                continue
+            bins.append(base + timedelta(seconds=w * window_s))
+            ents.append(e)
+            cells += [(rows, t, n) for t, n in enumerate(per_template) if n]
+            rows += 1
+    index = pl.DataFrame({"row": range(rows), "bin": bins, "entity": ents}).with_columns(
+        pl.col("bin").cast(pl.Datetime("us"))
+    )
+    n_templates = len(next(iter(counts[0].values())))
+    long = pl.DataFrame(cells, schema=["row", "template_id", "n"], orient="row")
+    return ft.build_matrix(index, long, list(range(n_templates)), window_s), base
 
 
 def test_built_from_template_counts(feat):
@@ -60,7 +86,8 @@ def test_load_matrix_matches_long_format(feat):
     assert matrix.counts.shape == (len(matrix.bins), len(matrix.template_ids))
     assert matrix.counts.sum() == long["n"].sum()
     host = ft.load_matrix(feat, "host", 300)
-    assert host.window_s == 300 and len(host.entities) > len(matrix.entities) - 1
+    hosts = feat.read_parquet("templates", "template_counts_host.parquet")["host"].n_unique()
+    assert host.window_s == 300 and len(host.entities) == hosts
     row = int(long["row"][0])
     col = int(np.searchsorted(matrix.template_ids, long["template_id"][0]))
     assert matrix.counts[row, col] == long["n"][0]
@@ -75,6 +102,12 @@ def test_select_rows_range_and_entities(feat, span):
     assert whole.n_windows == int((hi - lo).total_seconds() // 60)
     half = ft.select_rows(matrix, lo, lo + (hi - lo) / 2)
     assert 0 < half.counts.sum() < whole.counts.sum()
+    source = feat.read_parquet("templates", "template_counts.parquet")
+    start = lo + timedelta(hours=1)
+    end = lo + timedelta(hours=2)
+    inside = source.filter((pl.col("bin") >= start) & (pl.col("bin") < end))["n"].sum()
+    assert 0 < inside < whole.counts.sum()
+    assert ft.select_rows(matrix, start, end).counts.sum() == inside
     one = ft.select_rows(matrix, lo, hi, ("haproxy",))
     assert one.entities == ["haproxy"] and set(one.codes) == {0}
     assert 0 < one.counts.sum() < whole.counts.sum()
@@ -112,6 +145,47 @@ def test_variance_and_correlation_match_numpy():
     assert corr[0, 1] == pytest.approx(1.0) and corr[3, 3] == 0.0
 
 
+def test_planted_correlation():
+    # templates 0 and 1 always appear together, template 2 exactly when they do not
+    windows = [{"a": [3, 3, 0]} if w % 2 == 0 else {"a": [0, 0, 2]} for w in range(20)]
+    matrix, base = hand_matrix(windows)
+    sel = ft.select_rows(matrix, base, base + timedelta(minutes=20))
+    corr = ft.correlation(ft.scale_counts(sel.counts, "log1p", sel.n_rows), np.arange(3), 20)
+    assert corr[0, 1] == pytest.approx(1.0) and corr[0, 2] == pytest.approx(-1.0)
+
+
+def test_planted_association_and_mutual_information():
+    # template 0 only from entity a, template 1 from both equally, template 2 only from b
+    windows = [{"a": [1, 1, 0], "b": [0, 1, 1]} for _ in range(10)]
+    matrix, base = hand_matrix(windows)
+    sel = ft.select_rows(matrix, base, base + timedelta(minutes=10))
+    stats = ft.feature_stats(sel, "log1p")
+    assert stats.mutual_information[0] == pytest.approx(stats.mutual_information[2])
+    assert stats.mutual_information[0] > 0.4 and stats.mutual_information[1] == pytest.approx(0)
+    assert stats.by_entity.tolist() == [[10, 0], [10, 10], [0, 10]]
+    assert ft.stats_table(stats, {}).sort("template_id")["top_entity"].to_list()[0] == "a"
+
+
+def reference_mutual_information(present, n_windows):
+    """Plain-loop I(occurs; entity) in bits with equally weighted entities."""
+    n_entities = len(present)
+    p_x = sum(c / n_windows for c in present) / n_entities
+    total = 0.0
+    for c in present:
+        for p_given, p_marginal in ((c / n_windows, p_x), (1 - c / n_windows, 1 - p_x)):
+            if p_given > 0:
+                total += (1 / n_entities) * p_given * math.log2(p_given / p_marginal)
+    return total
+
+
+def test_mutual_information_matches_reference():
+    rng = np.random.default_rng(3)
+    present = rng.integers(0, 31, size=(12, 5)).astype(float)
+    got = ft.presence_mutual_information(present, 30)
+    expected = [reference_mutual_information(row, 30) for row in present]
+    assert np.allclose(got, expected)
+
+
 def test_mutual_information():
     even = np.full((1, 4), 5.0)
     assert ft.presence_mutual_information(even, 10)[0] == pytest.approx(0.0)
@@ -131,7 +205,7 @@ def test_feature_stats_on_synthetic(feat, span):
     stats = ft.feature_stats(sel, "log1p")
     templates = feat.read_parquet("templates", "templates.parquet")
     assert stats.volume.sum() == templates["count"].sum()
-    assert (stats.windows <= stats.by_entity.shape[1] * sel.n_windows).all()
+    assert (stats.windows <= matrix_windows(feat)).all()
     assert stats.by_entity.sum() == stats.volume.sum()
     assert ((stats.mutual_information >= 0) & (stats.mutual_information <= 1.0 + 1e-9)).all()
     top = ft.top_columns(stats, 5)
@@ -177,10 +251,187 @@ def test_figures(feat, span):
     assert "/explorer?template=" in str(ft.stats_view(table))
 
 
+def test_association_rows_sum_to_one_with_many_entities():
+    many = ft.MAX_ENTITIES + 10
+    windows = [{f"e{i:02d}": [i + 1, 1] for i in range(many)} for _ in range(3)]
+    matrix, base = hand_matrix(windows)
+    sel = ft.select_rows(matrix, base, base + timedelta(minutes=3))
+    stats = ft.feature_stats(sel, "log1p")
+    fig = ft.association_figure(stats, np.array([0, 1]), {}, "host", None)
+    z = np.asarray(fig.data[0].z)
+    assert z.shape == (2, ft.MAX_ENTITIES + 1) and fig.data[0].x[-1] == "other (10)"
+    assert np.allclose(z.sum(axis=1), 1.0)
+
+
+def test_entities_without_rows_in_range_are_dropped():
+    windows = [{"a": [1], "b": [1]}] * 5 + [{"a": [1]}] * 5
+    matrix, base = hand_matrix(windows)
+    late = ft.select_rows(matrix, base + timedelta(minutes=5), base + timedelta(minutes=10))
+    assert late.entities == ["a"] and set(late.codes) == {0}
+    assert ft.select_rows(matrix, base, base + timedelta(minutes=10)).entities == ["a", "b"]
+
+
+def test_build_matrix_rejects_unknown_template_ids():
+    index = pl.DataFrame({"row": [0], "bin": [datetime(2024, 1, 1)], "entity": ["a"]})
+    long = pl.DataFrame({"row": [0], "template_id": [7], "n": [1]})
+    with pytest.raises(ValueError, match="template ids"):
+        ft.build_matrix(index, long, [1, 2, 3], 60)
+    with pytest.raises(ValueError, match="template ids"):
+        ft.build_matrix(index, long, [1, 2, 8], 60)
+
+
+@pytest.mark.parametrize(
+    ("value", "window_s", "floor", "ceil"),
+    [
+        (
+            datetime(2024, 1, 1, 10, 7, 30),
+            300,
+            datetime(2024, 1, 1, 10, 5),
+            datetime(2024, 1, 1, 10, 10),
+        ),
+        (
+            datetime(2024, 1, 1, 10, 5),
+            300,
+            datetime(2024, 1, 1, 10, 5),
+            datetime(2024, 1, 1, 10, 5),
+        ),
+        (
+            datetime(2024, 1, 1, 10, 14, 59),
+            900,
+            datetime(2024, 1, 1, 10, 0),
+            datetime(2024, 1, 1, 10, 15),
+        ),
+    ],
+)
+def test_floor_and_ceil_window(value, window_s, floor, ceil):
+    assert ft.floor_window(value, window_s) == floor
+    assert ft.ceil_window(value, window_s) == ceil
+
+
+def test_visible_range_end_is_ceiled_and_clamped(feat, span):
+    first, _ = span
+    start = first.replace(second=0, microsecond=0)
+    mid = start + timedelta(minutes=10, seconds=20)
+    lo, hi = ft.visible_range(feat, Filters(start=start.isoformat(), end=mid.isoformat()), 60)
+    assert hi - lo == timedelta(minutes=11)  # the window holding the end is included
+    lo, hi = ft.visible_range(feat, Filters(start=mid.isoformat(), end=start.isoformat()), 60)
+    assert hi - lo == timedelta(minutes=1)  # end before start: one window
+
+
+def test_top_columns_ties_prefer_lower_id():
+    counts = sparse.csr_matrix(np.array([[2.0, 5, 2, 0, 5]]))
+    sel = ft.Selection(counts, np.array([0]), ["a"], 1, np.arange(5))
+    stats = ft.feature_stats(sel, "log1p")
+    assert ft.top_columns(stats, 4).tolist() == [1, 4, 0, 2]
+    assert ft.top_columns(stats, 2).tolist() == [1, 4]
+
+
+def test_ignored_filters_hint():
+    assert ft.ignored_filters(Filters(), "service") == ""
+    assert "host" in ft.ignored_filters(Filters(hosts=("h",)), "service")
+    assert "service" in ft.ignored_filters(Filters(services=("s",)), "host")
+    assert "level" in ft.ignored_filters(Filters(levels=("ERROR",)), "host")
+
+
+def test_load_scaled_matches_page(feat):
+    for scaling in ft.SCALINGS:
+        scaled = ft.load_scaled(feat, "service", 300, scaling)
+        matrix = ft.load_matrix(feat, "service", 300)
+        assert scaled.shape == matrix.counts.shape
+        assert scaled.nnz == matrix.counts.nnz
+    tfidf = ft.load_scaled(feat, "host", 60, "tfidf")
+    assert np.allclose(np.linalg.norm(tfidf.toarray(), axis=1), 1.0)
+
+
+def test_stats_are_memoised_across_theme_and_top(feat, monkeypatch):
+    ft.clear_caches()
+    calls = []
+    real = ft.feature_stats
+    monkeypatch.setattr(ft, "feature_stats", lambda *a: calls.append(a) or real(*a))
+    ft.draw_features(feat, Filters(), 60, "service", "log1p", 25, "light")
+    ft.draw_features(feat, Filters(), 60, "service", "log1p", 15, "dark")
+    ft.draw_features(feat, Filters(), 60, "service", "log1p", 25, "dark")
+    assert len(calls) == 1
+    ft.draw_features(feat, Filters(), 60, "service", "tfidf", 25, "dark")
+    assert len(calls) == 2
+
+
+def test_matrix_cache_follows_file_version(feat):
+    ft.clear_caches()
+    first = ft.load_matrix(feat)
+    assert ft.load_matrix(feat) is first
+    path = feat.path("features", ft.grid_name("matrix", "service", 60))
+    stat = path.stat()
+    import os
+
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+    second = ft.load_matrix(feat)
+    assert second is not first
+    assert len([k for k in ft._CACHE if k[1:] == ("service", 60)]) == 1  # stale one replaced
+
+
+def test_degrades_without_stage(tmp_path):
+    from logdash.cache.store import CacheStore
+
+    store = CacheStore(tmp_path)
+    out = ft.draw_features(store, Filters(), 60, "service", "log1p", 10, None)
+    assert len(out) == 6 and out[0].layout.annotations and "not built" in str(out[4])
+
+
+def test_degrades_on_empty_and_stale_stage(tmp_path, feat):
+    from logdash.cache.store import CacheStore
+
+    source, out = tmp_path / "templates", tmp_path / "features"
+    source.mkdir()
+    out.mkdir()
+    schema = {
+        "bin": pl.Datetime("us"),
+        "program": pl.String,
+        "template_id": pl.Int64,
+        "n": pl.Int64,
+    }
+    pl.DataFrame(schema=schema).write_parquet(source / "template_counts.parquet")
+    pl.DataFrame(schema={**schema, "host": pl.String}).drop("program").write_parquet(
+        source / "template_counts_host.parquet"
+    )
+    pl.DataFrame(
+        {"template_id": [], "template": []}, schema={"template_id": pl.Int64, "template": pl.String}
+    ).write_parquet(source / "templates.parquet")
+    (source / "meta.json").write_text(json.dumps({"ts_min": None, "ts_max": None}))
+    rows = ft.compute_all(source, out, lambda _: None)
+    assert rows["service_60_windows"] == 0 and rows["host_900_nonzero"] == 0
+    store = CacheStore(tmp_path)
+    assert ft.load_matrix(store).counts.shape == (0, 0)
+    drawn = ft.draw_features(store, Filters(), 60, "service", "log1p", 10, None)
+    assert "No events" in str(drawn[4])
+    # templates rebuilt with more templates than the features stage knows about
+    pl.DataFrame({"template_id": [1], "template": ["x"]}).write_parquet(
+        source / "templates.parquet"
+    )
+    (out / "meta.json").write_text(
+        json.dumps(
+            {"template_ids": [], "ts_min": "2024-01-01T00:00:00", "ts_max": "2024-01-01T01:00:00"}
+        )
+    )
+    assert "older than the templates" in str(
+        ft.draw_features(store, Filters(), 60, "service", "log1p", 10, None)[4]
+    )
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("300", 300), ("7", 60), (None, 60), ("x", 60)])
+def test_window_value(raw, expected):
+    assert ft.window_value(raw) == expected
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("15", 15), ("16", 25), (None, 25), ("x", 25)])
+def test_top_value(raw, expected):
+    assert ft.top_value(raw) == expected
+
+
 def test_draw_features_filters(feat, span):
     lo, hi = span
     base = ft.draw_features(feat, Filters(), 60, "service", "log1p", 10, "light")
-    assert len(base) == 5 and base[0].data and base[1].data and base[2].data and base[3].data
+    assert len(base) == 6 and base[0].data and base[1].data and base[2].data and base[3].data
     for window_s in ft.WINDOWS:
         for group in ft.GROUPS:
             out = ft.draw_features(feat, Filters(), window_s, group, "tfidf", 15, None)
@@ -200,10 +451,18 @@ def test_draw_features_filters(feat, span):
     assert len(unaffected[1].data[0].x) == len(
         ft.draw_features(feat, Filters(), 60, "host", "log1p", 10, None)[1].data[0].x
     )
+    assert (
+        "host filter"
+        in ft.draw_features(feat, Filters(hosts=("h",)), 60, "service", "log1p", 10, None)[5]
+    )
     timed = Filters(
         start=(lo + timedelta(hours=1)).isoformat(), end=(lo + timedelta(hours=2)).isoformat()
     )
-    assert ft.draw_features(feat, timed, 60, "service", "log1p", 10, None)[0].data
+    timed_out = ft.draw_features(feat, timed, 60, "service", "log1p", 10, None)
+    assert timed_out[0].data
+    full_events = ft.compute_features(feat, Filters(), 60, "service", "log1p").stats.volume.sum()
+    timed_events = ft.compute_features(feat, timed, 60, "service", "log1p").stats.volume.sum()
+    assert 0 < timed_events < full_events
     outside = Filters(start="2000-01-01 00:00:00", end="2000-01-01 01:00:00")
     assert ft.draw_features(feat, outside, 60, "service", "log1p", 10, None)[0].layout.annotations
     assert ft.visible_range(feat, outside, 60)[0] < ft.visible_range(feat, outside, 60)[1]
@@ -222,8 +481,9 @@ def test_layout_and_callback_over_http(feat, built):
         "features-variance",
         "features-mi",
         "features-table",
+        "features-hint",
     ]
-    props = ["figure"] * 4 + ["children"]
+    props = ["figure"] * 4 + ["children"] * 2
     body = {
         "output": ".." + "...".join(f"{o}.{p}" for o, p in zip(outputs, props, strict=True)) + "..",
         "outputs": [{"id": o, "property": p} for o, p in zip(outputs, props, strict=True)],
