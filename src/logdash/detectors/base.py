@@ -10,8 +10,8 @@ page nor the framework: create the module, decorate the class with ``@register``
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, fields
-from typing import NamedTuple, Protocol, runtime_checkable
+from dataclasses import dataclass, field, fields
+from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 import polars as pl
 
@@ -94,11 +94,17 @@ def declare_kind(
 
 @dataclass(frozen=True)
 class DetectContext:
-    """What ``Detector.detect`` gets: the cache (read the upstream stages through it)."""
+    """What ``Detector.detect`` gets: the cache (read the upstream stages through it).
+
+    ``meta`` is the detector's to fill (JSON values): the stage stores it as ``info`` in the
+    detector's ``meta.json`` entry, and the page shows ``info["note"]`` (text) if there is one.
+    Use it for what the rows alone do not tell, such as how many entities could not be scored.
+    """
 
     store: CacheStore
     settings: Settings
     log: Callable[[str], None] = print
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 @runtime_checkable

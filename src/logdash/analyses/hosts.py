@@ -401,6 +401,24 @@ BASELINE_SCHEMA = {
 }
 
 
+def window_matrix(
+    counts: pl.DataFrame, template_ids: np.ndarray
+) -> tuple[pl.DataFrame, sparse.csr_matrix]:
+    """Windows (``host, bin``, sorted) of a host x minute count frame and their count matrix.
+
+    The matrix is ``windows x templates`` (sparse, columns in ``template_ids`` order, row ``i``
+    belongs to row ``i`` of the frame). Only windows with at least one line exist.
+    """
+    windows = counts.select("host", "bin").unique().sort("host", "bin")
+    joined = counts.join(windows.with_row_index("w"), on=["host", "bin"])
+    cols = np.searchsorted(template_ids, joined["template_id"].to_numpy())
+    shape = (windows.height, len(template_ids))
+    matrix = sparse.csr_matrix(
+        (joined["n"].to_numpy().astype(np.float64), (joined["w"].to_numpy(), cols)), shape=shape
+    )
+    return windows, matrix
+
+
 def window_baseline(
     counts: pl.DataFrame, template_ids: np.ndarray, peer_centroids: Centroids
 ) -> pl.DataFrame:
@@ -408,13 +426,7 @@ def window_baseline(
     chosen = counts.filter(pl.col("host").is_in(list(peer_centroids.keys)))
     if chosen.is_empty():
         return pl.DataFrame(schema=BASELINE_SCHEMA)
-    windows = chosen.select("host", "bin").unique().sort("host", "bin").with_row_index("w")
-    joined = chosen.join(windows, on=["host", "bin"])
-    cols = np.searchsorted(template_ids, joined["template_id"].to_numpy())
-    shape = (windows.height, len(template_ids))
-    matrix = sparse.csr_matrix(
-        (joined["n"].to_numpy().astype(np.float64), (joined["w"].to_numpy(), cols)), shape=shape
-    )
+    windows, matrix = window_matrix(chosen, template_ids)
     distance = centroid_distance(matrix, windows["host"].to_list(), peer_centroids)
     lines = np.asarray(matrix.sum(axis=1)).ravel()
     frame = windows.select("host").with_columns(

@@ -16,6 +16,7 @@ file nor the page: the type filter, the timeline and the table follow the data.
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -85,10 +86,11 @@ def run_detectors(
             "type": detector.type,
             "title": detector.title,
         }
+        own = replace(ctx, meta={})
         try:
             threshold = threshold_of(detector, ctx.settings)
             rows, above = finish(
-                detector, detector.detect(ctx), MAX_PER_DETECTOR, MAX_PER_ENTITY, threshold
+                detector, detector.detect(own), MAX_PER_DETECTOR, MAX_PER_ENTITY, threshold
             )
         except Exception as error:  # noqa: BLE001 - any failure of a plug-in is isolated
             message = f"{type(error).__name__}: {error}"
@@ -105,6 +107,8 @@ def run_detectors(
             "dropped": above - rows.height,
             "seconds": round(seconds, 3),
         }
+        if own.meta:
+            entry["info"] = own.meta
         info.append(entry)
     combined = pl.concat(parts).sort(["score", "bin"], descending=[True, False])
     return combined, info
@@ -304,6 +308,9 @@ def kept_text(meta: list[dict[str, Any]]) -> str:
         + "; ".join(f"{k:,} of {m:,} {t}" for t, (k, m) in kept.items())
         + (f" windows above threshold (at most {MAX_PER_ENTITY} per service or host).")
     )
+    for entry in meta:
+        if "note" in entry.get("info", {}):
+            text += f" {entry['title']}: {entry['info']['note']}."
     failed = [f"{e['key']} ({e['error']})" for e in meta if e.get("error")]
     return text + (" Failed and skipped: " + "; ".join(failed) + "." if failed else "")
 
