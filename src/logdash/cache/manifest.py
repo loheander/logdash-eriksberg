@@ -1,21 +1,23 @@
-"""Fingerprints and the manifest that records which stages are built and from what."""
+"""Cache manifest: per-stage fingerprints, timings and row counts, plus staleness checks."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-CHUNK = 1 << 20
+import logdash
+
+CHUNK = 8 * 1024 * 1024
 
 
-@dataclass(frozen=True)
+@dataclass
 class Entry:
-    """One built stage: its fingerprint, module version, build time and output row counts."""
+    """Manifest record of one build stage."""
 
     fingerprint: str
     version: str
@@ -24,44 +26,60 @@ class Entry:
     rows: dict[str, int] = field(default_factory=dict)
 
 
-def now_iso() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat()
-
-
-def digest_of(value: Any) -> str:
-    """Stable hash of a JSON-serialisable value (key order does not matter)."""
-    text = json.dumps(value, sort_keys=True, default=str)
-    return hashlib.blake2b(text.encode(), digest_size=16).hexdigest()
-
-
 def file_fingerprint(path: Path, *, strict: bool = False) -> dict[str, Any]:
-    """Name and size plus mtime, or with ``strict`` a content hash instead of the mtime."""
+    """Identify a data file by name, size and mtime, or by content hash when strict."""
     stat = path.stat()
     info: dict[str, Any] = {"name": path.name, "size": stat.st_size}
-    if not strict:
+    if strict:
+        info["blake2b"] = hash_file(path)
+    else:
         info["mtime_ns"] = stat.st_mtime_ns
-        return info
-    hasher = hashlib.blake2b(digest_size=16)
-    with path.open("rb") as handle:
-        while chunk := handle.read(CHUNK):
-            hasher.update(chunk)
-    info["blake2b"] = hasher.hexdigest()
     return info
 
 
-def data_fingerprint(files: Sequence[Path], *, strict: bool = False) -> str:
-    return digest_of([file_fingerprint(f, strict=strict) for f in files])
+def hash_file(path: Path) -> str:
+    digest = hashlib.blake2b()
+    with path.open("rb") as handle:
+        while chunk := handle.read(CHUNK):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def data_fingerprint(files: Iterable[Path], *, strict: bool = False) -> str:
+    return digest_of([file_fingerprint(f, strict=strict) for f in sorted(files)])
+
+
+def digest_of(obj: Any) -> str:
+    """Stable sha256 of a JSON-serialisable object."""
+    blob = json.dumps(obj, sort_keys=True, default=str).encode()
+    return hashlib.sha256(blob).hexdigest()
 
 
 def stage_fingerprint(
-    *, version: str, data_fp: str, params: dict[str, Any], upstream: dict[str, str]
+    *,
+    version: str,
+    data_fp: str,
+    params: Mapping[str, Any],
+    upstream: Mapping[str, str],
 ) -> str:
-    """Hash of everything a stage's output depends on."""
-    return digest_of({"version": version, "data": data_fp, "params": params, "upstream": upstream})
+    """Fingerprint of one stage from its inputs, settings, version and upstream stages."""
+    return digest_of(
+        {
+            "package": logdash.__version__,
+            "version": version,
+            "data": data_fp,
+            "params": dict(params),
+            "upstream": dict(upstream),
+        }
+    )
+
+
+def now_iso() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 class Manifest:
-    """``manifest.json``: stage key to ``Entry``."""
+    """JSON-backed mapping from stage key to ``Entry``."""
 
     def __init__(self, path: Path, entries: dict[str, Entry] | None = None) -> None:
         self.path = path
@@ -72,12 +90,14 @@ class Manifest:
         if not path.exists():
             return cls(path)
         raw = json.loads(path.read_text())
-        return cls(path, {k: Entry(**v) for k, v in raw.items()})
+        return cls(path, {k: Entry(**v) for k, v in raw.get("stages", {}).items()})
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        data = {k: asdict(v) for k, v in self.entries.items()}
-        self.path.write_text(json.dumps(data, indent=2, sort_keys=True))
+        payload = {"stages": {k: asdict(v) for k, v in sorted(self.entries.items())}}
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        tmp.replace(self.path)
 
     def get(self, key: str) -> Entry | None:
         return self.entries.get(key)
