@@ -203,7 +203,7 @@ Each detector implements a common `Detector` interface returning
 | Contextual | Host deviating from its peer cluster |
 | Structural | PCA residual (SPE), Isolation Forest |
 | Novel/rare template | First-seen (late first line, scored in bits) and frequency (count at most the rare threshold) |
-| Sequence | Markov transition log-likelihood per `request_id` |
+| Sequence | Markov transition tail mass per `request_id` (smoothed log-likelihood in the evidence) |
 | Severity burst | WARNING/ERROR rate change |
 
 Page: combined anomaly timeline, sortable table with type and score, per-type
@@ -332,9 +332,8 @@ Status: **Phase 1 done** (steps 1 to 9).
   median score 0.50, the default top 100 holds 97 host and 3 service rows. The stage takes 0.2 s
   and the page answers in at most 61 ms (cold or warm) on the real cache. The test of
   injected anomalies checks type and rank (the PCA spike and the novel template, bounded to ten
-  minutes after its first line, are in the top 10 and 15); the novel and sequence cases are
-  strict expected failures until issue 8 registers its detector (they fail when one does,
-  so the mark must go), severity waits for a synthetic injection (issue 9).
+  minutes after its first line, are in the top 10 and 15); the sequence case
+  passes since issue 8, severity waits for a synthetic injection (issue 9).
   A stub detector of a new type on a new kind is tested end to end.
 - Volume detector (issue 4) done: `detectors/volume.py` uses `find_bursts`, `find_drops` and
   `find_gaps` of `analyses/temporal.py` on `rate_60` (spikes and drops per service and host) and
@@ -400,6 +399,23 @@ Status: **Phase 1 done** (steps 1 to 9).
   overrides, empty input and a template without counts. Real data: 15 novel templates (13 in 22:03 to
   22:10, one operator episode, two at 23:54) and 166 rare windows, 0.03 s together; the combined top 100
   by `overall` holds 9 novel and 9 rare rows (28 PCA, 28 forest, 18 volume, 9 contextual).
+- Sequence detector (issue 8) done: `detectors/sequence.py`, type `sequence`, kind `request`, from
+  `events` joined to `templates/assignments.parquet` (events carry no template id) in DuckDB. Requests of 2 to
+  100 lines are scored (871 longer ids hold 27.99 M of the 30.66 M lines with a request id; periodic agent loops
+  would own the model; the count is in the note). Pairs `(src, dst)` in `(ts, template_id)` order are fitted over
+  the population; a pair's tail mass `p = sum(c' <= c) / tot(src)` is the chance a draw from the state is as rare,
+  the request's `p` is Sidak over its `L` transitions and `raw = -log10(p)`; mean smoothed NLL (`(c + 0.5) /
+  (tot + 0.5 K)`) is only evidence, since 96 % of the scored requests have one transition. Deviations from the
+  plan: no `ALPHA = 0.05` and no `tot >= 20` rule: at 0.05 the 6,711 requests with a per-transition p are
+  not strict, so `ALPHA = 0.01` (a state seen under 100 times cannot flag anything), and at most 5 requests per
+  transition are listed (51 of the 91 flagged were one identical pair). The 5 swapped synthetic requests (3 % of
+  requests) are a common variant (tail mass 0.033, Sidak over 3 transitions 0.096), so they are not flagged and a
+  test says so; the injection that is found is three broken two-line requests (a skipped step, two restarts, from
+  their own generator, `truth.broken_request_ids`), each pair seen once among 150 requests (`P = 0.0066`). The
+  strict xfail is removed. Real data: 203,308 requests scored; `p <= 0.01` per transition 1,045, after Sidak 91,
+  38 kept (53 at 0.001), 2 s, peak 2.8 GB; the top row is `GET -> returned with HTTP` seen 51 of 190,285 times
+  (P = 0.0003). The combined top 100 holds 8 sequence rows (25 PCA, 25 forest, 16 volume, 9 contextual, 9 rare,
+  8 novel); the first is at position 12.
 - Module 7 (hosts and services, issue 10) done: `analyses/hosts.py` from `templates/template_counts_host.parquet`
   and one aggregate over `events` (service x host lines). A host's profile is its template mix over the whole
   span, compared as `sqrt(share)` (Hellinger). Display clusters: k-means (fixed seed) chooses k in 2..10 by

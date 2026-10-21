@@ -2,7 +2,6 @@ import json
 import math
 from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 import numpy as np
@@ -621,6 +620,7 @@ def test_built_table_and_manifest(stage):
         "volume",
         "novel_template",
         "rare_template",
+        "sequence",
     }
     meta = {d["key"]: d for d in stage.read_json("anomalies", "meta.json")["detectors"]}
     assert set(meta) == {
@@ -630,6 +630,7 @@ def test_built_table_and_manifest(stage):
         "contextual",
         "novel_template",
         "rare_template",
+        "sequence",
     }
     for key, entry in meta.items():
         assert entry["rows"] == rows.filter(pl.col("detector") == key).height
@@ -717,14 +718,8 @@ def rare_window(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
 
 
 def out_of_order_requests(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
-    ranks = [first_match(rows, pl.col("entity") == r) for r in truth.out_of_order_request_ids]
+    ranks = [first_match(rows, pl.col("entity") == r) for r in truth.broken_request_ids]
     return None if None in ranks else max(r for r in ranks if r is not None)
-
-
-def pending(kind: str, issue: str) -> list[Any]:
-    """Strict expected failure while no detector emits ``kind``."""
-    reason = f"no detector of type {kind!r} until {issue}"
-    return [pytest.mark.xfail(kind not in DETECTORS.types(), reason=reason, strict=True)]
 
 
 INJECTED = [
@@ -734,13 +729,7 @@ INJECTED = [
     pytest.param("structural", novel_template_window, 15, id="novel template seen structurally"),
     pytest.param("novel", novel_first_seen, 10, id="novel template"),
     pytest.param("novel", rare_window, 15, id="rare template"),
-    pytest.param(
-        "sequence",
-        out_of_order_requests,
-        20,
-        id="out-of-order request",
-        marks=pending("sequence", "issue 8"),
-    ),
+    pytest.param("sequence", out_of_order_requests, 20, id="out-of-order request"),
 ]
 # Types whose injection changes the structural fits of the shared data (a busy host), so their
 # case lives in tests/unit/test_contextual.py on a dataset of its own.
@@ -790,6 +779,17 @@ def test_novel_and_rare_rows_do_not_overlap(stage, synthetic):
     keys = ["template_id", "bin", "entity"]
     assert novel.join(rare, on=keys, how="inner").is_empty()
     assert rare["raw"].min() >= 1.0
+
+
+def test_sequence_rows_are_the_broken_requests_only(stage, synthetic):
+    truth = synthetic.truth
+    rows = an.load_anomalies(stage).filter(pl.col("type") == "sequence")
+    assert sorted(rows["entity"]) == sorted(truth.broken_request_ids)
+    assert (rows["kind"] == "request").all() and (rows["template_id"].is_not_null()).all()
+    # the 5 swapped requests are a variant seen in 3 % of the requests: not rare enough
+    assert not set(truth.out_of_order_request_ids) & set(rows["entity"])
+    meta = {d["key"]: d for d in stage.read_json("anomalies", "meta.json")["detectors"]}
+    assert "0 longer requests" in meta["sequence"]["info"]["note"]
 
 
 def test_every_registered_type_has_an_expectation():

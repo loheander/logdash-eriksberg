@@ -42,7 +42,7 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
 | pca | 12 fits (group x window x scaling); about 4 s for a synthetic 230k-window x 281-template matrix at 3 % density (not yet measured on the real data) |
 | hosts | 3 s on the real data (162 hosts, 281 templates, 559 service x host pairs; one aggregate over `events` for the matrix) |
-| anomalies | 26 s (six detectors: PCA residual, 1,232 windows above the entity's level, 377 episodes kept; Isolation Forest per entity, 25 s, 1,405 windows flagged, 438 episodes; volume, 87 episodes; contextual, 496 windows above the threshold, 456 kept; novel and rare templates, 15 and 166 rows, 0.03 s) |
+| anomalies | 28 s (seven detectors: PCA residual, 1,232 windows above the entity's level, 377 episodes kept; Isolation Forest per entity, 25 s, 1,405 windows flagged, 438 episodes; volume, 87 episodes; contextual, 496 windows above the threshold, 456 kept; novel and rare templates, 15 and 166 rows, 0.03 s; sequence, 38 requests, 2 s) |
 | total | 1 min 58 s (measured before the features, pca and anomalies stages existed) |
 
 `cache/` is 622 MB (281 templates from 73,583 unique masked lines).
@@ -190,6 +190,19 @@ last `LOGDASH_NOVEL_FRACTION` of the span, raw `-b * log2(1 - u)` bits with `b` 
 position of its first line; threshold `log2(1 / fraction)`) and `rare_template` (a (template, minute, service)
 window of a template with at most `LOGDASH_RARE_THRESHOLD` events; raw `(threshold + 0.5) / count`, threshold 1).
 Real data: 15 novel rows (an operator episode at 22:03 to 22:10 and two at 23:54) and 166 rare ones.
+
+`sequence.py` is the `sequence` type (kind `request`, `depends_on` the templates stage): the lines of a request id
+(2 to 100 lines; the 871 longer ids hold 91 % of the lines with a request id and are periodic agent loops, so they are
+not scored and the page note says so) are ordered by `(ts, template id)` and their consecutive template pairs
+fitted as a first-order Markov chain. The score is a tail mass, not the NLL (96 % of the requests have one
+transition, so the NLL is tie-ridden and depends on length): for a pair seen `c` of `tot` times from its source
+state, `p = sum(c' <= c) / tot` over the state's next templates, the request's `p` is `1 - (1 - p_min) ** L`
+(Sidak, over its `L` transitions) and `raw = -log10(p)`, threshold `-log10(0.01)`. The level is strict on purpose.
+On the real data 203,308 requests are scored, 1,045 have a transition with `p <= 0.01`, only 91 stay at 0.01 after
+the Sidak correction (at 0.05: 1,040 after it, 6,711 before; at 0.001: 53), and at most 5 requests are listed per
+transition (the note counts the rest). The smoothed NLL is in the evidence. Real data: 38 rows, 2 s, 2.8 GB peak
+build memory; the largest group is 5 of 38 rows, and the combined top 100 holds 8 sequence rows, the first at
+position 12.
 
 `structural_pca.py` and `structural_iforest.py` are the structural type (shared helpers in
 `detectors/_episodes.py`, which `load_builtin` skips). `spe / limit >= 1` is not usable on the real data (the

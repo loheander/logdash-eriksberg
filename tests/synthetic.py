@@ -93,6 +93,9 @@ REQUEST_STEPS = [
     "Scheduling instance on node{n}",
     "Instance {uuid} spawned in {n} seconds",
 ]
+# Indices into REQUEST_STEPS of the two lines of a broken request: spawned straight after the
+# request was received (a step skipped), and received again after the quota check (starts over).
+BROKEN_FLOWS = [(0, 3), (1, 0), (2, 0)]
 REQUEST_HOST = HOSTS[1]
 CONTEXT_HOST = HOSTS[5]
 CONTEXT_TEMPLATE = 0  # in the window the host logs only this template (of the first service)
@@ -132,6 +135,7 @@ class GroundTruth:
     rare_first_seen: datetime = START
     request_ids: list[str] = field(default_factory=list)
     out_of_order_request_ids: list[str] = field(default_factory=list)
+    broken_request_ids: list[str] = field(default_factory=list)
     n_rows: int = 0
     n_malformed: int = 0
     context_host: str = CONTEXT_HOST
@@ -259,6 +263,21 @@ def generate_rows(spec: SyntheticSpec) -> tuple[list[dict], GroundTruth]:
         for step in steps:
             ts += timedelta(milliseconds=rng.randint(5, 400))
             row = _row(ts, rng, REQUEST_HOST, request_service, _fill(rng, step))
+            row["request_id"], row["log_level"] = rid, "INFO"
+            rows.append(row)
+
+    # Requests that break the flow in a way nothing else does (two lines, each a step pair seen
+    # once: a step skipped, and the flow starting over). The 5 swapped requests above are a
+    # variant seen in 3 % of the requests, which is not rare. A separate generator keeps the
+    # rest of the data as it was.
+    broken = random.Random(spec.seed + 3000)
+    for first, second in BROKEN_FLOWS:
+        rid = f"req-{uuid.UUID(int=broken.getrandbits(128), version=4)}"
+        truth.broken_request_ids.append(rid)
+        ts = _random_time(broken, START, end - timedelta(minutes=1))
+        for step in (REQUEST_STEPS[first], REQUEST_STEPS[second]):
+            ts += timedelta(milliseconds=broken.randint(5, 400))
+            row = _row(ts, broken, REQUEST_HOST, request_service, _fill(broken, step))
             row["request_id"], row["log_level"] = rid, "INFO"
             rows.append(row)
 
