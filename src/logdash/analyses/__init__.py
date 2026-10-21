@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 
-BUILTIN: tuple[str, ...] = ("overview", "distributions", "temporal", "templates")
+BUILTIN: tuple[str, ...] = ("overview", "distributions", "temporal", "templates", "explorer")
 
 
 def load_builtin() -> None:
