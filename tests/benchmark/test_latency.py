@@ -13,6 +13,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+import polars as pl
 import pytest
 
 from logdash.analyses import anomalies, features, hosts, load_builtin, pca
@@ -296,7 +297,12 @@ def test_hosts_cold(store: CacheStore) -> None:
         over.append(f"hosts.draw cold {cold * 1000:.0f} ms")
 
 
-ANOMALY_CASES = (([], "score"), (["structural"], "time"), ([], "type"), (["structural"], "entity"))
+ANOMALY_CASES = (
+    ([], "overall"),
+    (["structural"], "time"),
+    ([], "type"),
+    (["structural"], "entity"),
+)
 
 
 def test_anomalies(store: CacheStore) -> None:
@@ -309,6 +315,21 @@ def test_anomalies(store: CacheStore) -> None:
                 CALLBACK_BUDGET_S,
                 partial(fns["draw"], types, sort, filters, "light"),
             )
+
+
+def test_anomalies_top_100_is_diverse(store: CacheStore) -> None:
+    """The plan's bounds on the combined top 100 by ``overall`` (not a latency measurement)."""
+    rows = anomalies.sort_rows(anomalies.load_anomalies(store), "overall")
+    top = rows.head(anomalies.TABLE_ROWS)
+    # a fleet row stands for many entities, so it is not one of them; per detector and grouping
+    # there are only a handful of fleet minutes
+    own = top.filter(pl.col("kind") != "fleet")
+    per_entity = own.group_by("kind", "entity").len()
+    assert per_entity["len"].max() <= 0.10 * anomalies.TABLE_ROWS
+    stray = own.filter(pl.col("entity").str.contains("u39|u40")).group_by("entity").len()
+    assert stray["len"].max() <= 0.05 * anomalies.TABLE_ROWS  # the two chronic host groups
+    assert set(rows["detector"]) <= set(top["detector"])  # no detector is crowded out
+    assert (top["kind"] == "fleet").sum() <= 0.25 * anomalies.TABLE_ROWS
 
 
 def test_anomalies_cold(store: CacheStore) -> None:

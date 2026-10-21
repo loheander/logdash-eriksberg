@@ -8,6 +8,7 @@ from urllib.parse import parse_qsl, urlsplit
 import numpy as np
 import polars as pl
 import pytest
+from scipy import sparse
 
 from logdash.analyses import anomalies as an
 from logdash.analyses import features as ft
@@ -21,7 +22,9 @@ from logdash.analyses.templates import Templates
 from logdash.analyses.temporal import Temporal
 from logdash.app.filters import Filters
 from logdash.cache.store import CacheStore
+from logdash.detectors import _episodes as episodes
 from logdash.detectors import base
+from logdash.detectors import structural_iforest as iforest
 from logdash.detectors.base import (
     ANOMALY_SCHEMA,
     DETECTORS,
@@ -195,19 +198,200 @@ def test_registry():
 
 
 def test_builtin_detectors_are_registered_by_file():
-    assert "structural_pca" in DETECTORS
-    assert DETECTORS.get("structural_pca").type == "structural"
+    for key in ("structural_pca", "structural_iforest"):
+        assert key in DETECTORS and DETECTORS.get(key).type == "structural"
+    assert not any(key.startswith("_") for key in DETECTORS._items)  # helper modules: no detector
 
 
-def test_structural_pca_returns_every_window_above_the_limit(stage):
-    detector = DETECTORS.get("structural_pca")
+def test_structural_detectors_flag_a_few_windows_per_entity(stage):
     ctx = DetectContext(stage, stage.settings, lambda _: None)
-    found = detector.detect(ctx)
-    assert found["evidence"].str.starts_with("SPE ").all() and (found["raw"] >= 1.0).all()
-    kept, above = base.finish(detector, found, 20_000, an.MAX_PER_ENTITY)
-    assert above == found.height
-    per_entity = kept.group_by("kind", "entity").len()["len"]
-    assert per_entity.max() <= an.MAX_PER_ENTITY
+    for key, evidence in (("structural_pca", "SPE "), ("structural_iforest", "isolation score ")):
+        detector = DETECTORS.get(key)
+        found = detector.detect(ctx)
+        own = found.filter(pl.col("kind") != "fleet")
+        assert own["evidence"].str.starts_with(evidence).all()
+        assert (found["raw"] >= detector.threshold).all() and own.height > 0
+        assert (found["window_s"] % 60 == 0).all()
+        kept, above = base.finish(detector, found, 20_000, an.MAX_PER_ENTITY)
+        assert above == found.height == kept.height  # episodes are few, nothing is cut
+        assert {"service", "host", "fleet"} >= set(found["kind"])
+        assert ctx.meta["host"]["episodes"] > 0
+
+
+def test_structural_detectors_are_deterministic(stage):
+    for key in ("structural_pca", "structural_iforest"):
+        detector = DETECTORS.get(key)
+        first = detector.detect(DetectContext(stage, stage.settings, lambda _: None))
+        second = detector.detect(DetectContext(stage, stage.settings, lambda _: None))
+        assert first.equals(second)
+
+
+def test_structural_iforest_meta_lists_skipped_entities_and_fleet_minutes(stage):
+    ctx = DetectContext(stage, stage.settings, lambda _: None)
+    DETECTORS.get("structural_iforest").detect(ctx)
+    for group in ("service", "host"):
+        info = ctx.meta[group]
+        assert info["windows"] > 0 and info["episodes"] <= info["flagged"] - info["fleet_windows"]
+        assert info["skipped_entities"] >= 0 and isinstance(info["worst_fleet_minutes"], list)
+
+
+# ------------------------------------------------------------------ structural helpers
+
+
+def windows(entities: dict[str, list[float]], start=datetime(2023, 5, 21)) -> pl.DataFrame:
+    rows = [
+        (start + timedelta(minutes=i), name, x)
+        for name, xs in entities.items()
+        for i, x in enumerate(xs)
+    ]
+    return pl.DataFrame(rows, schema=["bin", "entity", "x"], orient="row").with_row_index("row")
+
+
+def test_entity_level_is_per_entity_and_floored():
+    rng = np.random.default_rng(0)
+    quiet = rng.uniform(0.1, 0.9, 2000)
+    loud = rng.uniform(100, 200, 2000)
+    frame = windows({"quiet": list(quiet), "loud": list(loud)})
+    level = frame.with_columns(level=episodes.entity_level("x", 1.0))
+    flagged = level.filter(pl.col("x") > pl.col("level"))
+    assert level.filter(pl.col("entity") == "quiet")["level"].unique().to_list() == [1.0]
+    assert flagged.filter(pl.col("entity") == "quiet").is_empty()  # chronic or small: never
+    assert 0 < flagged.filter(pl.col("entity") == "loud").height <= math.ceil(0.005 * 2000)
+
+
+def test_iid_noise_flags_at_most_the_budget():
+    rng = np.random.default_rng(1)
+    n = 3000
+    frame = windows({"a": list(rng.poisson(5, n) + 1.0)}).with_columns(
+        level=episodes.entity_level("x", 1.0)
+    )
+    assert frame.filter(pl.col("x") > pl.col("level")).height <= math.ceil(0.005 * n)
+
+
+def test_constant_entity_flags_nothing():
+    frame = windows({"a": [50.0] * 500}).with_columns(level=episodes.entity_level("x", 1.0))
+    assert frame.filter(pl.col("x") > pl.col("level")).is_empty()
+
+
+def test_fleet_wide_minutes_are_dropped_and_counted():
+    names = [f"h{i}" for i in range(8)]
+    every = windows({n: [1.0] * 10 for n in names})
+    flagged = every.filter(pl.col("bin") == datetime(2023, 5, 21, 0, 3))  # all 8 at minute 3
+    flagged = flagged.with_columns(raw=pl.Series([1.0 + i for i in range(8)]))
+    flagged = pl.concat(
+        [
+            flagged,
+            every.filter(
+                (pl.col("bin") == datetime(2023, 5, 21, 0, 7)) & (pl.col("entity") == "h0")
+            ).with_columns(raw=pl.lit(2.0)),
+        ]
+    )
+    kept, drop = episodes.drop_fleet_wide(flagged, every, 60, "hosts")
+    assert kept["entity"].to_list() == ["h0"] and kept["bin"][0].minute == 7
+    assert (drop.windows, drop.minutes) == (8, 1)
+    assert drop.worst == [{"minute": "2023-05-21 00:03:00", "share": 1.0}]
+    # the minute stays visible as one row of kind fleet: severity share / 25 %, worst entities
+    row = drop.rows.row(0, named=True)
+    assert drop.rows.height == 1 and row["kind"] == "fleet" and row["entity"] == "all hosts"
+    assert (row["bin"], row["window_s"], row["raw"]) == (datetime(2023, 5, 21, 0, 3), 60, 4.0)
+    assert row["evidence"] == "8 of 8 hosts flagged (100%); highest: h7, h6, h5"
+    assert base.finish(DETECTORS.get("structural_pca"), drop.rows, 10).rows.height == 1
+    # a small fleet is never fleet-wide: two of two entities flagged is two anomalies
+    small = every.filter(pl.col("entity").is_in(["h0", "h1"]))
+    kept, drop = episodes.drop_fleet_wide(
+        small.filter(pl.col("bin") == datetime(2023, 5, 21, 0, 3)).with_columns(raw=pl.lit(2.0)),
+        small,
+        60,
+        "hosts",
+    )
+    assert kept.height == 2 and drop.minutes == 0 and drop.rows.is_empty()
+
+
+def test_episodes_merge_close_windows_per_entity():
+    start = datetime(2023, 5, 21)
+    rows = [  # a: minutes 0, 2, 5 (gaps <= 5: one episode, 6 windows), 20 (another)
+        (start + timedelta(minutes=m), "a", raw, i)
+        for i, (m, raw) in enumerate([(0, 1.5), (2, 4.0), (5, 2.0), (20, 1.2)])
+    ] + [(start + timedelta(minutes=1), "b", 3.0, 10), (start + timedelta(minutes=8), "b", 2.0, 11)]
+    merged = episodes.merge_episodes(
+        pl.DataFrame(rows, schema=["bin", "entity", "raw", "row"], orient="row"), 60
+    ).sort("entity", "bin")
+    assert merged["entity"].to_list() == ["a", "a", "b", "b"]
+    assert merged["minutes"].to_list() == [6, 1, 1, 1]
+    assert merged["raw"].to_list() == [4.0, 1.2, 3.0, 2.0]
+    assert merged["row"].to_list() == [1, 3, 10, 11]  # the peak window
+    assert merged["bin"][0] == start
+
+
+def test_forest_skips_short_and_constant_entities_and_scores_an_outlier():
+    rng = np.random.default_rng(2)
+    x = rng.normal(size=(300, 4))
+    x[17] = 12.0
+    s = iforest.isolation_scores(x)
+    assert int(np.argmax(s)) == 17 and s[17] > 0.6
+    assert (iforest.raw_score(np.array([0.5, 1.0, 0.25])) == [1.0, math.inf, 0.5]).all()
+    scaled = sparse.csr_matrix(np.vstack([np.ones((150, 3)), rng.integers(0, 3, (150, 3))]))
+    assert iforest.entity_windows(scaled, np.arange(99)) is None  # too short
+    assert iforest.entity_windows(scaled, np.arange(150)) is None  # identical rows
+    found = iforest.entity_windows(scaled, np.arange(150, 300))
+    assert found is not None and found[0].shape == (150, 3)
+
+
+def test_iforest_scores_an_entity_on_its_own_history():
+    # entity "a" always logs template 0 and 1 in a fixed mix; "b" always the opposite mix: a
+    # pooled forest would flag one of them everywhere, per-entity forests flag neither
+    rng = np.random.default_rng(3)
+    n = 300
+    a = np.column_stack([rng.integers(8, 12, n), rng.integers(0, 2, n)])
+    b = np.column_stack([rng.integers(0, 2, n), rng.integers(8, 12, n)])
+    a[100] = [0, 30]  # the one unusual window of a
+    counts = sparse.csr_matrix(np.log1p(np.vstack([a, b]).astype(float)))
+    bins = np.tile(
+        np.datetime64("2023-05-21T00:00", "us") + np.arange(n) * np.timedelta64(60, "s"), 2
+    )
+    matrix = ft.Matrix(counts, bins, np.repeat([0, 1], n), ["a", "b"], np.array([7, 8]), 60)
+    scores, skipped, _ = iforest.score_grid(matrix, counts)
+    assert skipped == 0
+    top = scores.sort("s", descending=True).head(1)
+    assert top["entity"][0] == "a" and top["row"][0] == 100
+    assert scores.group_by("entity").agg(pl.col("s").median())["s"].max() < 0.55
+
+
+# ------------------------------------------------------------------ ranking
+
+
+def test_overall_is_reciprocal_rank_within_detector_and_kind():
+    class Two(Fake):
+        key = "two"
+        type = "structural"
+
+    found = pl.DataFrame(
+        {
+            "bin": [datetime(2023, 5, 21, 0, i) for i in range(6)],
+            "window_s": [60] * 6,
+            "kind": ["host"] * 4 + ["service"] * 2,
+            "entity": ["h"] * 4 + ["s"] * 2,
+            "raw": [5.0, 4.0, 3.0, 2.0, 9.0, 8.0],
+            "evidence": [""] * 6,
+        }
+    )
+    rows = base.finish(Two(), found, 100, 100).rows
+    by_kind = {k: part.sort("score", descending=True) for (k,), part in rows.group_by("kind")}
+    assert by_kind["host"]["overall"].to_list() == pytest.approx([1 / 61, 1 / 62, 1 / 63, 1 / 64])
+    assert by_kind["service"]["overall"].to_list() == pytest.approx([1 / 61, 1 / 62])
+    # more rows in a detector do not lower its best row: ranks, not percentiles
+    assert rows["overall"].max() == pytest.approx(1 / 61)
+
+
+def test_combined_top_mixes_types_and_entities(stage):
+    rows = an.load_anomalies(stage)
+    ranked = an.sort_rows(rows, "overall")
+    assert set(rows["type"]) <= set(ranked.head(20)["type"])  # no type is crowded out
+    top = ranked.head(an.TABLE_ROWS)
+    # the synthetic stage has 12 entities in its 23 rows: the plan's 10 % per entity (of 100 rows)
+    # is checked on the real cache (``tests/benchmark``); here no entity may have a fifth
+    assert top.group_by("kind", "entity").len()["len"].max() <= 0.2 * top.height
+    assert an.DEFAULT_SORT == "overall"
 
 
 def test_analysis_follows_the_registered_detectors():
@@ -220,7 +404,7 @@ def test_analysis_follows_the_registered_detectors():
     registry.add(Fake("other"))
     assert analysis.version != version and "other=1" in analysis.version
     assert analysis.version.startswith(f"{base.FRAMEWORK_VERSION}:{an.MAX_PER_ENTITY}:")
-    assert Anomalies().depends_on == ("hosts", "pca", "templates", "temporal")
+    assert Anomalies().depends_on == ("features", "hosts", "pca", "templates", "temporal")
 
 
 def run_stage(built, tmp_path, registry, log=None):
@@ -430,9 +614,9 @@ def test_built_table_and_manifest(stage):
         and pca_rows["evidence"].str.contains("SPE").all()
     )
     # the shared data has no busy host, so the contextual detector runs but finds nothing
-    assert set(rows["detector"]) == {"structural_pca", "volume"}
+    assert set(rows["detector"]) == {"structural_pca", "structural_iforest", "volume"}
     meta = {d["key"]: d for d in stage.read_json("anomalies", "meta.json")["detectors"]}
-    assert set(meta) == {"structural_pca", "volume", "contextual"}
+    assert set(meta) == {"structural_pca", "structural_iforest", "volume", "contextual"}
     for key, entry in meta.items():
         assert entry["rows"] == rows.filter(pl.col("detector") == key).height
         assert entry["above_threshold"] >= entry["rows"]
@@ -544,6 +728,24 @@ def test_injected_anomaly_is_found_with_its_type_and_rank(stage, synthetic, kind
     assert rank < max_rank, f"found at rank {rank}, expected within the top {max_rank}"
 
 
+# The structural type has two detectors, each of which must find its injections on its own.
+STRUCTURAL = [
+    pytest.param("structural_pca", spike_service, 10, id="pca spike"),
+    pytest.param("structural_pca", novel_template_window, 15, id="pca novel template"),
+    pytest.param("structural_iforest", spike_service, 15, id="iforest spike"),
+    pytest.param("structural_iforest", novel_template_window, 15, id="iforest novel template"),
+    pytest.param("structural_iforest", spike_host, 15, id="iforest host spike"),
+]
+
+
+@pytest.mark.parametrize(("key", "found", "max_rank"), STRUCTURAL)
+def test_each_structural_detector_finds_the_injections(stage, synthetic, key, found, max_rank):
+    rows = an.load_anomalies(stage).filter(pl.col("detector") == key)
+    rank = found(synthetic.truth, rows)
+    assert rank is not None, f"not found among {rows.height} {key} rows"
+    assert rank < max_rank, f"found at rank {rank}, expected within the top {max_rank}"
+
+
 def test_every_registered_type_has_an_expectation():
     expected = {case.values[0] for case in INJECTED} | OWN_DATASET | NO_INJECTION
     assert set(DETECTORS.types()) <= expected
@@ -565,7 +767,7 @@ def test_select_by_range_type_and_entity(stage):
     assert set(by_service.filter(pl.col("kind") == "service")["entity"]) == {"haproxy"}
     assert (by_service["kind"] == "host").any()  # the service filter leaves host rows alone
     by_host = an.select(rows, Filters(hosts=("nope",)), [])
-    assert (by_host["kind"] == "service").all()
+    assert (by_host["kind"] != "host").all()  # fleet rows are not restricted by a host filter
 
 
 def stamp(value):
@@ -578,6 +780,7 @@ def test_sort_rows(stage):
     assert an.sort_rows(rows, "type")["type"].is_sorted()
     assert an.sort_rows(rows, "entity")["entity"].is_sorted()
     assert an.sort_rows(rows, "score")["score"].is_sorted(descending=True)
+    assert an.sort_rows(rows, "overall")["overall"].is_sorted(descending=True)
 
 
 def test_explorer_url_and_table(stage, synthetic):
@@ -592,7 +795,12 @@ def test_explorer_url_and_table(stage, synthetic):
     }
     assert "service=" not in an.explorer_url(start, 60, "unknown", "x", None)
     table, hrefs = an.table_rows(an.load_anomalies(stage).head(5))
-    assert table.height == 5 == len(hrefs) and table.columns[:3] == ["window", "type", "score"]
+    assert table.height == 5 == len(hrefs) and table.columns[:4] == [
+        "window",
+        "type",
+        "overall",
+        "score",
+    ]
 
 
 def test_request_links_do_not_restrict_the_time_range():
@@ -618,13 +826,20 @@ def test_select_keeps_windows_that_overlap_the_range():
     assert an.select(rows, Filters(start="2023-05-21 01:15:00"), [])["entity"].to_list() == []
 
 
-def test_the_table_sorts_the_whole_selection_not_its_top_rows(stage):
+def test_the_table_sorts_the_whole_selection_not_its_top_rows(stage, monkeypatch):
+    monkeypatch.setattr(an, "TABLE_ROWS", 5)
     rows = an.load_anomalies(stage)
-    assert rows.height > 30
+    assert rows.height > 5
     earliest = rows["bin"].min()
     _, table, _ = an.draw_anomalies(stage, Filters(), [], "time", None)
     first = an.stamp(earliest)
     assert first in str(table)  # the earliest anomaly is shown, wherever it ranks by score
+
+
+def test_the_table_shows_min_of_the_default_rows_and_the_selection(stage):
+    rows = an.load_anomalies(stage)
+    _, table, _ = an.draw_anomalies(stage, Filters(), [], "score", None)
+    assert str(table).count("/explorer") == min(an.TABLE_ROWS, rows.height)
 
 
 def test_timeline_samples_every_type(monkeypatch):
@@ -721,8 +936,8 @@ def test_load_follows_the_file(stage):
 
 
 def test_value_helpers():
-    assert an.sort_value("time") == "time" and an.sort_value("x") == "score"
-    assert an.sort_value(None) == "score"
+    assert an.sort_value("time") == "time" and an.sort_value("score") == "score"
+    assert an.sort_value("x") == "overall" and an.sort_value(None) == "overall"
     assert an.type_values(None) == [] and an.type_values(["a", 3]) == ["a"]  # type: ignore[list-item]
 
 
