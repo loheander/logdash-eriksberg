@@ -42,7 +42,7 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
 | pca | 12 fits (group x window x scaling); about 4 s for a synthetic 230k-window x 281-template matrix at 3 % density (not yet measured on the real data) |
 | hosts | 3 s on the real data (162 hosts, 281 templates, 559 service x host pairs; one aggregate over `events` for the matrix) |
-| anomalies | 0.5 s (two detectors: PCA residual, 73,421 windows above the limit, 11,446 kept: at most 100 per service or host; volume, 87 episodes) |
+| anomalies | 1.3 s (three detectors: PCA residual, 73,421 windows above the limit, 11,446 kept: at most 100 per service or host; volume, 87 episodes; contextual, 4,774 windows above the threshold, 3,533 kept) |
 | total | 1 min 58 s (measured before the features, pca and anomalies stages existed) |
 
 `cache/` is 622 MB (281 templates from 73,583 unique masked lines).
@@ -147,7 +147,8 @@ follows the data (type filter, timeline, table, explorer links).
   row counts as anomalous, above 0) and `setting_names` (settings that enter the cache
   fingerprint, `()` if none). A detector whose threshold depends on settings may define
   `threshold_for(settings)`. The registry checks the class against the `Detector` protocol.
-- `detect(ctx)` gets a `DetectContext` (`store`, `settings`, `log`) and returns a polars frame
+- `detect(ctx)` gets a `DetectContext` (`store`, `settings`, `log`, `meta`: a dict to fill with
+  JSON values, such as how many entities were not scored) and returns a polars frame
   with `bin` (window start, UTC), `window_s`, `kind` (what `entity` is, see below), `entity`,
   `raw` (larger is more anomalous), `evidence` (text) and optionally `template_id`. Return every
   row you consider anomalous and do not sort and cut first: the framework caps per entity.
@@ -172,7 +173,8 @@ follows the data (type filter, timeline, table, explorer links).
   99th percentile of the same kind and clipped to 1. It keeps its spread, does not saturate,
   and puts service and host rows of the same standing side by side; it orders rows within a
   detector and kind and compares them across detectors by position, it is not a probability.
-- `meta.json` lists each detector with `above_threshold`, `rows` (kept), `dropped`, `seconds`
+- `meta.json` lists each detector with `above_threshold`, `rows` (kept), `dropped`, `seconds`, an
+  optional `info` (what the detector put in `ctx.meta`; its `note` text is shown on the page)
   and, for a detector that raised, `error`: a failing detector is logged and skipped, the others
   still run, and the page names it. The page shows "kept N of M" per type.
 - The page links each row to `/explorer?[start=&end=&]service=|host=|request_id=[&template=]`
@@ -182,6 +184,17 @@ follows the data (type filter, timeline, table, explorer links).
 windows of the per-service and per-host 1-minute log1p fits with `spe / limit` of at least 1,
 with the top residual templates as evidence (on the real data 73,421 windows, 11,446 kept). Issue 6 adds the
 Isolation Forest next to it.
+
+`contextual.py` is the contextual type: a host's 1-minute template mix against its peers
+(`analyses/hosts`: the host's nearest hosts within the Hellinger radius, not its k-means cluster). A window's
+distance to the host's peer centroid (`centroid_distance`) becomes a robust z-score against the host's own
+baseline (`load_baseline`: median and MAD of that distance), threshold 8. Window noise depends on the line count:
+windows of fewer than `max(20, half the host's median lines)` lines are not scored and the scale of a window
+below the host's median grows by `sqrt(median / lines)`. The 23 hosts without a valid peer group are not scored;
+the count (and the number of windows scored) is in the detector's `meta.json` entry (`info.unscored_hosts`) and
+in the page's hint line. Evidence: the three templates that contribute most to the squared distance, with their
+share of the window and of the peers. Real data: 4,774 of 199,882 scored windows above the threshold, 3,533 kept
+(139 hosts), 0.6 s.
 
 `volume.py` is the volume spike/drop type. It uses `find_bursts`, `find_drops` and `find_gaps` of
 `analyses/temporal.py` on the 1-minute rate tables. A row is an episode (`bin` its first minute,

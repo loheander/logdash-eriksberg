@@ -14,6 +14,7 @@ from logdash.analyses.anomalies import Anomalies
 from logdash.analyses.base import ComputeContext
 from logdash.analyses.explorer import fetch_page, link_from_query, merge_link
 from logdash.analyses.features import Features
+from logdash.analyses.hosts import Hosts
 from logdash.analyses.pca import Pca
 from logdash.analyses.templates import Templates
 from logdash.analyses.temporal import Temporal
@@ -35,7 +36,7 @@ from tests.synthetic import GroundTruth, utc
 
 @pytest.fixture(scope="module")
 def stage(built):
-    build_with(built, Templates(), Features(), Pca(), Temporal(), Anomalies())
+    build_with(built, Templates(), Features(), Pca(), Temporal(), Hosts(), Anomalies())
     return built.store
 
 
@@ -218,7 +219,7 @@ def test_analysis_follows_the_registered_detectors():
     registry.add(Fake("other"))
     assert analysis.version != version and "other=1" in analysis.version
     assert analysis.version.startswith(f"{base.FRAMEWORK_VERSION}:{an.MAX_PER_ENTITY}:")
-    assert Anomalies().depends_on == ("pca", "templates", "temporal")
+    assert Anomalies().depends_on == ("hosts", "pca", "templates", "temporal")
 
 
 def run_stage(built, tmp_path, registry, log=None):
@@ -379,7 +380,7 @@ def test_built_table_and_manifest(stage):
         set(pca_rows["kind"]) == {"service", "host"}
         and pca_rows["evidence"].str.contains("SPE").all()
     )
-    assert set(rows["detector"]) == {"structural_pca", "volume"}
+    assert set(rows["detector"]) == {"structural_pca", "volume", "contextual"}
     meta = {d["key"]: d for d in stage.read_json("anomalies", "meta.json")["detectors"]}
     for key, entry in meta.items():
         assert entry["rows"] == rows.filter(pl.col("detector") == key).height
@@ -439,6 +440,13 @@ def silent_host_gap(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
     )
 
 
+def context_host_window(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
+    return first_match(
+        rows,
+        during(truth.context_start, truth.context_end) & (pl.col("entity") == truth.context_host),
+    )
+
+
 def novel_first_seen(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
     return first_match(rows, during(truth.novel_first_seen, truth.novel_first_seen))
 
@@ -457,8 +465,10 @@ def pending(kind: str, issue: str) -> list[Any]:
 INJECTED = [
     pytest.param("volume", spike_host, 20, id="volume spike"),
     pytest.param("volume", silent_host_gap, 20, id="silent host gap"),
+    pytest.param("contextual", context_host_window, 20, id="host mix against its peers"),
     pytest.param("structural", spike_service, 10, id="spike seen structurally"),
-    pytest.param("structural", novel_template_window, 15, id="novel template seen structurally"),
+    # the contextual injection (a busy host that changes its mix) adds structural rows of its own
+    pytest.param("structural", novel_template_window, 25, id="novel template seen structurally"),
     pytest.param(
         "novel", novel_first_seen, 10, id="novel template", marks=pending("novel", "issue 7")
     ),
@@ -470,7 +480,7 @@ INJECTED = [
         marks=pending("sequence", "issue 8"),
     ),
 ]
-NO_INJECTION = {"contextual", "severity"}  # the synthetic data has none yet (issues 5 and 9)
+NO_INJECTION = {"severity"}  # the synthetic data has none yet (issue 9)
 
 
 @pytest.mark.parametrize(("kind", "found", "max_rank"), INJECTED)
@@ -669,7 +679,7 @@ def test_layout_and_callback_over_http(stage, built):
 
     assert "anomalies-timeline" in str(Anomalies().layout(stage))
     app = create_app(
-        stage, build_with(built, Templates(), Features(), Pca(), Temporal(), Anomalies())
+        stage, build_with(built, Templates(), Features(), Pca(), Temporal(), Hosts(), Anomalies())
     )
     client = app.server.test_client()
     assert client.get("/anomalies").status_code == 200

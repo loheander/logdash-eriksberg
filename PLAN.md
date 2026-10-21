@@ -335,7 +335,7 @@ Status: **Phase 1 done** (steps 1 to 9).
   injected anomalies checks type and rank (the PCA spike and the novel template, bounded to ten
   minutes after its first line, are in the top 10 and 15); the novel and sequence cases are
   strict expected failures until issues 7 and 8 register detectors (they fail when one does,
-  so the mark must go), contextual and severity wait for synthetic injections (issues 5 and 9).
+  so the mark must go), severity waits for a synthetic injection (issue 9).
   A stub detector of a new type on a new kind is tested end to end.
 - Volume detector (issue 4) done: `detectors/volume.py` uses `find_bursts`, `find_drops` and
   `find_gaps` of `analyses/temporal.py` on `rate_60` (spikes and drops per service and host) and
@@ -348,6 +348,18 @@ Status: **Phase 1 done** (steps 1 to 9).
   87 episodes of 42 entities (426 before merging; 91 spikes before the full-hour baseline rule
   removed 4 start-up artefacts), no drops or gaps, 0.4 s. Framework score normalisation is
   unchanged: 2 of the top 100 anomalies are volume.
+- Contextual detector (issue 5) done: `detectors/contextual.py` scores host x 1-minute windows by their
+  distance to the host's peer centroid (`hosts.centroid_distance`, `load_peer_centroids`) as a robust z-score
+  against the host's `load_baseline` row (threshold 8, the raw score). Windows with fewer than
+  `max(20, 0.5 * median lines)` lines are not scored, and the scale of a window below the host's median line
+  count grows by `sqrt(median / lines)`. The 23 hosts without a valid peer group are not scored: the count goes
+  to the detector's meta (`DetectContext.meta`, stored as `info` in `meta.json`, its `note` shown on the page).
+  `hosts.window_matrix` was factored out of `window_baseline` (same output). Synthetic data: one busy host
+  (`context_busy_rows`) logs the first template of every service for 6 minutes (service volumes unchanged);
+  the case is in `INJECTED` (top 20). The novel-template structural case now allows rank 25 (it was 15; the
+  added host rows add structural rows). Real data: 4,774 of 199,882 scored windows above the threshold, 3,533
+  kept over 139 hosts, 0.6 s; the top rows are hosts with a rare error template (T86 'could not open network
+  device') at 30 % of a window.
 - Module 7 (hosts and services, issue 10) done: `analyses/hosts.py` from `templates/template_counts_host.parquet`
   and one aggregate over `events` (service x host lines). A host's profile is its template mix over the whole
   span, compared as `sqrt(share)` (Hellinger). Display clusters: k-means (fixed seed) chooses k in 2..10 by
