@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -14,6 +15,7 @@ from logdash.analyses.anomalies import Anomalies
 from logdash.analyses.base import ComputeContext
 from logdash.analyses.explorer import fetch_page, link_from_query, merge_link
 from logdash.analyses.features import Features
+from logdash.analyses.hosts import Hosts
 from logdash.analyses.pca import Pca
 from logdash.analyses.templates import Templates
 from logdash.analyses.temporal import Temporal
@@ -35,7 +37,7 @@ from tests.synthetic import GroundTruth, utc
 
 @pytest.fixture(scope="module")
 def stage(built):
-    build_with(built, Templates(), Features(), Pca(), Temporal(), Anomalies())
+    build_with(built, Templates(), Features(), Pca(), Temporal(), Hosts(), Anomalies())
     return built.store
 
 
@@ -218,7 +220,7 @@ def test_analysis_follows_the_registered_detectors():
     registry.add(Fake("other"))
     assert analysis.version != version and "other=1" in analysis.version
     assert analysis.version.startswith(f"{base.FRAMEWORK_VERSION}:{an.MAX_PER_ENTITY}:")
-    assert Anomalies().depends_on == ("pca", "templates", "temporal")
+    assert Anomalies().depends_on == ("hosts", "pca", "templates", "temporal")
 
 
 def run_stage(built, tmp_path, registry, log=None):
@@ -334,6 +336,54 @@ class Malformed(Broken):
         return pl.DataFrame({"bin": [datetime(2023, 5, 21)]})
 
 
+class WithMeta(Fake):
+    """Fills the meta with what ``json.dumps`` cannot take: numpy values and NaN."""
+
+    def detect(self, ctx):
+        ctx.meta.update(
+            {
+                "count": np.int64(3),
+                "ratio": np.float32(0.5),
+                "missing": float("nan"),
+                "names": {"b", "a"},
+                "nested": {"values": np.array([1, 2]), "flag": np.bool_(True), "inf": math.inf},
+                "note": "text",
+            }
+        )
+        return super().detect(ctx)
+
+
+class BrokenWithMeta(Broken):
+    key = "broken_meta"
+
+    def detect(self, ctx):
+        ctx.meta["seen"] = np.int64(7)
+        raise ValueError("boom")
+
+
+def test_detector_meta_is_stored_as_json_safe_info(stage):
+    registry = DetectorRegistry()
+    for detector in (WithMeta("meta"), BrokenWithMeta(), Fake("plain")):
+        registry.add(detector)
+    ctx = DetectContext(stage, stage.settings, lambda _: None)
+    _, info = an.run_detectors(registry, ctx)
+    by_key = {entry["key"]: entry for entry in info}
+    json.dumps(info, allow_nan=False)  # numpy values and NaN cannot fail the write
+    assert by_key["meta"]["info"] == {
+        "count": 3,
+        "ratio": 0.5,
+        "missing": None,
+        "names": ["a", "b"],
+        "nested": {"values": [1, 2], "flag": True, "inf": None},
+        "note": "text",
+    }
+    assert by_key["broken_meta"]["info"] == {"seen": 7} and "error" in by_key["broken_meta"]
+    assert "info" not in by_key["plain"]  # nothing to say: no key
+    assert ctx.meta == {}  # each detector gets a fresh dict
+    text = an.kept_text(info)
+    assert " text." in text  # the page shows the note of the detectors that have one
+
+
 def test_a_failing_detector_is_skipped_and_reported(built, tmp_path):
     registry = DetectorRegistry()
     for detector in (Broken(), Fake("one"), Malformed()):
@@ -379,8 +429,10 @@ def test_built_table_and_manifest(stage):
         set(pca_rows["kind"]) == {"service", "host"}
         and pca_rows["evidence"].str.contains("SPE").all()
     )
+    # the shared data has no busy host, so the contextual detector runs but finds nothing
     assert set(rows["detector"]) == {"structural_pca", "volume"}
     meta = {d["key"]: d for d in stage.read_json("anomalies", "meta.json")["detectors"]}
+    assert set(meta) == {"structural_pca", "volume", "contextual"}
     for key, entry in meta.items():
         assert entry["rows"] == rows.filter(pl.col("detector") == key).height
         assert entry["above_threshold"] >= entry["rows"]
@@ -439,6 +491,13 @@ def silent_host_gap(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
     )
 
 
+def context_host_window(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
+    return first_match(
+        rows,
+        during(truth.context_start, truth.context_end) & (pl.col("entity") == truth.context_host),
+    )
+
+
 def novel_first_seen(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
     return first_match(rows, during(truth.novel_first_seen, truth.novel_first_seen))
 
@@ -470,7 +529,10 @@ INJECTED = [
         marks=pending("sequence", "issue 8"),
     ),
 ]
-NO_INJECTION = {"contextual", "severity"}  # the synthetic data has none yet (issues 5 and 9)
+# Types whose injection changes the structural fits of the shared data (a busy host), so their
+# case lives in tests/unit/test_contextual.py on a dataset of its own.
+OWN_DATASET = {"contextual"}
+NO_INJECTION = {"severity"}  # the synthetic data has none yet (issue 9)
 
 
 @pytest.mark.parametrize(("kind", "found", "max_rank"), INJECTED)
@@ -483,7 +545,7 @@ def test_injected_anomaly_is_found_with_its_type_and_rank(stage, synthetic, kind
 
 
 def test_every_registered_type_has_an_expectation():
-    expected = {case.values[0] for case in INJECTED} | NO_INJECTION
+    expected = {case.values[0] for case in INJECTED} | OWN_DATASET | NO_INJECTION
     assert set(DETECTORS.types()) <= expected
 
 
@@ -669,7 +731,7 @@ def test_layout_and_callback_over_http(stage, built):
 
     assert "anomalies-timeline" in str(Anomalies().layout(stage))
     app = create_app(
-        stage, build_with(built, Templates(), Features(), Pca(), Temporal(), Anomalies())
+        stage, build_with(built, Templates(), Features(), Pca(), Temporal(), Hosts(), Anomalies())
     )
     client = app.server.test_client()
     assert client.get("/anomalies").status_code == 200

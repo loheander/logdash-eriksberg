@@ -335,7 +335,7 @@ Status: **Phase 1 done** (steps 1 to 9).
   injected anomalies checks type and rank (the PCA spike and the novel template, bounded to ten
   minutes after its first line, are in the top 10 and 15); the novel and sequence cases are
   strict expected failures until issues 7 and 8 register detectors (they fail when one does,
-  so the mark must go), contextual and severity wait for synthetic injections (issues 5 and 9).
+  so the mark must go), severity waits for a synthetic injection (issue 9).
   A stub detector of a new type on a new kind is tested end to end.
 - Volume detector (issue 4) done: `detectors/volume.py` uses `find_bursts`, `find_drops` and
   `find_gaps` of `analyses/temporal.py` on `rate_60` (spikes and drops per service and host) and
@@ -348,6 +348,25 @@ Status: **Phase 1 done** (steps 1 to 9).
   87 episodes of 42 entities (426 before merging; 91 spikes before the full-hour baseline rule
   removed 4 start-up artefacts), no drops or gaps, 0.4 s. Framework score normalisation is
   unchanged: 2 of the top 100 anomalies are volume.
+- Contextual detector (issue 5) done: `detectors/contextual.py` scores host x 1-minute windows by their
+  distance to the host's peer centroid (`hosts.centroid_distance`, `load_peer_centroids`). Each host has its own
+  fit `expected(n) = a + b / sqrt(n)` of that distance against the window's line count (robust refit, `b >= 0`) and
+  a scale (MAD of the residuals, at least 0.1 of the median, times `sqrt(median lines / n)` clipped to 0.5..2);
+  `u` is the standardised residual and the raw score is `z = u - median(u of the host's peers in the same minute)`
+  (`hosts.load_peers`; the fleet's median of the minute when fewer than 3 peers have a window, no shift when the
+  fleet is that small too), so fleet-wide events are not host-versus-peer deviations. Threshold 8 (about the
+  99th percentile of `z` on the real data; the quantiles are in the meta) and at least 3 lines of the template
+  that leads the evidence. Windows with fewer than `max(30, 0.5 * median lines)` lines are not scored (inert on
+  the real data: all windows have 46 or more lines). The 23 hosts without a valid peer group are not scored: the
+  count and the names go to the detector's meta (`DetectContext.meta`, stored as `info` in `meta.json`
+  after `json_safe` converts numpy values and NaN; its `note` is shown on the page). `hosts.window_matrix` was
+  factored out of `window_baseline` (same output). The synthetic injection (`context_busy_rows`,
+  `context_minutes`, off by default) makes one busy host log a single message for 6 minutes (z 15 to 22); it
+  changes the structural fits of the shared data, so it has a dataset of its own in `test_contextual.py` and the
+  structural novel-template bound stays 15. Hand-made fleets test the negative cases (a fleet-wide shift, a
+  normal host and a single stray line are not flagged) and that the flag rate is level over line counts. Real
+  data: 2,299 of 199,882 scored windows at `z >= 8`, 496 after the evidence rule, 456 kept over 41 hosts, 0.9 s;
+  the top rows are eselda12u01s09 ('could not open network device' at 23 to 33 % of a window, z 70 to 94).
 - Module 7 (hosts and services, issue 10) done: `analyses/hosts.py` from `templates/template_counts_host.parquet`
   and one aggregate over `events` (service x host lines). A host's profile is its template mix over the whole
   span, compared as `sqrt(share)` (Hellinger). Display clusters: k-means (fixed seed) chooses k in 2..10 by

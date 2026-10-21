@@ -15,11 +15,14 @@ file nor the page: the type filter, the timeline and the table follow the data.
 
 from __future__ import annotations
 
+import math
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
 
 import dash_mantine_components as dmc
+import numpy as np
 import plotly.graph_objects as go
 import polars as pl
 from dash import Dash, Input, Output
@@ -68,6 +71,25 @@ load_builtin()  # import the detector modules so that they register
 # --------------------------------------------------------------------------- compute
 
 
+def json_safe(value: Any) -> Any:
+    """``value`` with numpy scalars and arrays as Python values and NaN or infinity as None.
+
+    Detector meta goes into ``meta.json`` outside the per-detector ``try``, so whatever a
+    detector puts there must not be able to fail the write.
+    """
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set | frozenset | np.ndarray):
+        return [
+            json_safe(v) for v in (sorted(value) if isinstance(value, set | frozenset) else value)
+        ]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value if value is None or isinstance(value, str | int | bool) else str(value)
+
+
 def run_detectors(
     registry: DetectorRegistry, ctx: DetectContext
 ) -> tuple[pl.DataFrame, list[dict[str, Any]]]:
@@ -85,10 +107,11 @@ def run_detectors(
             "type": detector.type,
             "title": detector.title,
         }
+        own = replace(ctx, meta={})
         try:
             threshold = threshold_of(detector, ctx.settings)
             rows, above = finish(
-                detector, detector.detect(ctx), MAX_PER_DETECTOR, MAX_PER_ENTITY, threshold
+                detector, detector.detect(own), MAX_PER_DETECTOR, MAX_PER_ENTITY, threshold
             )
         except Exception as error:  # noqa: BLE001 - any failure of a plug-in is isolated
             message = f"{type(error).__name__}: {error}"
@@ -105,6 +128,8 @@ def run_detectors(
             "dropped": above - rows.height,
             "seconds": round(seconds, 3),
         }
+        if own.meta:
+            entry["info"] = json_safe(own.meta)
         info.append(entry)
     combined = pl.concat(parts).sort(["score", "bin"], descending=[True, False])
     return combined, info
@@ -304,6 +329,9 @@ def kept_text(meta: list[dict[str, Any]]) -> str:
         + "; ".join(f"{k:,} of {m:,} {t}" for t, (k, m) in kept.items())
         + (f" windows above threshold (at most {MAX_PER_ENTITY} per service or host).")
     )
+    for entry in meta:
+        if "note" in entry.get("info", {}):
+            text += f" {entry['title']}: {entry['info']['note']}."
     failed = [f"{e['key']} ({e['error']})" for e in meta if e.get("error")]
     return text + (" Failed and skipped: " + "; ".join(failed) + "." if failed else "")
 
