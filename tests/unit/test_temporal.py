@@ -238,3 +238,16 @@ def test_layout_and_callbacks_over_http(tmp, built):
         [("temporal-service", "value", "haproxy"), ("theme", "data", None)],
     )
     call([("temporal-anomalies", "children")], base)
+
+
+def test_rate_figure_with_range_not_aligned_to_bins():
+    lo = datetime(2023, 5, 21, 0, 1, 10, 665000)
+    df = pl.DataFrame(
+        {
+            "bin": [datetime(2023, 5, 21, 0, 1), datetime(2023, 5, 21, 0, 2)],
+            "series": ["INFO"] * 2,
+            "n": [5, 7],
+        }
+    )
+    fig = t.rate_figure(df, lo, lo + timedelta(minutes=3), 60, "level", None)
+    assert list(fig.data[0].y)[:2] == [5, 7]

@@ -9,7 +9,7 @@ burst/gap detection run on those small tables with NumPy/SciPy.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -397,8 +397,9 @@ def rate_figure(
     if df.is_empty():
         return figures.empty_figure("no events in the visible range", scheme)
     df = fold_series(df)
+    first = datetime.fromtimestamp(lo.replace(tzinfo=UTC).timestamp() // bin_s * bin_s, UTC)
     grid = pl.datetime_range(
-        lo.replace(microsecond=0), hi, interval=f"{bin_s}s", eager=True, time_unit="us"
+        first.replace(tzinfo=None), hi, interval=f"{bin_s}s", eager=True, time_unit="us"
     ).to_frame("bin")
     names = (
         df.group_by("series").agg(pl.col("n").sum()).sort("n", descending=True)["series"].to_list()

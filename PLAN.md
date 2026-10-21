@@ -252,6 +252,8 @@ uv run ruff check . && uv run ruff format --check .
 
 ## 8. Phase 1 work breakdown
 
+Status: **Phase 1 done** (steps 1 to 9).
+
 1. Project scaffold: `pyproject.toml` (uv, src layout, entry point, tool config),
    `.gitignore` (`data/`, `cache/`), ruff/mypy/pytest config, README usage.
 2. Synthetic dataset generator and fixtures.
@@ -264,6 +266,25 @@ uv run ruff check . && uv run ruff format --check .
 8. Run `build` on the real data, measure build time and callback latency,
    tune bins and limits.
 9. Coverage check ≥ 90 %, README with screenshots.
+
+### Phase 1 status
+
+- Real data: build takes 1 min 58 s (events 97 s, other stages under 8 s each),
+  cache 622 MB, 281 templates from 73,583 unique masked lines.
+- Latency (`pytest -m slow --no-cov`, real cache): every page layout under 25 ms and
+  every callback under 300 ms warm; worst are temporal rate by service on one hour
+  (about 190 ms), heatmap at 1 min (about 180 ms) and explorer text search (about 180 ms).
+  Start-up (`create_app`) about 220 ms.
+- Tuning: explorer text search scanned all payloads (5 s); it now walks hour partitions
+  in time order with a 150 ms budget and says where it stopped. Bursts within two
+  minutes merge into episodes, need 300 events above baseline and are ranked by excess
+  volume (867 rows became 522; the table now shows a real recurring neutron-l3-agent
+  burst every 75 minutes). The malformed-row host bucket is not analysed. Fixed a
+  rate chart that was blank on data not aligned to bin edges.
+- Deviations: hour partitions are in UTC; `events` carries `masked_hash` instead of
+  `template_id` (templates map via `templates/assignments.parquet`); a `level_raw`
+  column keeps the original level; shared widgets live in `app/ui.py`; the global time
+  range is only respected by Temporal, Templates and Explorer.
 
 ## 9. Open decisions
 

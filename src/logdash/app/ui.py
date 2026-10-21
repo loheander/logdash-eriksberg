@@ -76,10 +76,19 @@ def link_table(
     body = dmc.TableTbody(
         [
             dmc.TableTr(
-                [dmc.TableTd("" if v is None else str(v)) for v in row]
+                [
+                    dmc.TableTd(
+                        "" if v is None else str(v),
+                        style={"whiteSpace": "nowrap"}
+                        if len(str(v)) <= 24
+                        else {"wordBreak": "break-all"},
+                    )
+                    for v in row
+                ]
                 + [dmc.TableTd(dmc.Anchor("view", href=href, refresh=False))]
             )
             for row, href in zip(rows, hrefs, strict=False)
         ]
     )
-    return dmc.Table([head, body], striped=True, highlightOnHover=True, withTableBorder=True)
+    table = dmc.Table([head, body], striped=True, highlightOnHover=True, withTableBorder=True)
+    return dmc.ScrollArea(table, h=420) if len(rows) > 10 else table
