@@ -46,6 +46,8 @@ SPLITS = {"level": "level", "service": "program", "host": "host"}
 TOP_SPLIT = 10
 ROLL_WINDOW = 61  # 1-minute bins (one hour) for the rolling median and MAD
 MIN_BURST = 10  # a burst needs at least this many events in its peak minute
+MIN_EXCESS = 300  # ... and at least this many events above its baseline over the whole episode
+MERGE_BINS = 2  # bursts separated by at most this many quiet minutes form one episode
 MAX_LAG = 3600  # autocorrelation lags in seconds
 SPECTRUM_POINTS = 300
 MIN_SPECTRUM_EVENTS = 50
@@ -216,9 +218,14 @@ def find_bursts(x: np.ndarray, k: float, min_peak: int = MIN_BURST) -> list[dict
     """Runs of bins above rolling median + k robust sigmas; one dict per run."""
     median, scale = rolling_baseline(x)
     flagged = (x > median + k * scale) & (x >= min_peak)
+    if MERGE_BINS:
+        flagged = ndimage.binary_closing(flagged, structure=np.ones(MERGE_BINS + 1, dtype=bool))
     found = []
     for first, last in runs(flagged):
         peak = first + int(np.argmax(x[first : last + 1]))
+        excess = float(x[first : last + 1].sum() - median[first : last + 1].sum())
+        if excess < MIN_EXCESS:
+            continue
         found.append(
             {
                 "first": first,
@@ -227,6 +234,7 @@ def find_bursts(x: np.ndarray, k: float, min_peak: int = MIN_BURST) -> list[dict
                 "baseline": float(median[peak]),
                 "score": float((x[peak] - median[peak]) / scale[peak]),
                 "events": float(x[first : last + 1].sum()),
+                "excess": excess,
             }
         )
     return found
@@ -244,6 +252,7 @@ def find_gaps(x: np.ndarray, min_bins: int) -> list[dict[str, Any]]:
             "baseline": baseline,
             "score": float(b - a + 1),
             "events": 0.0,
+            "excess": baseline * (b - a + 1),
         }
         for a, b in runs(x == 0)
         if b - a + 1 >= min_bins
@@ -260,6 +269,7 @@ ANOMALY_SCHEMA: dict[str, Any] = {
     "baseline": pl.Float64,
     "score": pl.Float64,
     "events": pl.Float64,
+    "excess": pl.Float64,  # events above (burst) or below (gap) the rolling baseline
 }
 
 
@@ -286,6 +296,7 @@ def detect_anomalies(
                     "baseline": f["baseline"],
                     "score": f["score"],
                     "events": f["events"],
+                    "excess": f["excess"],
                 }
             )
 
@@ -298,12 +309,14 @@ def detect_anomalies(
     for (program,), frame in rate_60.group_by(["program"], maintain_order=True):
         add("burst", "service", str(program), find_bursts(series(frame), burst_k))
     for (host,), frame in host_60.group_by(["host"], maintain_order=True):
+        if host == MISSING:  # malformed rows, not a machine
+            continue
         x = series(frame)
         add("burst", "host", str(host), find_bursts(x, burst_k))
         add("gap", "host", str(host), find_gaps(x, gap_minutes))
     if not rows:
         return pl.DataFrame(schema=ANOMALY_SCHEMA)
-    return pl.DataFrame(rows, schema=ANOMALY_SCHEMA).sort("score", descending=True)
+    return pl.DataFrame(rows, schema=ANOMALY_SCHEMA).sort("excess", descending=True)
 
 
 # ------------------------------------------------------------------- page data access
@@ -531,6 +544,7 @@ def anomaly_table(df: pl.DataFrame) -> Component:
         pl.col("peak").round(0).cast(pl.Int64),
         pl.col("baseline").round(1),
         pl.col("score").round(1),
+        pl.col("excess").round(0).cast(pl.Int64),
     )  # fmt: skip
     return ui.link_table(shown, [explorer_href(r) for r in df.iter_rows(named=True)])
 
@@ -539,7 +553,7 @@ def anomaly_table(df: pl.DataFrame) -> Component:
 class Temporal:
     key = KEY
     title = "Temporal"
-    version = "1"
+    version = "2"
     depends_on: tuple[str, ...] = ()
     setting_names = SETTING_NAMES
 

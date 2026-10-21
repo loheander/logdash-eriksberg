@@ -47,8 +47,8 @@ def test_build_query_is_parameterised_and_limited():
         size=10,
     )
     assert "a'b" not in sql and "LIMIT 11 OFFSET 20" in sql and "hour IN (?, ?)" in sql
-    assert "it''s.parquet" in sql and "ESCAPE" in sql
-    assert params[-1] == "%50\\%\\_x%" and "r1" in params and 3 in params and "a'b" in params
+    assert "it''s.parquet" in sql and "contains(lower(payload), ?)" in sql
+    assert params[-1] == "50%_x" and "r1" in params and 3 in params and "a'b" in params
     plain, p2 = ex.build_query(Filters())
     assert "WHERE" not in plain and p2 == [] and f"LIMIT {ex.PAGE_SIZE + 1}" in plain
     no_template, _ = ex.build_query(Filters(), template=3)
@@ -175,3 +175,15 @@ def test_layout_prefilled_and_callback(exp):
         "explorer-link.data",
     )
     assert all(r["host"] == "eselda14u05s02" for r in linked["explorer-grid"]["rowData"])
+
+
+def test_search_page_matches_fetch_page_and_stops_on_budget(exp, con):
+    store = exp[0]
+    rows, more, cut = ex.search_page(con, store, Filters(), text="bgp session")
+    assert cut is None and not more
+    assert [r["time"] for r in rows] == [r["time"] for r in page(con, store, text="BGP SESSION")[0]]
+    first, more1, _ = ex.search_page(con, store, Filters(), text="e", size=5)
+    second, _, _ = ex.search_page(con, store, Filters(), text="e", size=5, page=1)
+    assert more1 and len(first) == 5 and second and second[0] not in first
+    none, more0, cut0 = ex.search_page(con, store, Filters(), text="zzzz", budget_s=-1.0)
+    assert none == [] and not more0 and cut0 == "00"

@@ -7,6 +7,7 @@ link here with the filters in the URL query (``/explorer?template=12&host=x``).
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -23,6 +24,7 @@ from logdash.cache.store import CacheStore
 
 KEY = "explorer"
 PAGE_SIZE = 100
+SEARCH_BUDGET_S = 0.15  # a text search stops starting new hour partitions after this long
 COLUMNS = ("time", "level", "host", "program", "logger", "python_module", "request_id", "payload")
 LINK_KEYS = ("template", "host", "service", "level", "start", "end", "request_id", "q")
 SELECT = (
@@ -41,12 +43,6 @@ def hour_values(start: datetime | None, end: datetime | None) -> list[str] | Non
         hours.append(f"{cursor.hour:02d}")
         cursor += timedelta(hours=1)
     return hours
-
-
-def like_pattern(text: str) -> str:
-    """``%text%`` with LIKE wildcards in ``text`` escaped (``ESCAPE '\\'``)."""
-    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return f"%{escaped}%"
 
 
 def parse_template(value: Any) -> int | None:
@@ -82,11 +78,21 @@ def build_query(
     text: str | None = None,
     page: int = 0,
     size: int = PAGE_SIZE,
+    hour: str | None = None,
+    limit: int | None = None,
 ) -> tuple[str, list[Any]]:
-    """``(sql, params)`` for one page; fetches ``size + 1`` rows to detect a next page."""
+    """``(sql, params)`` for one page; fetches ``size + 1`` rows to detect a next page.
+
+    ``hour`` restricts the query to one hour partition and ``limit`` replaces the
+    page arithmetic by ``LIMIT limit`` (used by the chunked text search).
+    """
     where, params = where_clause(filters)
     parts = [where.removeprefix("WHERE ")] if where else []
-    hours = hour_values(parse_time(filters.start), parse_time(filters.end))
+    hours = (
+        [hour]
+        if hour is not None
+        else hour_values(parse_time(filters.start), parse_time(filters.end))
+    )
     if hours is not None:
         parts.append(f"hour IN ({', '.join('?' for _ in hours)})")
         params.extend(hours)
@@ -100,9 +106,11 @@ def build_query(
         parts.append("request_id = ?")
         params.append(request_id.strip())
     if text:
-        parts.append("payload ILIKE ? ESCAPE '\\'")
-        params.append(like_pattern(text))
+        parts.append("contains(lower(payload), ?)")
+        params.append(text.lower())
     clause = f" WHERE {' AND '.join(parts)}" if parts else ""
+    if limit is not None:
+        return f"{SELECT}{clause} ORDER BY ts LIMIT {int(limit)}", params
     sql = f"{SELECT}{clause} ORDER BY ts LIMIT {int(size) + 1} OFFSET {int(page) * int(size)}"
     return sql, params
 
@@ -131,6 +139,52 @@ def fetch_page(
     rows = con.execute(sql, params).fetchall()
     records = [dict(zip(COLUMNS, row, strict=True)) for row in rows[:size]]
     return records, len(rows) > size
+
+
+def search_page(
+    con: duckdb.DuckDBPyConnection,
+    store: CacheStore,
+    filters: Filters,
+    *,
+    text: str,
+    template: int | None = None,
+    request_id: str | None = None,
+    page: int = 0,
+    size: int = PAGE_SIZE,
+    budget_s: float = SEARCH_BUDGET_S,
+) -> tuple[list[dict[str, Any]], bool, str | None]:
+    """Text search over hour partitions in time order, stopping early on a time budget.
+
+    A substring scan of ``payload`` over all hours takes seconds, so the hours are scanned
+    one at a time until the page is full or ``budget_s`` has passed. Returns the rows, whether
+    another page follows, and the last hour scanned when the search was cut short (else None).
+    """
+    hours = hour_values(parse_time(filters.start), parse_time(filters.end)) or [
+        f"{h:02d}" for h in range(24)
+    ]
+    skip, wanted = page * size, page * size + size + 1
+    assignments = str(store.path("templates", "assignments.parquet"))
+    deadline = time.monotonic() + budget_s
+    found: list[tuple[Any, ...]] = []
+    cut: str | None = None
+    for index, hour in enumerate(hours):
+        if index and time.monotonic() > deadline:
+            cut = hours[index - 1]
+            break
+        sql, params = build_query(
+            filters,
+            assignments=assignments,
+            template=template,
+            request_id=request_id,
+            text=text,
+            hour=hour,
+            limit=wanted - len(found),
+        )
+        found.extend(con.execute(sql, params).fetchall())
+        if len(found) >= wanted:
+            break
+    records = [dict(zip(COLUMNS, row, strict=True)) for row in found[skip : skip + size]]
+    return records, len(found) > skip + size, cut
 
 
 def next_page(trigger: str | None, page: int, has_more: bool = True) -> int:
@@ -263,21 +317,35 @@ class Explorer:
             effective = merge_link(from_dict(filters), link)
             tid = parse_template(template) if template else None
 
+            cut: list[str | None] = [None]
+
             def load(index: int) -> tuple[list[dict[str, Any]], bool]:
+                if text:
+                    rows, more, cut[0] = search_page(
+                        connection(),
+                        store,
+                        effective,
+                        text=text,
+                        template=tid,
+                        request_id=request_id,
+                        page=index,
+                    )
+                    return rows, more
                 return fetch_page(
                     connection(),
                     store,
                     effective,
                     template=tid,
                     request_id=request_id,
-                    text=text,
                     page=index,
                 )
 
             rows, more = load(page_index)
-            while not rows and page_index > 0:  # paged past the end
+            while not rows and page_index > 0 and cut[0] is None:  # paged past the end
                 page_index -= 1
                 rows, more = load(page_index)
             first = page_index * PAGE_SIZE + 1
             label = f"rows {first}-{first + len(rows) - 1}" if rows else "no matching rows"
+            if cut[0] is not None:
+                label += f" (searched through hour {cut[0]} UTC; narrow the time range for more)"
             return rows, page_index, label, page_index == 0, not more
