@@ -333,10 +333,16 @@ Status: **Phase 1 done** (steps 1 to 9).
   median score 0.50, the default top 100 holds 97 host and 3 service rows. The stage takes 0.2 s
   and the page answers in at most 61 ms (cold or warm) on the real cache. The test of
   injected anomalies checks type and rank (the PCA spike and the novel template, bounded to ten
-  minutes after its first line, are in the top 10 and 15); the volume, novel and sequence cases are
-  strict expected failures until issues 4, 7 and 8 register detectors (they fail when one does,
+  minutes after its first line, are in the top 10 and 15); the novel and sequence cases are
+  strict expected failures until issues 7 and 8 register detectors (they fail when one does,
   so the mark must go), contextual and severity wait for synthetic injections (issues 5 and 9).
   A stub detector of a new type on a new kind is tested end to end.
+- Volume detector (issue 4) done: `detectors/volume.py` reuses `find_bursts` and `find_gaps` of
+  `analyses/temporal.py` on `rate_60` (spikes per service and host) and `host_60` (gaps per
+  host); one row per episode (`window_s` is its length). Raw score is the peak robust z-score
+  (threshold `burst_k`, via `threshold_for`); a gap scores `burst_k * minutes / gap_minutes`. The
+  synthetic volume spike and silent-host gap are in the top 20. Real data: 426 episodes (156
+  service, 270 host spikes, no gaps), 0.2 s; the whole anomalies stage 0.5 s.
 
 ## 9. Open decisions
 
