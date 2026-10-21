@@ -85,6 +85,8 @@ SERVICES = [
 ]
 
 NOVEL_TEMPLATE = "Unexpected bgp session reset for peer {ip} after {n} seconds"
+# Two lines in the middle of the run (not novel: it is far from the end), on one host.
+RARE_TEMPLATE = "Watchdog rebooted chassis blade {n} following thermal trip"
 REQUEST_STEPS = [
     "Received request for instance {uuid}",
     "Validating quota for tenant {hex}",
@@ -126,6 +128,8 @@ class GroundTruth:
     gap_end: datetime
     novel_template: str
     novel_first_seen: datetime
+    rare_template: str = RARE_TEMPLATE
+    rare_first_seen: datetime = START
     request_ids: list[str] = field(default_factory=list)
     out_of_order_request_ids: list[str] = field(default_factory=list)
     n_rows: int = 0
@@ -235,6 +239,13 @@ def generate_rows(spec: SyntheticSpec) -> tuple[list[dict], GroundTruth]:
         ts = first if i == 0 else _random_time(rng, first, end)
         rows.append(_row(ts, rng, HOSTS[4], SERVICES[2], _fill(rng, NOVEL_TEMPLATE)))
     truth.novel_first_seen = first
+
+    # A separate generator keeps the rest of the data as it was.
+    rare = random.Random(spec.seed + 2000)
+    truth.rare_first_seen = START + (end - START) * 0.40
+    for i in range(2):
+        ts = truth.rare_first_seen + timedelta(seconds=10 * i)
+        rows.append(_row(ts, rare, HOSTS[3], SERVICES[3], _fill(rare, RARE_TEMPLATE)))
 
     request_service = ("nova-api", "openstack.nova", "nova.api.openstack", [])
     for r in range(spec.n_requests):

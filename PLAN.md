@@ -202,7 +202,7 @@ Each detector implements a common `Detector` interface returning
 | Volume spike/drop | Rolling robust z-score per service/host |
 | Contextual | Host deviating from its peer cluster |
 | Structural | PCA residual (SPE), Isolation Forest |
-| Novel/rare template | First-seen and frequency thresholds |
+| Novel/rare template | First-seen (late first line, scored in bits) and frequency (count at most the rare threshold) |
 | Sequence | Markov transition log-likelihood per `request_id` |
 | Severity burst | WARNING/ERROR rate change |
 
@@ -333,7 +333,7 @@ Status: **Phase 1 done** (steps 1 to 9).
   and the page answers in at most 61 ms (cold or warm) on the real cache. The test of
   injected anomalies checks type and rank (the PCA spike and the novel template, bounded to ten
   minutes after its first line, are in the top 10 and 15); the novel and sequence cases are
-  strict expected failures until issues 7 and 8 register detectors (they fail when one does,
+  strict expected failures until issue 8 registers its detector (they fail when one does,
   so the mark must go), severity waits for a synthetic injection (issue 9).
   A stub detector of a new type on a new kind is tested end to end.
 - Volume detector (issue 4) done: `detectors/volume.py` uses `find_bursts`, `find_drops` and
@@ -385,6 +385,21 @@ Status: **Phase 1 done** (steps 1 to 9).
   injected service spike and the novel template on its own (the host spike is a volume anomaly, found by the
   forest only), negative cases on hand-made data (iid noise within the 0.5 % budget, constant entity,
   short entity, fleet-wide minute, episode merge) and the ranking. Slow benchmark: every callback under 300 ms.
+- Novel and rare template detectors (issue 7) done: `detectors/novel.py`, type `novel`, kind `service`
+  (the busiest service of the template's first minute, or of each window), reading `templates.parquet`
+  and `template_counts.parquet`. `novel_template`: one row per template first seen in the last
+  `novel_fraction` of the span (the templates page's rule), raw `-b * log2(1 - u)` bits with `b` the
+  template's active minutes and `u` its first line's position in the span (the chance a steady template
+  starts that late is `(1 - u) ** b`); threshold `log2(1 / novel_fraction)` is the gate for `b = 1`;
+  evidence has the text, `p` and how many other templates appeared within 10 minutes (an operator episode
+  reads as one story). `rare_template`: one row per (template, minute, service) of a template with at most
+  `rare_threshold` events, raw `(rare_threshold + 0.5) / count`, threshold 1, the first window of a novel
+  template left out. The synthetic data gained a two-line rare template (`RARE_TEMPLATE`, mid-run, from its
+  own generator so the rest of the data is unchanged); the novel (rank under 10) and rare (under 15) cases
+  replace the strict xfail. Hand-made tables test the boundaries, the burst-versus-spread score, settings
+  overrides, empty input and a template without counts. Real data: 15 novel templates (13 in 22:03 to
+  22:10, one operator episode, two at 23:54) and 166 rare windows, 0.03 s together; the combined top 100
+  by `overall` holds 9 novel and 9 rare rows (28 PCA, 28 forest, 18 volume, 9 contextual).
 - Module 7 (hosts and services, issue 10) done: `analyses/hosts.py` from `templates/template_counts_host.parquet`
   and one aggregate over `events` (service x host lines). A host's profile is its template mix over the whole
   span, compared as `sqrt(share)` (Hellinger). Display clusters: k-means (fixed seed) chooses k in 2..10 by

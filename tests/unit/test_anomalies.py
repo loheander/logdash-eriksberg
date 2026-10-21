@@ -22,6 +22,7 @@ from logdash.analyses.templates import Templates
 from logdash.analyses.temporal import Temporal
 from logdash.app.filters import Filters
 from logdash.cache.store import CacheStore
+from logdash.config import Settings
 from logdash.detectors import _episodes as episodes
 from logdash.detectors import base
 from logdash.detectors import structural_iforest as iforest
@@ -614,9 +615,22 @@ def test_built_table_and_manifest(stage):
         and pca_rows["evidence"].str.contains("SPE").all()
     )
     # the shared data has no busy host, so the contextual detector runs but finds nothing
-    assert set(rows["detector"]) == {"structural_pca", "structural_iforest", "volume"}
+    assert set(rows["detector"]) == {
+        "structural_pca",
+        "structural_iforest",
+        "volume",
+        "novel_template",
+        "rare_template",
+    }
     meta = {d["key"]: d for d in stage.read_json("anomalies", "meta.json")["detectors"]}
-    assert set(meta) == {"structural_pca", "structural_iforest", "volume", "contextual"}
+    assert set(meta) == {
+        "structural_pca",
+        "structural_iforest",
+        "volume",
+        "contextual",
+        "novel_template",
+        "rare_template",
+    }
     for key, entry in meta.items():
         assert entry["rows"] == rows.filter(pl.col("detector") == key).height
         assert entry["above_threshold"] >= entry["rows"]
@@ -631,6 +645,7 @@ def test_built_table_and_manifest(stage):
 Rank = int | None  # position among the type's rows of the best matching row, None if none matches
 Found = Callable[[GroundTruth, pl.DataFrame], Rank]
 MINUTE = timedelta(minutes=1)
+SECOND = timedelta(seconds=1)
 
 
 def first_match(rows: pl.DataFrame, match: pl.Expr) -> Rank:
@@ -683,7 +698,22 @@ def context_host_window(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
 
 
 def novel_first_seen(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
-    return first_match(rows, during(truth.novel_first_seen, truth.novel_first_seen))
+    """The novel template's own row: haproxy at its first minute."""
+    return first_match(
+        rows,
+        during(truth.novel_first_seen, truth.novel_first_seen)
+        & (pl.col("entity") == "haproxy")
+        & pl.col("evidence").str.contains("novel template"),
+    )
+
+
+def rare_window(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
+    return first_match(
+        rows,
+        during(truth.rare_first_seen, truth.rare_first_seen + 10 * SECOND)
+        & (pl.col("entity") == "libvirt")
+        & pl.col("evidence").str.contains("rare template"),
+    )
 
 
 def out_of_order_requests(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
@@ -702,9 +732,8 @@ INJECTED = [
     pytest.param("volume", silent_host_gap, 20, id="silent host gap"),
     pytest.param("structural", spike_service, 10, id="spike seen structurally"),
     pytest.param("structural", novel_template_window, 15, id="novel template seen structurally"),
-    pytest.param(
-        "novel", novel_first_seen, 10, id="novel template", marks=pending("novel", "issue 7")
-    ),
+    pytest.param("novel", novel_first_seen, 10, id="novel template"),
+    pytest.param("novel", rare_window, 15, id="rare template"),
     pytest.param(
         "sequence",
         out_of_order_requests,
@@ -744,6 +773,20 @@ def test_each_structural_detector_finds_the_injections(stage, synthetic, key, fo
     rank = found(synthetic.truth, rows)
     assert rank is not None, f"not found among {rows.height} {key} rows"
     assert rank < max_rank, f"found at rank {rank}, expected within the top {max_rank}"
+
+
+def test_novel_and_rare_rows_do_not_overlap(stage, synthetic):
+    truth = synthetic.truth
+    rows = an.load_anomalies(stage).filter(pl.col("type") == "novel")
+    novel = rows.filter(pl.col("detector") == "novel_template")
+    rare = rows.filter(pl.col("detector") == "rare_template")
+    assert novel["template_id"].is_not_null().all() and rare["template_id"].is_not_null().all()
+    assert novel["evidence"].str.contains(truth.novel_template[:20].replace("{", "")).any()
+    assert not rare["evidence"].str.contains("bgp").any()  # 20 events: not rare
+    assert not novel["evidence"].str.contains("Watchdog").any()  # mid-run: not novel
+    cutoff = truth.end - (truth.end - truth.start) * Settings().novel_fraction
+    assert (novel["bin"] > ft.floor_window(naive(cutoff), 60)).all()
+    assert rare["raw"].min() >= 1.0
 
 
 def test_every_registered_type_has_an_expectation():
