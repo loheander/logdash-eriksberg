@@ -119,7 +119,6 @@ VIEWS = ("full", "collapsed")
 DEFAULT_VIEW = "full"
 MODES = ("count", "share")
 DEFAULT_MODE = "count"
-ROW_PX = 15  # height of one host in the tall plots
 OUTLIER_ROWS = 25
 LABELED_OUTLIERS = 6
 LABEL_SIDES = ("top center", "bottom center", "middle right", "middle left")
@@ -931,12 +930,9 @@ def dendrogram_figure(profile: Profile, view: str, scheme: str | None) -> tuple[
         (f"{cuts} clusters at the dashed cut; " if cut is not None else "")
         + (f"{len(nodes)} leaves" if collapsed else f"{n} hosts"),
     )
-    return figures.style(fig, scheme, height=pixel_height(len(nodes))), pixel_height(len(nodes))
-
-
-def pixel_height(rows: int) -> int:
-    """Height for a plot with one labelled row per item (at least 320 px)."""
-    return max(320, ROW_PX * rows + 110)
+    return figures.style(fig, scheme, height=ui.pixel_height(len(nodes))), ui.pixel_height(
+        len(nodes)
+    )
 
 
 def matrix_data(profile: Profile, filters: Filters) -> tuple[list[str], list[str], np.ndarray]:
@@ -991,7 +987,7 @@ def matrix_figure(
     fig.update_yaxes(autorange="reversed", type="category", tickfont={"size": 10})
     fig.update_xaxes(type="category", tickangle=-45, tickfont={"size": 10}, side="top")
     figures.add_note(fig, f"{len(hosts)} hosts in dendrogram order x {len(services)} services")
-    return figures.style(fig, scheme, height=pixel_height(len(hosts)) + 80), pixel_height(
+    return figures.style(fig, scheme, height=ui.pixel_height(len(hosts)) + 80), ui.pixel_height(
         len(hosts)
     ) + 80
 
@@ -1173,11 +1169,6 @@ def draw_hosts(
     )
 
 
-def tall(graph_id: str) -> Component:
-    """A tall plot inside a scrolling area (its height is set by the callback)."""
-    return dmc.ScrollArea(ui.graph(graph_id, 320), h=720, type="auto")
-
-
 @register
 class Hosts:
     key = KEY
@@ -1219,8 +1210,10 @@ class Hosts:
             ),
             ui.card("Clusters", dmc.Box(id="hosts-clusters")),
             ui.card("Outlier hosts (no peers close by)", dmc.Box(id="hosts-table")),
-            ui.card("Dendrogram (Ward linkage on the template mix)", tall("hosts-tree")),
-            ui.card("Service x host matrix (hosts in dendrogram order)", tall("hosts-matrix")),
+            ui.card("Dendrogram (Ward linkage on the template mix)", ui.tall_graph("hosts-tree")),
+            ui.card(
+                "Service x host matrix (hosts in dendrogram order)", ui.tall_graph("hosts-matrix")
+            ),
             dmc.Text(id="hosts-hint", size="sm", c="dimmed"),
             description=(
                 "A host's profile is its template mix over the whole span, compared as the "

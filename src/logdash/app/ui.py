@@ -47,6 +47,20 @@ def graph(graph_id: str, height: int = 360) -> Component:
     )
 
 
+ROW_PX = 15  # height of one labelled row in the tall plots
+TALL_PX = 720  # height of the scrolling area holding a tall plot
+
+
+def pixel_height(rows: int) -> int:
+    """Height for a plot with one labelled row per item (at least 320 px)."""
+    return max(320, ROW_PX * rows + 110)
+
+
+def tall_graph(graph_id: str) -> Component:
+    """A tall plot inside a scrolling area (its height is set by the callback)."""
+    return dmc.ScrollArea(graph(graph_id, 320), h=TALL_PX, type="auto")
+
+
 def scale_toggle(toggle_id: str) -> Component:
     """Linear/log switch; the value is ``"linear"`` or ``"log"``."""
     return dmc.SegmentedControl(

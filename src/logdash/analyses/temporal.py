@@ -503,14 +503,27 @@ def _bin_label(seconds: int) -> str:
     return f"{seconds // 60} min" if seconds >= 60 else f"{seconds} s"
 
 
-HEAT_MAX_HEIGHT = 720
 REL_CLIP = 3.0
+COLORBAR: dict[str, Any] = {"lenmode": "pixels", "len": 320, "yanchor": "top", "y": 1}
 REL_TICKS = ("×1/8", "×1/4", "×1/2", "×1", "×2", "×4", "×8")
 
 
 def heatmap_height(n_hosts: int) -> int:
-    """Pixel height: one row per host up to ``HEAT_MAX_HEIGHT``; labels thin out beyond that."""
-    return min(HEAT_MAX_HEIGHT, max(320, 14 * n_hosts + 120))
+    """Pixel height: one labelled row per host (the page scrolls inside a fixed area)."""
+    return ui.pixel_height(n_hosts) + 40
+
+
+def host_order(store: CacheStore) -> list[str] | None:
+    """Hosts in dendrogram order from the ``hosts`` stage, or ``None`` if it is not built."""
+    if not store.exists("hosts", "hosts.parquet"):
+        return None
+    return store.read_parquet("hosts", "hosts.parquet").sort("leaf")["host"].to_list()
+
+
+def ordered_hosts(hosts: list[str], order: list[str] | None) -> list[str]:
+    """``hosts`` by position in ``order``; hosts not in it go last, alphabetically."""
+    rank = {h: i for i, h in enumerate(order or ())}
+    return sorted(hosts, key=lambda h: (rank.get(h, len(rank)), h))
 
 
 def relative_ratio(z: np.ndarray) -> np.ndarray:
@@ -530,24 +543,26 @@ def relative_scale(z: np.ndarray, clip: float = REL_CLIP) -> np.ndarray:
 
 
 def heatmap_figure(
-    df: pl.DataFrame, bin_s: int, scheme: str | None, scale: str = "relative"
+    df: pl.DataFrame,
+    bin_s: int,
+    scheme: str | None,
+    scale: str = "relative",
+    order: list[str] | None = None,
 ) -> go.Figure:
     """Host x time heatmap from a ``(bin, host, n)`` frame.
 
     ``relative``: log2 of the ratio to each host's median, diverging around 0.
-    ``absolute``: log1p of the counts.
+    ``absolute``: log1p of the counts. One labelled row per host, in ``order`` (alphabetical
+    without it, hosts missing from it last).
     """
     if df.is_empty():
         return figures.empty_figure("no events in the visible range", scheme)
-    hosts = sorted(df["host"].unique().to_list())
+    parts = {key[0]: sub for key, sub in df.partition_by("host", as_dict=True).items()}
+    hosts = ordered_hosts(list(parts), order)
     t0, t1 = span(df["bin"])
     length = int((t1 - t0).total_seconds() // bin_s) + 1
     z = np.vstack(
-        [
-            dense_series(sub["bin"], sub["n"], t0, bin_s, length)
-            for host in hosts
-            for sub in [df.filter(pl.col("host") == host)]
-        ]
+        [dense_series(parts[host]["bin"], parts[host]["n"], t0, bin_s, length) for host in hosts]
     )
     x = [t0 + timedelta(seconds=bin_s * i) for i in range(length)]
     relative = scale != "absolute"
@@ -559,13 +574,18 @@ def heatmap_figure(
             "zmid": 0,
             "colorscale": "RdBu_r",
             "colorbar": {
+                **COLORBAR,
                 "title": "vs host median",
                 "tickvals": list(range(-3, 4)),
                 "ticktext": list(REL_TICKS),
             },
         }
         if relative
-        else {"z": np.log1p(z), "colorscale": "Viridis", "colorbar": {"title": "log(1+n)"}}
+        else {
+            "z": np.log1p(z),
+            "colorscale": "Viridis",
+            "colorbar": {**COLORBAR, "title": "log(1+n)"},
+        }
     )
     fig = go.Figure(
         go.Heatmap(
@@ -579,6 +599,15 @@ def heatmap_figure(
             **scaling,
         )
     )
+    fig.update_yaxes(
+        autorange="reversed",
+        type="category",
+        tickmode="array",
+        tickvals=hosts,
+        ticktext=[figures.shorten_middle(h, 30) for h in hosts],
+        tickfont={"size": 10},
+    )
+    fig.update_xaxes(side="top")
     return figures.style(fig, scheme, height=heatmap_height(len(hosts)))
 
 
@@ -710,7 +739,6 @@ class Temporal:
     def layout(self, store: CacheStore, **_query: Any) -> Component:
         peaks = store.read_parquet(KEY, "peaks.parquet")
         services = [s for s in peaks["service"].unique().sort().to_list() if s != ALL]
-        meta = store.read_json(KEY, "meta.json")
         return ui.page(
             "Temporal analysis",
             dmc.Group(
@@ -749,7 +777,7 @@ class Temporal:
                     ],
                     mb="xs",
                 ),
-                ui.graph("temporal-heatmap", heatmap_height(len(meta["hosts"]))),
+                ui.tall_graph("temporal-heatmap"),
             ),
             ui.card(
                 "Periodicity",
@@ -801,6 +829,7 @@ class Temporal:
 
         @app.callback(
             Output("temporal-heatmap", "figure"),
+            Output("temporal-heatmap", "style"),
             Input(FILTER_STORE_ID, "data"),
             Input("temporal-hbin", "value"),
             Input("temporal-hscale", "value"),
@@ -811,10 +840,11 @@ class Temporal:
             hbin: str | None,
             hscale: str | None,
             theme: str | None,
-        ) -> go.Figure:
-            return self.heatmap(
+        ) -> tuple[go.Figure, dict[str, Any]]:
+            fig = self.heatmap(
                 store, from_dict(filters), int(hbin or 300), theme, hscale or "relative"
             )
+            return fig, {"height": fig.layout.height or ui.pixel_height(0)}
 
         @app.callback(
             Output("temporal-acf", "figure"),
@@ -858,7 +888,9 @@ class Temporal:
             bin_s = 300
         name = f"host_{bin_s}.parquet"
         df = lazy_table(store, name).filter((pl.col("bin") >= lo) & (pl.col("bin") < hi)).collect()
-        return heatmap_figure(filter_frame(df, filters, host="host"), bin_s, theme, scale)
+        return heatmap_figure(
+            filter_frame(df, filters, host="host"), bin_s, theme, scale, host_order(store)
+        )
 
     @staticmethod
     def brushed(
