@@ -15,12 +15,14 @@ file nor the page: the type filter, the timeline and the table follow the data.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
 
 import dash_mantine_components as dmc
+import numpy as np
 import plotly.graph_objects as go
 import polars as pl
 from dash import Dash, Input, Output
@@ -69,6 +71,25 @@ load_builtin()  # import the detector modules so that they register
 # --------------------------------------------------------------------------- compute
 
 
+def json_safe(value: Any) -> Any:
+    """``value`` with numpy scalars and arrays as Python values and NaN or infinity as None.
+
+    Detector meta goes into ``meta.json`` outside the per-detector ``try``, so whatever a
+    detector puts there must not be able to fail the write.
+    """
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set | frozenset | np.ndarray):
+        return [
+            json_safe(v) for v in (sorted(value) if isinstance(value, set | frozenset) else value)
+        ]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value if value is None or isinstance(value, str | int | bool) else str(value)
+
+
 def run_detectors(
     registry: DetectorRegistry, ctx: DetectContext
 ) -> tuple[pl.DataFrame, list[dict[str, Any]]]:
@@ -108,7 +129,7 @@ def run_detectors(
             "seconds": round(seconds, 3),
         }
         if own.meta:
-            entry["info"] = own.meta
+            entry["info"] = json_safe(own.meta)
         info.append(entry)
     combined = pl.concat(parts).sort(["score", "bin"], descending=[True, False])
     return combined, info

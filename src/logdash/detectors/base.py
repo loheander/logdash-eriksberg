@@ -96,7 +96,8 @@ def declare_kind(
 class DetectContext:
     """What ``Detector.detect`` gets: the cache (read the upstream stages through it).
 
-    ``meta`` is the detector's to fill (JSON values): the stage stores it as ``info`` in the
+    ``meta`` is the detector's to fill (JSON values; numpy values are converted and NaN becomes
+    null by ``analyses.anomalies.json_safe``): the stage stores it as ``info`` in the
     detector's ``meta.json`` entry, and the page shows ``info["note"]`` (text) if there is one.
     Use it for what the rows alone do not tell, such as how many entities could not be scored.
     """

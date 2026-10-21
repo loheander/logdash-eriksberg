@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -335,6 +336,54 @@ class Malformed(Broken):
         return pl.DataFrame({"bin": [datetime(2023, 5, 21)]})
 
 
+class WithMeta(Fake):
+    """Fills the meta with what ``json.dumps`` cannot take: numpy values and NaN."""
+
+    def detect(self, ctx):
+        ctx.meta.update(
+            {
+                "count": np.int64(3),
+                "ratio": np.float32(0.5),
+                "missing": float("nan"),
+                "names": {"b", "a"},
+                "nested": {"values": np.array([1, 2]), "flag": np.bool_(True), "inf": math.inf},
+                "note": "text",
+            }
+        )
+        return super().detect(ctx)
+
+
+class BrokenWithMeta(Broken):
+    key = "broken_meta"
+
+    def detect(self, ctx):
+        ctx.meta["seen"] = np.int64(7)
+        raise ValueError("boom")
+
+
+def test_detector_meta_is_stored_as_json_safe_info(stage):
+    registry = DetectorRegistry()
+    for detector in (WithMeta("meta"), BrokenWithMeta(), Fake("plain")):
+        registry.add(detector)
+    ctx = DetectContext(stage, stage.settings, lambda _: None)
+    _, info = an.run_detectors(registry, ctx)
+    by_key = {entry["key"]: entry for entry in info}
+    json.dumps(info, allow_nan=False)  # numpy values and NaN cannot fail the write
+    assert by_key["meta"]["info"] == {
+        "count": 3,
+        "ratio": 0.5,
+        "missing": None,
+        "names": ["a", "b"],
+        "nested": {"values": [1, 2], "flag": True, "inf": None},
+        "note": "text",
+    }
+    assert by_key["broken_meta"]["info"] == {"seen": 7} and "error" in by_key["broken_meta"]
+    assert "info" not in by_key["plain"]  # nothing to say: no key
+    assert ctx.meta == {}  # each detector gets a fresh dict
+    text = an.kept_text(info)
+    assert " text." in text  # the page shows the note of the detectors that have one
+
+
 def test_a_failing_detector_is_skipped_and_reported(built, tmp_path):
     registry = DetectorRegistry()
     for detector in (Broken(), Fake("one"), Malformed()):
@@ -380,8 +429,10 @@ def test_built_table_and_manifest(stage):
         set(pca_rows["kind"]) == {"service", "host"}
         and pca_rows["evidence"].str.contains("SPE").all()
     )
-    assert set(rows["detector"]) == {"structural_pca", "volume", "contextual"}
+    # the shared data has no busy host, so the contextual detector runs but finds nothing
+    assert set(rows["detector"]) == {"structural_pca", "volume"}
     meta = {d["key"]: d for d in stage.read_json("anomalies", "meta.json")["detectors"]}
+    assert set(meta) == {"structural_pca", "volume", "contextual"}
     for key, entry in meta.items():
         assert entry["rows"] == rows.filter(pl.col("detector") == key).height
         assert entry["above_threshold"] >= entry["rows"]
@@ -465,10 +516,8 @@ def pending(kind: str, issue: str) -> list[Any]:
 INJECTED = [
     pytest.param("volume", spike_host, 20, id="volume spike"),
     pytest.param("volume", silent_host_gap, 20, id="silent host gap"),
-    pytest.param("contextual", context_host_window, 20, id="host mix against its peers"),
     pytest.param("structural", spike_service, 10, id="spike seen structurally"),
-    # the contextual injection (a busy host that changes its mix) adds structural rows of its own
-    pytest.param("structural", novel_template_window, 25, id="novel template seen structurally"),
+    pytest.param("structural", novel_template_window, 15, id="novel template seen structurally"),
     pytest.param(
         "novel", novel_first_seen, 10, id="novel template", marks=pending("novel", "issue 7")
     ),
@@ -480,6 +529,9 @@ INJECTED = [
         marks=pending("sequence", "issue 8"),
     ),
 ]
+# Types whose injection changes the structural fits of the shared data (a busy host), so their
+# case lives in tests/unit/test_contextual.py on a dataset of its own.
+OWN_DATASET = {"contextual"}
 NO_INJECTION = {"severity"}  # the synthetic data has none yet (issue 9)
 
 
@@ -493,7 +545,7 @@ def test_injected_anomaly_is_found_with_its_type_and_rank(stage, synthetic, kind
 
 
 def test_every_registered_type_has_an_expectation():
-    expected = {case.values[0] for case in INJECTED} | NO_INJECTION
+    expected = {case.values[0] for case in INJECTED} | OWN_DATASET | NO_INJECTION
     assert set(DETECTORS.types()) <= expected
 
 

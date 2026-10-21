@@ -93,7 +93,7 @@ REQUEST_STEPS = [
 ]
 REQUEST_HOST = HOSTS[1]
 CONTEXT_HOST = HOSTS[5]
-CONTEXT_TEMPLATE = 0  # in the window the host logs only this template of each service
+CONTEXT_TEMPLATE = 0  # in the window the host logs only this template (of the first service)
 
 
 @dataclass(frozen=True)
@@ -105,8 +105,11 @@ class SyntheticSpec:
     spike_rows: int = 2_500
     n_requests: int = 150
     n_out_of_order: int = 5
-    context_minutes: int = 6  # host-specific template-mix deviation
-    context_busy_rows: int = 12_000  # extra lines of that host: busy enough for 1-minute windows
+    # Host-specific template-mix deviation (0: none). It needs a busy host (extra rows, enough
+    # lines for 1-minute windows) and shifts the structural fits of the shared data, so only the
+    # contextual tests ask for it (``tests/unit/test_contextual.py``, a dataset of their own).
+    context_minutes: int = 0
+    context_busy_rows: int = 0
 
 
 @dataclass
@@ -207,9 +210,9 @@ def generate_rows(spec: SyntheticSpec) -> tuple[list[dict], GroundTruth]:
 
     # A host-specific template-mix deviation. One host is busier than the rest (more lines in
     # the fleet's mix: a 1-minute window needs enough lines to be scored), and for a few minutes
-    # it logs the first template of every service (each service keeps its line count, so service
-    # volumes and the services' own template mix hardly change). A separate generator keeps
-    # the rest of the data as it was.
+    # every one of its lines is the same message (a stuck loop: far from any normal mix, so the
+    # window's distance to the peers is many times its usual noise); each service keeps its line
+    # count, so volumes do not change. A separate generator keeps the rest of the data as it was.
     other = random.Random(spec.seed + 1000)
     for _ in range(spec.context_busy_rows):
         ts = _random_time(other, START, end)
@@ -218,7 +221,7 @@ def generate_rows(spec: SyntheticSpec) -> tuple[list[dict], GroundTruth]:
         if context_start <= ts < context_end:
             shifted.append((len(rows) - 1, ts, service))
     for i, ts, service in shifted:
-        payload = service[3][CONTEXT_TEMPLATE]
+        payload = SERVICES[0][3][CONTEXT_TEMPLATE]
         rows[i] = _row(ts, other, CONTEXT_HOST, service, _fill(other, payload))
 
     spike_service = SERVICES[0]

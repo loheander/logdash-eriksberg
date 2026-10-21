@@ -42,7 +42,7 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
 | pca | 12 fits (group x window x scaling); about 4 s for a synthetic 230k-window x 281-template matrix at 3 % density (not yet measured on the real data) |
 | hosts | 3 s on the real data (162 hosts, 281 templates, 559 service x host pairs; one aggregate over `events` for the matrix) |
-| anomalies | 1.3 s (three detectors: PCA residual, 73,421 windows above the limit, 11,446 kept: at most 100 per service or host; volume, 87 episodes; contextual, 4,774 windows above the threshold, 3,533 kept) |
+| anomalies | 1.3 s (three detectors: PCA residual, 73,421 windows above the limit, 11,446 kept: at most 100 per service or host; volume, 87 episodes; contextual, 496 windows above the threshold, 456 kept) |
 | total | 1 min 58 s (measured before the features, pca and anomalies stages existed) |
 
 `cache/` is 622 MB (281 templates from 73,583 unique masked lines).
@@ -187,14 +187,24 @@ Isolation Forest next to it.
 
 `contextual.py` is the contextual type: a host's 1-minute template mix against its peers
 (`analyses/hosts`: the host's nearest hosts within the Hellinger radius, not its k-means cluster). A window's
-distance to the host's peer centroid (`centroid_distance`) becomes a robust z-score against the host's own
-baseline (`load_baseline`: median and MAD of that distance), threshold 8. Window noise depends on the line count:
-windows of fewer than `max(20, half the host's median lines)` lines are not scored and the scale of a window
-below the host's median grows by `sqrt(median / lines)`. The 23 hosts without a valid peer group are not scored;
-the count (and the number of windows scored) is in the detector's `meta.json` entry (`info.unscored_hosts`) and
-in the page's hint line. Evidence: the three templates that contribute most to the squared distance, with their
-share of the window and of the peers. Real data: 4,774 of 199,882 scored windows above the threshold, 3,533 kept
-(139 hosts), 0.6 s.
+distance to the host's peer centroid (`centroid_distance`) is compared with what that host's windows of the same
+line count usually have: a per-host fit `expected(n) = a + b / sqrt(n)` (the multinomial noise of a small window
+falls with `1 / sqrt(n)`), a scale from the MAD of the residuals that widens by `sqrt(median lines / n)` for
+sparse windows, and `u = (distance - expected) / scale`. The centroid is a whole-day mean, so the host is also
+compared with its peers in the same minute: `z = u - median(u of its peers in that minute)` (the fleet's median
+when fewer than 3 peers have a window), which leaves out events that hit many hosts at once (they are for the
+structural and volume detectors). The raw score is `z`; the threshold 8 is about the 99th percentile of `z` on the
+real data (8.4; the 99.9th is 17, both in the detector's meta), and a window is kept only if the template that
+contributes most to its distance has at least 3 lines (one or two stray lines of a rare template are noise).
+Windows of fewer than `max(30, half the host's median lines)` lines are not scored; on the real data every window
+has at least 46 lines, so that rule and the widening only matter for sparse hosts. The 23 hosts without a valid
+peer group are not scored, and these are the hosts most likely to be odd: their number is in the page's hint line
+and their names are in the detector's `meta.json` entry (`info.unscored_names`, with `unscored_hosts`, the number
+of windows scored and the `z` quantiles). Evidence: the three templates that contribute most to the squared
+distance (ties by line count), with their share of the distance, their lines, their share of the window and the
+peers' profile (the peer centroid squared, at most the peers' mean share, so shown as a profile). Real data: 2,299
+of 199,882 scored windows have `z >= 8`, 496 pass the evidence rule, 456 are kept (41 hosts), 0.9 s; 11 of the 496
+fall in minutes where 5 or more hosts are flagged (2,900 of 4,774 against the whole-day centroid).
 
 `volume.py` is the volume spike/drop type. It uses `find_bursts`, `find_drops` and `find_gaps` of
 `analyses/temporal.py` on the 1-minute rate tables. A row is an episode (`bin` its first minute,
