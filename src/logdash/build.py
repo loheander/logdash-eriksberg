@@ -36,15 +36,18 @@ def compute_fingerprints(
 ) -> dict[str, str]:
     """Fingerprint of ``events`` and of every registered analysis."""
     data_fp = data_fingerprint(settings.data_files(), strict=strict)
-    params = settings.fingerprint_params()
     prints = {
         EVENTS_KEY: stage_fingerprint(
-            version=EVENTS_VERSION, data_fp=data_fp, params=params, upstream={}
+            version=EVENTS_VERSION,
+            data_fp=data_fp,
+            params=settings.fingerprint_params(),
+            upstream={},
         )
     }
     for analysis in registry.ordered():
         upstream = {EVENTS_KEY: prints[EVENTS_KEY]}
         upstream.update({dep: prints[dep] for dep in analysis.depends_on})
+        params = settings.analysis_params(getattr(analysis, "setting_names", ()))
         prints[analysis.key] = stage_fingerprint(
             version=analysis.version, data_fp=data_fp, params=params, upstream=upstream
         )

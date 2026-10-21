@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
+from urllib.parse import urlencode
 
 import polars as pl
 
@@ -141,3 +142,37 @@ def filter_frame(
         if column and values:
             df = df.filter(pl.col(column).is_in(list(values)))
     return df
+
+
+def parse_time(value: str | None) -> datetime | None:
+    """Parse a filter timestamp (naive UTC); ``None`` for empty or malformed text."""
+    try:
+        return datetime.fromisoformat(value).replace(tzinfo=None) if value else None
+    except ValueError:
+        return None
+
+
+def with_time_range(
+    filters: dict[str, Any] | None, start: datetime | None, end: datetime | None
+) -> dict[str, Any]:
+    """Store dict with the time range replaced; other filters are kept."""
+    current = from_dict(filters)
+    return to_dict(
+        Filters(
+            start=_iso_dt(start),
+            end=_iso_dt(end),
+            levels=current.levels,
+            services=current.services,
+            hosts=current.hosts,
+        )
+    )
+
+
+def _iso_dt(value: datetime | None) -> str | None:
+    return value.replace(microsecond=0).isoformat(sep=" ") if value else None
+
+
+def page_url(path: str, **params: object) -> str:
+    """``path`` with a query string of the non-empty ``params`` (deep link into a page)."""
+    query = urlencode({k: v for k, v in params.items() if v not in (None, "")})
+    return f"{path}?{query}" if query else path

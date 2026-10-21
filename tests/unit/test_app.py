@@ -168,5 +168,5 @@ def test_theme_toggle_and_filter_callbacks(app):
         ("filter-services", "value", []),
         ("filter-hosts", "value", None),
     ]
-    data = post(client, "filters.data", ins)
+    data = post(client, "filters.data", ins, [("filters", "data", None)])
     assert data["levels"] == ["INFO"] and data["end"] == "2023-05-22 00:00:00"

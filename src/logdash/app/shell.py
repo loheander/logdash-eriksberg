@@ -7,12 +7,12 @@ from dataclasses import dataclass
 from typing import Any
 
 import dash_mantine_components as dmc
-from dash import Dash, Input, Output, State, dcc, page_container
+from dash import Dash, Input, Output, State, ctx, dcc, page_container
 from dash.development.base_component import Component
 
 from logdash.analyses.base import Registry
 from logdash.app.figures import DARK, LIGHT, scheme_name
-from logdash.app.filters import FILTER_STORE_ID, build_filters
+from logdash.app.filters import FILTER_STORE_ID, build_filters, parse_time, with_time_range
 
 THEME_STORE_ID = "theme"
 PROVIDER_ID = "mantine-provider"
@@ -125,6 +125,21 @@ def make_layout(registry: Registry, options: FilterOptions) -> Component:
     )
 
 
+def merge_filters(
+    trigger: str | None,
+    current: dict[str, Any] | None,
+    dates: list[str] | None,
+    levels: list[str] | None,
+    services: list[str] | None,
+    hosts: list[str] | None,
+) -> dict[str, Any]:
+    """Filters from the controls; a time range brushed on a chart survives other changes."""
+    built = build_filters(dates, levels, services, hosts)
+    if trigger == "filter-dates" or not current:
+        return built
+    return with_time_range(built, parse_time(current.get("start")), parse_time(current.get("end")))
+
+
 def register_shell_callbacks(app: Dash) -> None:
     @app.callback(
         Output(THEME_STORE_ID, "data"),
@@ -145,11 +160,13 @@ def register_shell_callbacks(app: Dash) -> None:
         Input("filter-levels", "value"),
         Input("filter-services", "value"),
         Input("filter-hosts", "value"),
+        State(FILTER_STORE_ID, "data"),
     )
     def update_filters(
         dates: list[str] | None,
         levels: list[str] | None,
         services: list[str] | None,
         hosts: list[str] | None,
+        current: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        return build_filters(dates, levels, services, hosts)
+        return merge_filters(ctx.triggered_id, current, dates, levels, services, hosts)

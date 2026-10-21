@@ -65,3 +65,21 @@ def table(df: pl.DataFrame, max_rows: int = 200) -> Component:
     return dmc.Table(
         data={"head": head, "body": body}, striped=True, highlightOnHover=True, withTableBorder=True
     )
+
+
+def link_table(
+    df: pl.DataFrame, hrefs: Sequence[str], label: str = "explorer", max_rows: int = 200
+) -> Component:
+    """Static table with a trailing column of links, one per row (``hrefs`` aligns with rows)."""
+    rows = list(df.head(max_rows).iter_rows())
+    head = dmc.TableThead(dmc.TableTr([dmc.TableTh(c) for c in [*df.columns, label]]))
+    body = dmc.TableTbody(
+        [
+            dmc.TableTr(
+                [dmc.TableTd("" if v is None else str(v)) for v in row]
+                + [dmc.TableTd(dmc.Anchor("view", href=href, refresh=False))]
+            )
+            for row, href in zip(rows, hrefs, strict=False)
+        ]
+    )
+    return dmc.Table([head, body], striped=True, highlightOnHover=True, withTableBorder=True)

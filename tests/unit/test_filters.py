@@ -64,3 +64,28 @@ def test_filter_frame():
     assert filter_frame(df, Filters(), level="level").height == 2
     assert filter_frame(df, Filters(services=("a",)), service="svc")["n"].to_list() == [1]
     assert filter_frame(df, Filters(hosts=("z",)), host=None).height == 2
+
+
+def test_time_helpers_and_page_url():
+    from datetime import datetime
+
+    from logdash.app.filters import page_url, parse_time, with_time_range
+
+    assert parse_time("2023-05-21 01:02:03") == datetime(2023, 5, 21, 1, 2, 3)
+    assert parse_time("2023-05-21T01:02:03+02:00") == datetime(2023, 5, 21, 1, 2, 3)
+    assert parse_time("junk") is None and parse_time(None) is None
+    out = with_time_range({"hosts": ["a"]}, datetime(2023, 5, 21, 1), None)
+    assert out["start"] == "2023-05-21 01:00:00" and out["end"] is None and out["hosts"] == ("a",)
+    assert page_url("/x", a="b c", none=None, empty="") == "/x?a=b+c"
+    assert page_url("/x") == "/x"
+
+
+def test_merge_filters_keeps_brushed_time():
+    from logdash.app.shell import merge_filters
+
+    current = {"start": "2023-05-21 01:00:00", "end": "2023-05-21 02:00:00"}
+    kept = merge_filters("filter-levels", current, [], ["INFO"], [], [])
+    assert kept["start"] == "2023-05-21 01:00:00" and kept["levels"] == ("INFO",)
+    cleared = merge_filters("filter-dates", current, [], [], [], [])
+    assert cleared["start"] is None
+    assert merge_filters(None, None, [], [], [], [])["start"] is None
