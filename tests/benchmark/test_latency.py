@@ -296,7 +296,12 @@ def test_hosts_cold(store: CacheStore) -> None:
         over.append(f"hosts.draw cold {cold * 1000:.0f} ms")
 
 
-ANOMALY_CASES = (([], "score"), (["structural"], "time"), ([], "type"), (["structural"], "entity"))
+ANOMALY_CASES = (
+    ([], "overall"),
+    (["structural"], "time"),
+    ([], "type"),
+    (["structural"], "entity"),
+)
 
 
 def test_anomalies(store: CacheStore) -> None:

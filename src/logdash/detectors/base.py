@@ -21,7 +21,7 @@ from logdash.cache.store import CacheStore
 from logdash.config import Settings
 
 # Bump when the score formula, the columns or the caps' meaning change; part of the stage version.
-FRAMEWORK_VERSION = "3"
+FRAMEWORK_VERSION = "4"
 
 Schema = dict[str, pl.DataType | type[pl.DataType]]
 
@@ -51,6 +51,7 @@ ANOMALY_SCHEMA: Schema = {
     "template_id": pl.Int64,
     "raw": pl.Float64,
     "score": pl.Float64,
+    "overall": pl.Float64,
     "evidence": pl.String,
 }
 
@@ -194,6 +195,10 @@ def threshold_of(detector: Detector, settings: Settings) -> float:
     return float(method(settings)) if method is not None else detector.threshold
 
 
+# Reciprocal rank fusion constant (the published default, not tuned): ``overall`` of a row is
+# ``1 / (RANK_K + rank)``, with ``rank`` its position by score within its detector and kind.
+RANK_K = 60
+
 # A row's score blends where it ranks among the detector's rows of its kind with how far above
 # the threshold it is, relative to that kind's strong rows; see ``score_columns``.
 LOG_CAP = 10.0  # octaves above the threshold (a factor of 1024) beyond which raw is clipped
@@ -239,7 +244,11 @@ def finish(
     The score is computed over every row at or above the threshold. Then at most
     ``max_per_entity`` highest-scoring rows are kept per (kind, entity), so that a sustained
     incident on a few entities does not hide an isolated anomaly on a quiet one, and finally the
-    ``max_rows`` highest overall; rows are sorted by score (descending), then time.
+    ``max_rows`` highest overall; rows are sorted by score (descending), then time. ``overall``
+    is the reciprocal rank fusion of the kept rows: ``1 / (RANK_K + rank)`` with ``rank`` (from 1)
+    the row's position by score among the detector's kept rows of its kind. Unlike ``score``
+    (which keeps its meaning within a detector), it does not depend on how many rows a detector
+    has, so it is what ranks rows of different detectors against each other.
     """
     missing = set(REQUIRED) - set(found.columns)
     if missing:
@@ -267,7 +276,10 @@ def finish(
     above = rows.height
     if max_per_entity is not None:
         rows = rows.filter(pl.int_range(pl.len()).over("kind", "entity") < max_per_entity)
-    return Finished(rows.head(max_rows).select(*ANOMALY_SCHEMA), above)
+    rows = rows.head(max_rows).with_columns(
+        (1.0 / (RANK_K + 1 + pl.int_range(pl.len()).over("kind"))).alias("overall")
+    )
+    return Finished(rows.select(*ANOMALY_SCHEMA), above)
 
 
 def empty() -> pl.DataFrame:

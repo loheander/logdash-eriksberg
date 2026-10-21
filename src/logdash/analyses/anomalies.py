@@ -7,6 +7,8 @@ per detector (rows above the threshold, rows kept, rows dropped, or the error of
 failed and was skipped). The score in ``[0, 1]`` blends a row's rank among the detector's rows of
 its kind with its log-scaled excess over the threshold (``detectors.base.score_columns``). At most
 ``MAX_PER_ENTITY`` rows are kept per service or host, then ``MAX_PER_DETECTOR`` per detector.
+``overall = 1 / (60 + rank)`` (reciprocal rank fusion of the rank by score within detector and
+kind) is what the page sorts by, so that no detector with many rows fills the top of the table.
 
 The page reads that table only. The analysis depends on, and is invalidated by, whatever the
 registered detectors depend on and their versions, so a new detector module changes neither this
@@ -56,9 +58,10 @@ MAX_PER_DETECTOR = 20_000
 MAX_POINTS = 3000  # timeline points, shared between the types: the highest scores of each
 TABLE_ROWS = 100
 TEXT_CHARS = 110
-SORTS = {"score": "score", "time": "time", "type": "type", "entity": "entity"}
-DEFAULT_SORT = "score"
+SORTS = {"overall": "overall", "score": "score", "time": "time", "type": "type", "entity": "entity"}
+DEFAULT_SORT = "overall"
 SORT_COLUMNS = {
+    "overall": (["overall", "score", "bin"], [True, True, False]),
     "score": (["score", "bin"], [True, False]),
     "time": (["bin", "score"], [False, True]),
     "type": (["type", "score"], [False, True]),
@@ -226,6 +229,7 @@ def table_rows(rows: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
         {
             "window": [stamp(b) for b in rows["bin"]],
             "type": rows["type"],
+            "overall": rows["overall"].round(4),
             "score": rows["score"].round(3),
             "on": rows["kind"],
             "entity": rows["entity"],
@@ -233,7 +237,8 @@ def table_rows(rows: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
             "evidence": [short(e, TEXT_CHARS) for e in rows["evidence"]],
         },
         schema={
-            "window": pl.String, "type": pl.String, "score": pl.Float64, "on": pl.String,
+            "window": pl.String, "type": pl.String, "overall": pl.Float64, "score": pl.Float64,
+            "on": pl.String,
             "entity": pl.String, "detector": pl.String, "evidence": pl.String,
         },
     )  # fmt: skip
@@ -311,7 +316,7 @@ def draw_anomalies(
             dmc.Text("no anomalies in the selection"),
             hint(filters, 0, sort, load_meta(store)),
         )
-    ordered = rows if sort == DEFAULT_SORT else sort_rows(rows, sort)  # sort the whole selection
+    ordered = rows if sort == "score" else sort_rows(rows, sort)  # sort the whole selection
     table, hrefs = table_rows(ordered.head(TABLE_ROWS))
     shown = ui.link_table(table, hrefs, max_rows=TABLE_ROWS)
     return fig, shown, hint(filters, rows.height, sort, load_meta(store))
@@ -439,9 +444,11 @@ class Anomalies:
             description=(
                 "Every registered detector writes its candidates at build time. The score in "
                 "[0, 1] blends a row's rank among the detector's rows of the same kind with its "
-                "log-scaled excess over the detector's threshold. The time range, service and "
-                "host filters apply (each to its own kind of row); each row links to the raw "
-                "lines of its window in the explorer."
+                "log-scaled excess over the detector's threshold; the default order, overall, "
+                "is the reciprocal rank (1 / (60 + rank by score within detector and kind)), "
+                "which compares detectors by position, not by how many rows each has. The time "
+                "range, service and host filters apply (each to its own kind of row); each row "
+                "links to the raw lines of its window in the explorer."
             ),
         )
 

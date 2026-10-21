@@ -42,7 +42,7 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
 | pca | 12 fits (group x window x scaling); about 4 s for a synthetic 230k-window x 281-template matrix at 3 % density (not yet measured on the real data) |
 | hosts | 3 s on the real data (162 hosts, 281 templates, 559 service x host pairs; one aggregate over `events` for the matrix) |
-| anomalies | 1.3 s (three detectors: PCA residual, 73,421 windows above the limit, 11,446 kept: at most 100 per service or host; volume, 87 episodes; contextual, 496 windows above the threshold, 456 kept) |
+| anomalies | 26 s (four detectors: PCA residual, 1,232 windows above the entity's level, 377 episodes kept; Isolation Forest per entity, 25 s, 1,405 windows flagged, 438 episodes; volume, 87 episodes; contextual, 496 windows above the threshold, 456 kept) |
 | total | 1 min 58 s (measured before the features, pca and anomalies stages existed) |
 
 `cache/` is 622 MB (281 templates from 73,583 unique masked lines).
@@ -57,7 +57,7 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | Templates | Drain3 templates: top, volume over time, parameter distributions, rare and novel lists |
 | Features | window x template count matrix (1, 5, 15 min; per service or host; log1p or TF-IDF): template correlation heatmap, template-entity association, variance ranking, mutual information |
 | PCA | PCA of the window x template matrix (precomputed per grouping, window and scaling): scree plot, 2D and 3D projections coloured by time, service or host, or SPE; loadings per component; residual SPE per window against its control limit, and the windows above it with their top residual templates |
-| Anomalies | every registered detector's anomalies: score timeline coloured by type, per-type filter, table sortable (the whole selection) by score, time, type or entity, "N of M kept" per type, with a link per row to the raw lines of its window in the explorer |
+| Anomalies | every registered detector's anomalies: score timeline coloured by type, per-type filter, table sortable (the whole selection) by overall (default), score, time, type or entity, "N of M kept" per type, with a link per row to the raw lines of its window in the explorer |
 | Hosts | host profiles (template mix per host): silhouette for every candidate k, 2D projection, cluster table, outlier hosts (and the hosts without peers) with the templates that deviate, Ward dendrogram (every host, or collapsed to the clusters) and the service x host matrix in dendrogram order |
 | Explorer | paged grid over raw events with filters, template, request id and text search; other pages link here |
 
@@ -162,7 +162,7 @@ follows the data (type filter, timeline, table, explorer links).
   an error naming the detector and the kind; the declaration is validated against the
   explorer's parameters and `Filters`. The page, links and filters follow the declaration.
 - `cache/anomalies/anomalies.parquet` has one row per anomaly: `detector, type, bin, window_s,
-  kind, entity, template_id, raw, score, evidence`. The framework drops rows with `raw` below
+  kind, entity, template_id, raw, score, overall, evidence`. The framework drops rows with `raw` below
   the detector's threshold (null, NaN, zero and negative values too; `+inf` counts as far above
   it), scores the rest, keeps the 100 highest per (kind, entity) so that a sustained incident on
   a few hosts does not hide an isolated anomaly on a quiet one, and then the 20,000 highest per
@@ -173,6 +173,11 @@ follows the data (type filter, timeline, table, explorer links).
   99th percentile of the same kind and clipped to 1. It keeps its spread, does not saturate,
   and puts service and host rows of the same standing side by side; it orders rows within a
   detector and kind and compares them across detectors by position, it is not a probability.
+- `overall = 1 / (60 + rank)` is the reciprocal rank fusion of a row's position by score among the
+  detector's kept rows of its kind (60 is the published default, not tuned). The score's
+  percentile depends on how many rows a detector has, so a detector with thousands of rows has
+  hundreds above 0.99 and fills a top-100 sorted by score; `overall` does not. The page sorts by
+  it by default and keeps `score` as a sort and as the timeline's y axis.
 - `meta.json` lists each detector with `above_threshold`, `rows` (kept), `dropped`, `seconds`, an
   optional `info` (what the detector put in `ctx.meta`; its `note` text is shown on the page)
   and, for a detector that raised, `error`: a failing detector is logged and skipped, the others
@@ -180,10 +185,31 @@ follows the data (type filter, timeline, table, explorer links).
 - The page links each row to `/explorer?[start=&end=&]service=|host=|request_id=[&template=]`
   (start and end only for kinds whose lines stay inside the window).
 
-`structural_pca.py` is the PCA residual half of the structural type:
-windows of the per-service and per-host 1-minute log1p fits with `spe / limit` of at least 1,
-with the top residual templates as evidence (on the real data 73,421 windows, 11,446 kept). Issue 6 adds the
-Isolation Forest next to it.
+`structural_pca.py` and `structural_iforest.py` are the structural type (shared helpers in
+`detectors/_episodes.py`, which `load_builtin` skips). `spe / limit >= 1` is not usable on the real data (the
+limit is Gaussian theory on heavy-tailed counts: 71,745 of 233,117 host windows exceed it, and two hosts are
+chronically at a ratio of 100), so both detectors judge a window against its own entity:
+- a window is flagged when its score exceeds the entity's 99.5 % quantile (at least the limit for PCA, at least
+  the average isolation score `s = 0.5` for the forest): a stated 0.5 % false-positive rate, and a chronically
+  high entity cannot flag itself;
+- a minute in which more than 25 % of the active entities (at least 4) are flagged is fleet-wide and dropped
+  (counted in the meta with the worst minutes). 25 % is a judgement: an event on a quarter of the hosts is a
+  fleet event, and the minutes that this removes are the ones the volume detector sees at fleet scale. A
+  declared `fleet` kind would keep them visible; it is not worth a new kind while no detector emits one;
+- flagged windows at most 5 minutes apart are one episode (`bin` its first window, `window_s` its length, the
+  raw score its peak), so a sustained incident is one row.
+
+PCA uses `raw = peak ratio / entity level` and names the top residual templates of the peak window. The forest
+fits one `IsolationForest(100 trees, max_samples = min(256, n), seed 0)` per service or host on its own log1p
+windows over the templates it ever logs (a pooled forest flags a host with an unusual normal mix on every
+window); entities with fewer than 100 windows or identical windows are skipped (counted in the meta). With
+`s = 2 ** (-E[h] / c)`, `raw = 1 / -log2(s) = c / E[h]`, so `s = 0.5` is the threshold 1. Its evidence is the
+three templates most above the entity's median in the peak window. Real data: PCA 1,232 windows flagged (149
+service, 1,083 host), 774 of them in 10 fleet-wide minutes, leaving 377 episodes; Isolation Forest 1,405 windows
+flagged, 892 of them in 11 fleet-wide minutes, 438 episodes (12 short services skipped, 288 windows); the forests take 25 s, so the stage goes from 1.3 s
+to 26 s (the page reads the parquet only). A top 100 by `score` held 97 PCA rows on 11 entities (93 on hosts
+u39 and u40); by `overall` it holds 29 PCA, 29 Isolation Forest, 28 volume and 14 contextual rows on 63
+entities, at most 10 per entity.
 
 `contextual.py` is the contextual type: a host's 1-minute template mix against its peers
 (`analyses/hosts`: the host's nearest hosts within the Hellinger radius, not its k-means cluster). A window's

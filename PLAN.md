@@ -316,13 +316,12 @@ Status: **Phase 1 done** (steps 1 to 9).
   the slow benchmark has not been run on the real cache yet.
 - Module 6 framework (issue 3) done: `detectors/base.py` (the `Detector` protocol, a registry,
   declared entity kinds and scoring), `analyses/anomalies.py` (stage and page) and one real
-  detector, `detectors/structural_pca.py`, the PCA residual part of the structural type (issue 6
-  adds the Isolation Forest beside it). Every module in `detectors/` is imported, so a detector is
+  detector, `detectors/structural_pca.py`, the PCA residual part of the structural type (the Isolation Forest is beside it, see issue 6 below). Every module in `detectors/` is imported, so a detector is
   one new file and the stage depends on what its detectors depend on; a new entity kind is one
   `declare_kind` call (explorer parameter, global filter, whether the link is time-limited),
   an undeclared kind is rejected by name, and a detector that raises is logged, skipped and
   recorded in `meta.json` without losing the others. `cache/anomalies/anomalies.parquet` holds
-  `detector, type, bin, window_s, kind, entity, template_id, raw, score, evidence`. The score in
+  `detector, type, bin, window_s, kind, entity, template_id, raw, score, overall, evidence`. The score in
   [0, 1] is `0.5 * percentile + 0.5 * magnitude` (rank among the detector's rows of the same
   kind; log-scale excess over the threshold relative to that kind's 99th percentile, raw clipped
   at 1024x), replacing a saturating `1 - threshold / (2 raw)` whose median was 0.995 and under
@@ -367,6 +366,23 @@ Status: **Phase 1 done** (steps 1 to 9).
   normal host and a single stray line are not flagged) and that the flag rate is level over line counts. Real
   data: 2,299 of 199,882 scored windows at `z >= 8`, 496 after the evidence rule, 456 kept over 41 hosts, 0.9 s;
   the top rows are eselda12u01s09 ('could not open network device' at 23 to 33 % of a window, z 70 to 94).
+- Structural detectors (issue 6) done: `structural_pca` is reworked and `structural_iforest` added, with shared
+  helpers in `detectors/_episodes.py` (`load_builtin` skips `_` modules). The fixed limit `ratio >= 1` flagged 31 %
+  of the host windows (two hosts sit at ratio 100 all day), so both judge a window against its own entity: a
+  window is flagged above the entity's 99.5 % quantile (PCA also above the limit, the forest above the average
+  isolation score 0.5), minutes with more than 25 % of the active entities (at least 4) flagged are dropped as
+  fleet-wide (counted in `meta.json`, with the worst minutes), and flagged windows at most 5 minutes apart are
+  one episode. The forest is fitted per entity (100 trees, 256 samples, seed 0; entities under 100 windows or with
+  identical windows are skipped and counted). `raw` is `peak ratio / level` (PCA) and `c / E[h]` (forest), both
+  with threshold 1. Ranking: `overall = 1 / (60 + rank by score within detector and kind)` (reciprocal rank
+  fusion, `FRAMEWORK_VERSION` 4); the page sorts by it by default (`score` stays as a sort and the timeline's y
+  axis). Real data: PCA 1,232 windows flagged, 774 fleet-wide, 377 episodes; forest 1,405 flagged, 892
+  fleet-wide, 438 episodes (12 short services skipped); stage 26 s (forests 25 s). The combined top 100 by score
+  held 97 PCA rows on 11 entities; by `overall` it holds 29 PCA, 29 forest, 28 volume and 14 contextual rows on 63
+  entities (at most 10 per entity, 9 on the u39 and u40 hosts). Tests: each structural detector must find the
+  injected service spike and the novel template on its own (the host spike is a volume anomaly, found by the
+  forest only), negative cases on hand-made data (iid noise within the 0.5 % budget, constant entity,
+  short entity, fleet-wide minute, episode merge) and the ranking. Slow benchmark: every callback under 300 ms.
 - Module 7 (hosts and services, issue 10) done: `analyses/hosts.py` from `templates/template_counts_host.parquet`
   and one aggregate over `events` (service x host lines). A host's profile is its template mix over the whole
   span, compared as `sqrt(share)` (Hellinger). Display clusters: k-means (fixed seed) chooses k in 2..10 by

@@ -9,5 +9,5 @@ import pkgutil
 def load_builtin() -> None:
     """Import every detector module so that its ``@register`` decorator runs."""
     for module in pkgutil.iter_modules(__path__):
-        if module.name != "base":
+        if module.name != "base" and not module.name.startswith("_"):
             importlib.import_module(f"{__name__}.{module.name}")
