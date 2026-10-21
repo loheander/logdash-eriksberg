@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from logdash.analyses import features, load_builtin
+from logdash.analyses import features, load_builtin, pca
 from logdash.analyses.base import REGISTRY
 from logdash.analyses.explorer import fetch_page, search_page
 from logdash.analyses.temporal import Temporal
@@ -227,6 +227,44 @@ def test_features_cold(store: CacheStore) -> None:
         results.append(("features.draw (cold)", f"{window} s, {group}, {scale}", cold, warm))
         if cold >= LAYOUT_BUDGET_S:  # a first request may take as long as a first layout
             over.append(f"features.draw cold [{window} s, {group}, {scale}] {cold * 1000:.0f} ms")
+
+
+PCA_CASES = (
+    ("60", "service", "log1p", "time"),
+    ("60", "host", "log1p", "entity"),
+    ("60", "service", "tfidf", "score"),
+    ("60", "host", "tfidf", "time"),
+    ("300", "service", "log1p", "entity"),
+    ("900", "host", "tfidf", "score"),
+)
+
+
+def test_pca(store: CacheStore) -> None:
+    fns = _recorded(store, "pca")
+    for name, filters in _cases(store).items():
+        for window, group, scale, color in PCA_CASES:
+            measure(
+                "pca.draw",
+                f"{name}, {window} s, {group}, {scale}, {color}",
+                CALLBACK_BUDGET_S,
+                partial(fns["draw"], window, group, scale, color, "2", filters, "light"),
+            )
+
+
+def test_pca_cold(store: CacheStore) -> None:
+    """First request after start-up: the fit is not in memory, only read from the cache."""
+    fns = _recorded(store, "pca")
+    for window, group, scale, color in PCA_CASES:
+        pca.clear_caches()
+        features.clear_caches()
+        draw = partial(fns["draw"], window, group, scale, color, "1", None, "light")
+        t0 = time.perf_counter()
+        draw()
+        cold = time.perf_counter() - t0
+        warm = _time(draw)
+        results.append(("pca.draw (cold)", f"{window} s, {group}, {scale}", cold, warm))
+        if cold >= LAYOUT_BUDGET_S:
+            over.append(f"pca.draw cold [{window} s, {group}, {scale}] {cold * 1000:.0f} ms")
 
 
 def test_explorer(store: CacheStore) -> None:

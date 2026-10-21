@@ -40,6 +40,7 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | events (normalised, hour-partitioned Parquet) | 97 s |
 | overview, distributions, temporal, templates, explorer | under 8 s each (measured before the templates stage also wrote the per-host counts) |
 | features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
+| pca | 12 fits (group x window x scaling); about 4 s for a synthetic 230k-window x 281-template matrix at 3 % density (not yet measured on the real data) |
 | total | 1 min 58 s |
 
 `cache/` is 622 MB (281 templates from 73,583 unique masked lines).
@@ -53,10 +54,11 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | Temporal | event rate (1 s to 5 min bins by zoom), host x time heatmap, autocorrelation and periodogram, bursts and gaps; drag on the rate chart to set the global time range |
 | Templates | Drain3 templates: top, volume over time, parameter distributions, rare and novel lists |
 | Features | window x template count matrix (1, 5, 15 min; per service or host; log1p or TF-IDF): template correlation heatmap, template-entity association, variance ranking, mutual information |
+| PCA | PCA of the window x template matrix (precomputed per grouping, window and scaling): scree plot, 2D and 3D projections coloured by time, service or host, or SPE; loadings per component; residual SPE per window against its control limit, and the windows above it with their top residual templates |
 | Explorer | paged grid over raw events with filters, template, request id and text search; other pages link here |
 
 Global filters (date range, level, service, host) live in the sidebar. The time
-range is respected by Temporal, Templates, Features and Explorer; the other pages state which
+range is respected by Temporal, Templates, Features, PCA and Explorer; the other pages state which
 filters they honour.
 
 Screenshots (`docs/screenshots/`):
@@ -67,6 +69,16 @@ Screenshots (`docs/screenshots/`):
 ![temporal, dark theme](docs/screenshots/temporal-dark.png)
 ![templates](docs/screenshots/templates.png)
 ![explorer](docs/screenshots/explorer.png)
+
+## Anomaly scores from PCA
+
+The `pca` stage keeps, for every grouping (`service`, `host`), window (60, 300, 900 s) and
+scaling (`log1p`, `tfidf`), the per-window SPE (squared norm of what the first `k`
+components, keeping 95 % of the variance, do not explain) with its Jackson-Mudholkar control
+limit at 99.9 %, and the three templates that contribute most to each window's residual.
+Downstream modules read them with `pca.load_spe(store, group, window_s, scaling)`
+(`row, bin, entity, spe, limit`) and `pca.load_residuals(...)`
+(`row, rank, template_id, residual, share`); `row` is the row of the features index.
 
 ## Adding an analysis
 
