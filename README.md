@@ -42,7 +42,7 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
 | pca | 12 fits (group x window x scaling); about 4 s for a synthetic 230k-window x 281-template matrix at 3 % density (not yet measured on the real data) |
 | hosts | 3 s on the real data (162 hosts, 281 templates, 559 service x host pairs; one aggregate over `events` for the matrix) |
-| anomalies | 28 s (seven detectors: PCA residual, 1,232 windows above the entity's level, 377 episodes kept; Isolation Forest per entity, 25 s, 1,405 windows flagged, 438 episodes; volume, 87 episodes; contextual, 496 windows above the threshold, 456 kept; novel and rare templates, 15 and 166 rows, 0.03 s; sequence, 40 requests, 3 s) |
+| anomalies | 28 s (eight detectors: PCA residual, 1,232 windows above the entity's level, 377 episodes kept; Isolation Forest per entity, 25 s, 1,405 windows flagged, 438 episodes; volume, 87 episodes; contextual, 496 windows above the threshold, 456 kept; novel and rare templates, 15 and 166 rows, 0.03 s; sequence, 40 requests, 3 s; severity, 13 episodes, 0.1 s) |
 | total | 1 min 58 s (measured before the features, pca and anomalies stages existed) |
 
 `cache/` is 622 MB (281 templates from 73,583 unique masked lines).
@@ -285,6 +285,20 @@ before an entity's first or after its last line. Episodes of one entity and kind
 fixed period are merged into the strongest one (evidence says how many and how often). On the real
 data this leaves 87 episodes of 42 entities (87 spikes, no drops or gaps: every host logs
 throughout the 24 hours); 426 before periodic repeats were merged.
+
+`severity.py` is the severity burst type (kind `service`: only `rate_60` has a level). Per service two series: WARNING,
+and ERROR plus CRITICAL (UNKNOWN is a missing level). `find_bursts` finds the runs, with floors per level because ERROR
+is rare: WARNING 10 lines in the peak minute and 300 above baseline (the volume defaults), ERROR 5 and 30
+(`find_bursts(min_excess=)`). With a zero baseline the robust z is just the peak count (median and MAD are 0, the scale
+floors at 1), so below a baseline median of 10 events/min the score is the Poisson tail `P(X >= peak)` at the rate
+`max(median, mean outside the episodes, 0.1)`, converted to the Gaussian-equivalent z; a busier baseline keeps the robust
+z. The evidence shows the p and z that drive the score; the threshold is `burst_k` in both regimes. Episodes that recur
+at a fixed period (the `neutron-l3-agent` duplicate iptables rule is 88 % of all WARNING lines) are merged by the volume
+detector's `merge_periodic` into one row demoted to the threshold, so known noise stays visible without ranking. The
+shared fleet filter is not used: severity rows are rare and a surge in several services is the incident, so the meta
+records the most services with a burst starting in one minute (2 on the real data). On the real data: 13 episodes (8 ERROR,
+4 WARNING, 1 periodic row of 96 l3 episodes at about 77 min); barbican-api 07:50 to 09:43 and neutron-server 09:01 are
+the ERROR rows.
 
 ## Adding an analysis
 

@@ -333,7 +333,7 @@ Status: **Phase 1 done** (steps 1 to 9).
   and the page answers in at most 61 ms (cold or warm) on the real cache. The test of
   injected anomalies checks type and rank (the PCA spike and the novel template, bounded to ten
   minutes after its first line, are in the top 10 and 15); the sequence case
-  passes since issue 8, severity waits for a synthetic injection (issue 9).
+  passes since issue 8, severity since issue 9.
   A stub detector of a new type on a new kind is tested end to end.
 - Volume detector (issue 4) done: `detectors/volume.py` uses `find_bursts`, `find_drops` and
   `find_gaps` of `analyses/temporal.py` on `rate_60` (spikes and drops per service and host) and
@@ -418,6 +418,18 @@ Status: **Phase 1 done** (steps 1 to 9).
   peak 2.8 GB; the top row is `GET -> returned with HTTP` seen 51 of 190,285 times
   (P = 0.0003). The combined top 100 holds 8 sequence rows (25 PCA, 25 forest, 16 volume, 9 contextual, 9 rare,
   8 novel); the first is at position 12.
+- Severity detector (issue 9) done: `detectors/severity.py`, kind `service` only (`rate_60` is the one table with a
+  level). WARNING and ERROR+CRITICAL series per service through `find_bursts` (new `min_excess` parameter, default
+  unchanged; floors 10 / 300 for WARNING and 5 / 30 for ERROR). Where the baseline median is below 10 events/min the
+  score is a Poisson tail converted to a z (rate `max(median, mean outside episodes, 0.1)`), otherwise the robust z; the
+  evidence shows that p and z. Periodic episodes are merged with the volume detector's `merge_periodic` (imported, not
+  moved) and the merged row is demoted to the threshold. The shared fleet filter is not used (the meta records the
+  most services starting a burst in one minute: 2). The version embeds the constants. Synthetic injection:
+  `error_rows=600` libvirt ERROR lines in two minutes at 80 % of the span (own generator, seed + 4000; libvirt, not
+  haproxy, because a burst in haproxy takes its 99.5 % level and hides the novel template structurally); the
+  injected burst ranks first, the volume spike also yields one WARNING severity row. The strict xfail is gone.
+  Real data: 13 episodes (8 ERROR, 4 WARNING, one periodic row), 0.1 s; the combined top 100 holds 8 severity rows (23
+  PCA, 23 forest, 15 volume, 8 contextual, 8 rare, 8 sequence, 7 novel).
 - Module 7 (hosts and services, issue 10) done: `analyses/hosts.py` from `templates/template_counts_host.parquet`
   and one aggregate over `events` (service x host lines). A host's profile is its template mix over the whole
   span, compared as `sqrt(share)` (Hellinger). Display clusters: k-means (fixed seed) chooses k in 2..10 by
