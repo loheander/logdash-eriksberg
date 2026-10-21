@@ -48,6 +48,8 @@ ROLL_WINDOW = 61  # 1-minute bins (one hour) for the rolling median and MAD
 MIN_BURST = 10  # a burst needs at least this many events in its peak minute
 MIN_EXCESS = 300  # ... and at least this many events above its baseline over the whole episode
 MERGE_BINS = 2  # bursts separated by at most this many quiet minutes form one episode
+MIN_DROP_BASELINE = 50  # a drop needs a baseline of at least this many events per minute ...
+DROP_RATIO = 0.5  # ... and a minute at or below this fraction of it
 MAX_LAG = 3600  # autocorrelation lags in seconds
 SPECTRUM_POINTS = 300
 MIN_SPECTRUM_EVENTS = 50
@@ -206,10 +208,17 @@ def runs(mask: np.ndarray) -> list[tuple[int, int]]:
     return [(int(a), int(b) - 1) for a, b in zip(edges[::2], edges[1::2], strict=True)]
 
 
-def rolling_baseline(x: np.ndarray, window: int = ROLL_WINDOW) -> tuple[np.ndarray, np.ndarray]:
-    """Rolling median and robust scale (1.4826 MAD, floored by Poisson noise and 1)."""
-    median = ndimage.median_filter(x, size=window, mode="nearest")
-    mad = ndimage.median_filter(np.abs(x - median), size=window, mode="nearest")
+def rolling_baseline(
+    x: np.ndarray, window: int = ROLL_WINDOW, trailing: bool = False
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rolling median and robust scale (1.4826 MAD, floored by Poisson noise and 1).
+
+    The window is centred, or with ``trailing`` it ends at the bin, so a long drop does not
+    become its own baseline half way through.
+    """
+    origin = window // 2 if trailing else 0
+    median = ndimage.median_filter(x, size=window, mode="nearest", origin=origin)
+    mad = ndimage.median_filter(np.abs(x - median), size=window, mode="nearest", origin=origin)
     scale = np.maximum(1.4826 * mad, np.sqrt(np.maximum(median, 1.0)))
     return median, scale
 
@@ -240,10 +249,23 @@ def find_bursts(x: np.ndarray, k: float, min_peak: int = MIN_BURST) -> list[dict
     return found
 
 
+def active_span(x: np.ndarray) -> tuple[int, int] | None:
+    """First and last non-empty bin (inclusive), or None for an empty series.
+
+    An entity that starts logging late or stops early is not silent before and after.
+    """
+    nonzero = np.flatnonzero(x)
+    return (int(nonzero[0]), int(nonzero[-1])) if len(nonzero) else None
+
+
 def find_gaps(x: np.ndarray, min_bins: int) -> list[dict[str, Any]]:
-    """Runs of at least ``min_bins`` empty bins."""
+    """Runs of at least ``min_bins`` empty bins between the first and the last non-empty bin."""
+    span = active_span(x)
+    if span is None:
+        return []
+    lo, hi = span
     nonzero = x[x > 0]
-    baseline = float(np.median(nonzero)) if len(nonzero) else 0.0
+    baseline = float(np.median(nonzero))
     return [
         {
             "first": a,
@@ -254,9 +276,57 @@ def find_gaps(x: np.ndarray, min_bins: int) -> list[dict[str, Any]]:
             "events": 0.0,
             "excess": baseline * (b - a + 1),
         }
-        for a, b in runs(x == 0)
+        for a, b in runs(
+            np.concatenate(
+                [np.zeros(lo, bool), x[lo : hi + 1] == 0, np.zeros(len(x) - hi - 1, bool)]
+            )
+        )
         if b - a + 1 >= min_bins
     ]
+
+
+def find_drops(
+    x: np.ndarray, k: float, skip_gaps: int | None = None, min_baseline: int = MIN_DROP_BASELINE
+) -> list[dict[str, Any]]:
+    """Runs of bins below the trailing median minus k robust sigmas; one dict per run.
+
+    The low-side counterpart of ``find_bursts`` for a busy entity (trailing median of at least
+    ``min_baseline``, bin at most ``DROP_RATIO`` of it), merged like bursts, within the entity's
+    first and last non-empty bin and only once a full hour of baseline precedes it. ``skip_gaps``
+    leaves out empty runs of at least that many bins (reported by ``find_gaps``); None counts
+    silence as a drop. ``score`` is the robust z-score
+    of the trough (deficit over scale), ``peak`` the trough's event count.
+    """
+    span = active_span(x)
+    if span is None:
+        return []
+    median, scale = rolling_baseline(x, trailing=True)
+    flagged = (x < median - k * scale) & (x <= DROP_RATIO * median) & (median >= min_baseline)
+    flagged[: span[0] + ROLL_WINDOW - 1] = flagged[span[1] + 1 :] = False  # a full hour first
+    if skip_gaps is not None:
+        for a, b in runs(x == 0):
+            if b - a + 1 >= skip_gaps:
+                flagged[a : b + 1] = False
+    if MERGE_BINS:
+        flagged = ndimage.binary_closing(flagged, structure=np.ones(MERGE_BINS + 1, dtype=bool))
+    found = []
+    for first, last in runs(flagged):
+        trough = first + int(np.argmin(x[first : last + 1]))
+        deficit = float(median[first : last + 1].sum() - x[first : last + 1].sum())
+        if deficit < MIN_EXCESS:
+            continue
+        found.append(
+            {
+                "first": first,
+                "last": last,
+                "peak": float(x[trough]),
+                "baseline": float(median[trough]),
+                "score": float((median[trough] - x[trough]) / scale[trough]),
+                "events": float(x[first : last + 1].sum()),
+                "excess": deficit,
+            }
+        )
+    return found
 
 
 ANOMALY_SCHEMA: dict[str, Any] = {
@@ -610,7 +680,7 @@ def anomaly_table(df: pl.DataFrame) -> Component:
 class Temporal:
     key = KEY
     title = "Temporal"
-    version = "2"
+    version = "3"
     depends_on: tuple[str, ...] = ()
     setting_names = SETTING_NAMES
 

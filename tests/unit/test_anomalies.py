@@ -709,11 +709,12 @@ def test_volume_rows_say_spike_or_gap_and_gaps_start_at_the_threshold(stage, syn
     spike = volume.filter(
         during(truth.spike_start, truth.spike_end) & (pl.col("entity") == truth.spike_host)
     )
-    assert spike["evidence"].str.starts_with("spike: peak").all()
+    assert spike.height and spike["evidence"].str.starts_with("spike: peak").all()
     gap = volume.filter(
         during(truth.gap_start, truth.gap_end) & (pl.col("entity") == truth.silent_host)
     )
-    assert gap["evidence"].str.starts_with("silent for").all() and (gap["kind"] == "host").all()
+    assert gap.height and (gap["kind"] == "host").all()
+    assert gap["evidence"].str.starts_with("silent for").any()
     assert set(volume["kind"]) <= {"service", "host"}
     assert (
         not volume.filter(pl.col("kind") == "service")["evidence"].str.starts_with("silent").any()

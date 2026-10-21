@@ -337,12 +337,17 @@ Status: **Phase 1 done** (steps 1 to 9).
   strict expected failures until issues 7 and 8 register detectors (they fail when one does,
   so the mark must go), contextual and severity wait for synthetic injections (issues 5 and 9).
   A stub detector of a new type on a new kind is tested end to end.
-- Volume detector (issue 4) done: `detectors/volume.py` reuses `find_bursts` and `find_gaps` of
-  `analyses/temporal.py` on `rate_60` (spikes per service and host) and `host_60` (gaps per
-  host); one row per episode (`window_s` is its length). Raw score is the peak robust z-score
-  (threshold `burst_k`, via `threshold_for`); a gap scores `burst_k * minutes / gap_minutes`. The
-  synthetic volume spike and silent-host gap are in the top 20. Real data: 426 episodes (156
-  service, 270 host spikes, no gaps), 0.2 s; the whole anomalies stage 0.5 s.
+- Volume detector (issue 4) done: `detectors/volume.py` uses `find_bursts`, `find_drops` and
+  `find_gaps` of `analyses/temporal.py` on `rate_60` (spikes and drops per service and host) and
+  `host_60` (gaps per host); one row per episode (`window_s` is its length). Raw score is the peak
+  or trough robust z-score (threshold `burst_k`, via `threshold_for`); a gap scores
+  `burst_k * minutes / gap_minutes`. Drops need a baseline of 50 events/min and cover busy
+  services going silent; gaps and drops stay inside an entity's first and last line; periodic
+  repeats of one entity are merged into the strongest episode. The synthetic volume spike and
+  silent-host gap are in the top 20; partial drops are tested on hand-made rate tables. Real data:
+  87 episodes of 42 entities (426 before merging; 91 spikes before the full-hour baseline rule
+  removed 4 start-up artefacts), no drops or gaps, 0.4 s. Framework score normalisation is
+  unchanged: 2 of the top 100 anomalies are volume.
 
 ## 9. Open decisions
 
