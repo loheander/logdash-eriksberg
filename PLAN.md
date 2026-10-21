@@ -371,15 +371,17 @@ Status: **Phase 1 done** (steps 1 to 9).
   of the host windows (two hosts sit at ratio 100 all day), so both judge a window against its own entity: a
   window is flagged above the entity's 99.5 % quantile (PCA also above the limit, the forest above the average
   isolation score 0.5), minutes with more than 25 % of the active entities (at least 4) flagged are dropped as
-  fleet-wide (counted in `meta.json`, with the worst minutes), and flagged windows at most 5 minutes apart are
-  one episode. The forest is fitted per entity (100 trees, 256 samples, seed 0; entities under 100 windows or with
+  fleet-wide (counted in `meta.json`, with the worst minutes; each becomes one row of kind `fleet`, so the
+  largest events stay on the page), and flagged windows at most 5 minutes apart are one episode. The forest
+  is fitted per entity (100 trees, 256 samples, seed 0; entities under 100 windows or with
   identical windows are skipped and counted). `raw` is `peak ratio / level` (PCA) and `c / E[h]` (forest), both
   with threshold 1. Ranking: `overall = 1 / (60 + rank by score within detector and kind)` (reciprocal rank
   fusion, `FRAMEWORK_VERSION` 4); the page sorts by it by default (`score` stays as a sort and the timeline's y
-  axis). Real data: PCA 1,232 windows flagged, 774 fleet-wide, 377 episodes; forest 1,405 flagged, 892
-  fleet-wide, 438 episodes (12 short services skipped); stage 26 s (forests 25 s). The combined top 100 by score
-  held 97 PCA rows on 11 entities; by `overall` it holds 29 PCA, 29 forest, 28 volume and 14 contextual rows on 63
-  entities (at most 10 per entity, 9 on the u39 and u40 hosts). Tests: each structural detector must find the
+  axis). Real data: PCA 1,232 windows flagged, 774 fleet-wide, 377 episodes; forest 1,405 flagged, 885
+  fleet-wide, 437 episodes (12 short services skipped); 10 fleet rows per detector; stage 26 s (forests 25 s).
+  The combined top 100 by score held 97 PCA rows on 11 entities; by `overall` it holds 33 PCA, 33 forest, 22
+  volume and 12 contextual rows, 20 of them fleet rows, the rest at most 10 per entity and 2 per u39 or u40
+  host (checked on the real cache in the slow benchmark). Tests: each structural detector must find the
   injected service spike and the novel template on its own (the host spike is a volume anomaly, found by the
   forest only), negative cases on hand-made data (iid noise within the 0.5 % budget, constant entity,
   short entity, fleet-wide minute, episode merge) and the ranking. Slow benchmark: every callback under 300 ms.

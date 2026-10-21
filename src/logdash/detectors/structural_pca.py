@@ -9,8 +9,9 @@ windows exceed it, and some hosts sit far above it all the time. Per service or 
 1. a window is flagged when its ratio exceeds the entity's own 99.5 % quantile (and the limit,
    1): the false-positive rate is a stated 0.5 % of an entity's windows and a chronically high
    entity cannot flag itself;
-2. a minute in which more than 25 % of the active entities are flagged is fleet-wide, not
-   specific to an entity, and is dropped (counted, with the worst minutes, in the meta);
+2. a minute in which more than 25 % of the active entities (those with a window) are flagged is
+   fleet-wide, not specific to an entity: its windows are dropped and the minute is one row of
+   kind ``fleet`` (counted, with the worst minutes, in the meta);
 3. flagged windows at most five minutes apart are one episode.
 
 ``raw = peak ratio / the entity's level``, so the threshold is 1. The evidence names the
@@ -82,7 +83,7 @@ class StructuralPca:
     key = "structural_pca"
     type = "structural"
     title = "PCA residual (SPE)"
-    version = f"2:{WINDOW_S}:{SCALING}:{THRESHOLD}:{MIN_LEVEL}"  # constants change the output
+    version = f"3:{WINDOW_S}:{SCALING}:{THRESHOLD}:{MIN_LEVEL}"  # constants change the output
     setting_names: tuple[str, ...] = ()
     depends_on: tuple[str, ...] = ("pca", "templates")
     threshold = THRESHOLD
@@ -94,11 +95,12 @@ class StructuralPca:
             spe = pca.load_spe(ctx.store, group, WINDOW_S, SCALING).with_columns(
                 level=_episodes.entity_level("ratio", MIN_LEVEL)
             )
-            flagged = spe.filter(pl.col("ratio") > pl.col("level"))
-            kept, fleet = _episodes.drop_fleet_wide(flagged, spe)
+            flagged = spe.filter(pl.col("ratio") > pl.col("level")).with_columns(
+                raw=pl.col("ratio") / pl.col("level")
+            )
+            kept, fleet = _episodes.drop_fleet_wide(flagged, spe, WINDOW_S, f"{kind}s")
             episodes = _episodes.merge_episodes(
-                kept.select("bin", "entity", raw=pl.col("ratio") / pl.col("level"), row="row"),
-                WINDOW_S,
+                kept.select("bin", "entity", "raw", "row"), WINDOW_S
             )
             ctx.log(
                 f"structural_pca: {group}: {flagged.height} of {spe.height} windows flagged, "
@@ -121,5 +123,6 @@ class StructuralPca:
                 )
                 .select("bin", "window_s", "kind", "entity", "raw", "evidence")
             )
+            parts.append(fleet.rows)
         ctx.meta.update(info)
         return pl.concat(parts)

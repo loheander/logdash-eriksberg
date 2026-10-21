@@ -192,10 +192,16 @@ chronically at a ratio of 100), so both detectors judge a window against its own
 - a window is flagged when its score exceeds the entity's 99.5 % quantile (at least the limit for PCA, at least
   the average isolation score `s = 0.5` for the forest): a stated 0.5 % false-positive rate, and a chronically
   high entity cannot flag itself;
-- a minute in which more than 25 % of the active entities (at least 4) are flagged is fleet-wide and dropped
-  (counted in the meta with the worst minutes). 25 % is a judgement: an event on a quarter of the hosts is a
-  fleet event, and the minutes that this removes are the ones the volume detector sees at fleet scale. A
-  declared `fleet` kind would keep them visible; it is not worth a new kind while no detector emits one;
+- a minute in which more than 25 % of the active entities (those with a window in that minute; at least 4, the same
+  count for both detectors) are flagged is fleet-wide, not an entity's anomaly. Its windows are dropped from the
+  entity rows and the minute is one row of kind `fleet` (entity `all hosts` or `all services`, raw = share flagged
+  / 25 %, evidence "N of M hosts flagged (P%); highest: ..."), so the largest events stay on the page and rank
+  by `overall` among the fleet rows. The cut is not fragile: on the real hosts the share flagged per minute is
+  bimodal (132 minutes below 10 %, 4 at about 90 %), dropping at 5, 10, 25 or 50 % removes 822, 803, 741 or 586
+  windows, and independent flags would reach a share of only 0.5 %. The floor of 4 matters only for small
+  active sets, where one flag is already a large share. (The detector is blind to a chronic entity by design:
+  a tied block of identical windows is never above its own quantile.) Whether the volume detector also sees
+  these minutes has not been verified;
 - flagged windows at most 5 minutes apart are one episode (`bin` its first window, `window_s` its length, the
   raw score its peak), so a sustained incident is one row.
 
@@ -206,10 +212,12 @@ window); entities with fewer than 100 windows or identical windows are skipped (
 `s = 2 ** (-E[h] / c)`, `raw = 1 / -log2(s) = c / E[h]`, so `s = 0.5` is the threshold 1. Its evidence is the
 three templates most above the entity's median in the peak window. Real data: PCA 1,232 windows flagged (149
 service, 1,083 host), 774 of them in 10 fleet-wide minutes, leaving 377 episodes; Isolation Forest 1,405 windows
-flagged, 892 of them in 11 fleet-wide minutes, 438 episodes (12 short services skipped, 288 windows); the forests take 25 s, so the stage goes from 1.3 s
-to 26 s (the page reads the parquet only). A top 100 by `score` held 97 PCA rows on 11 entities (93 on hosts
-u39 and u40); by `overall` it holds 29 PCA, 29 Isolation Forest, 28 volume and 14 contextual rows on 63
-entities, at most 10 per entity.
+flagged, 885 of them in 10 fleet-wide minutes, 437 episodes (12 short services skipped, 288 windows); the
+forests take 25 s, so the stage goes from 1.3 s to 26 s (the page reads the parquet only). Each detector
+emits 10 fleet rows (7 to 8 host minutes with up to 94 % of the hosts flagged, 2 to 3 service minutes). A top 100
+by `score` held 97 PCA rows on 11 entities (93 on hosts u39 and u40); by `overall` it holds 33 PCA, 33 Isolation
+Forest, 22 volume and 12 contextual rows, 20 of them fleet rows (all 20 fleet rows rank first within their
+kind), and the other 80 rows have at most 10 per entity (eselda12u01s09) and at most 2 per u39 or u40 host.
 
 `contextual.py` is the contextual type: a host's 1-minute template mix against its peers
 (`analyses/hosts`: the host's nearest hosts within the Hellinger radius, not its k-means cluster). A window's

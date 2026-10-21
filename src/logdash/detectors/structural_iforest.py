@@ -10,7 +10,8 @@ identical, are skipped (their number goes to the meta).
 With ``s = -score_samples = 2 ** (-E[h] / c)``, a window is flagged when ``s > 0.5`` (it is
 isolated in fewer splits than the average one) and ``s`` exceeds the entity's 99.5 %
 quantile, so at most about 0.5 % of an entity's windows are flagged. Fleet-wide minutes are
-dropped and neighbouring windows merged, as in the PCA detector (``_episodes``). The raw score
+dropped (one ``fleet`` row per such minute) and neighbouring windows merged, as in the PCA
+detector (``_episodes``; the active entities are all those with a window, as there). The raw score
 is ``1 / -log2(s) = c / E[h]``: 1 at ``s = 0.5``, so the threshold is 1.
 
 The evidence names the three templates whose log1p count in the peak window exceeds the entity's
@@ -53,7 +54,7 @@ def isolation_scores(x: np.ndarray, seed: int = SEED) -> np.ndarray:
 
 
 def raw_score(s: np.ndarray) -> np.ndarray:
-    """``1 / -log2(s)``: infinite at ``s = 1``, below 1 for ``s < 0.5``."""
+    """``1 / -log2(s)``: infinite at ``s = 1`` (``finish`` clips raw, so inf is no score)."""
     with np.errstate(divide="ignore"):
         return 1.0 / np.maximum(-np.log2(s), 0.0)
 
@@ -75,11 +76,8 @@ def entity_windows(
     return x, columns
 
 
-def score_grid(
-    matrix: features.Matrix, scaled: sparse.csr_matrix
-) -> tuple[pl.DataFrame, pl.DataFrame, int, int]:
-    """``scores`` (``row, bin, entity, s``), ``windows`` (``bin, entity`` scored) and the
-    number of entities and windows skipped."""
+def score_grid(matrix: features.Matrix, scaled: sparse.csr_matrix) -> tuple[pl.DataFrame, int, int]:
+    """``scores`` (``row, bin, entity, s``) and the number of entities and windows skipped."""
     order = np.argsort(matrix.codes, kind="stable")
     bounds = np.searchsorted(matrix.codes[order], np.arange(len(matrix.entities) + 1))
     rows_out, scores_out, skipped_entities, skipped_windows = [], [], 0, 0
@@ -105,7 +103,7 @@ def score_grid(
             "row": pl.Int64, "bin": pl.Datetime("us"), "entity": pl.String, "s": pl.Float64
         },
     )  # fmt: skip
-    return scores, scores.select("bin", "entity"), skipped_entities, skipped_windows
+    return scores, skipped_entities, skipped_windows
 
 
 def evidence(
@@ -140,7 +138,7 @@ class StructuralIforest:
     key = "structural_iforest"
     type = "structural"
     title = "Isolation Forest per entity"
-    version = f"1:{WINDOW_S}:{SCALING}:{THRESHOLD}:{MIN_WINDOWS}:{TREES}:{SAMPLE}:{SEED}"
+    version = f"2:{WINDOW_S}:{SCALING}:{THRESHOLD}:{MIN_WINDOWS}:{TREES}:{SAMPLE}:{SEED}"
     setting_names: tuple[str, ...] = ()
     depends_on: tuple[str, ...] = ("features", "templates")
     threshold = THRESHOLD
@@ -153,15 +151,22 @@ class StructuralIforest:
             scaled = features.load_scaled(ctx.store, group, WINDOW_S, SCALING)
             if scaled.shape[0] != len(matrix.bins):
                 raise ValueError(f"{group}: scaled matrix and index differ in length")
-            scores, windows, skipped, skipped_windows = score_grid(matrix, scaled)
+            scores, skipped, skipped_windows = score_grid(matrix, scaled)
+            active = pl.DataFrame(
+                {
+                    "bin": matrix.bins,
+                    "entity": np.array(matrix.entities, dtype=object)[matrix.codes],
+                },
+                schema={"bin": pl.Datetime("us"), "entity": pl.String},
+            )
             scores = scores.with_columns(
                 level=pl.col("s").quantile(_episodes.LEVEL_QUANTILE, "linear").over("entity")
             )
             flagged = scores.filter((pl.col("s") > 0.5) & (pl.col("s") > pl.col("level")))
-            kept, fleet = _episodes.drop_fleet_wide(flagged, windows)
+            flagged = flagged.with_columns(raw=raw_score(flagged["s"].to_numpy()))
+            kept, fleet = _episodes.drop_fleet_wide(flagged, active, WINDOW_S, f"{kind}s")
             episodes = _episodes.merge_episodes(
-                kept.select("bin", "entity", raw=raw_score(kept["s"].to_numpy()), row="row"),
-                WINDOW_S,
+                kept.select("bin", "entity", "raw", "row"), WINDOW_S
             )
             peaks = episodes.join(scores.select("row", "s"), on="row")
             ctx.log(
@@ -186,5 +191,6 @@ class StructuralIforest:
                 )
                 .select("bin", "window_s", "kind", "entity", "raw", "evidence")
             )
+            parts.append(fleet.rows)
         ctx.meta.update(info)
         return pl.concat(parts)

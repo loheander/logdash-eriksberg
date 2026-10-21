@@ -290,3 +290,4 @@ def empty() -> pl.DataFrame:
 declare_kind("service", link_param="service", filter_field="services")
 declare_kind("host", link_param="host", filter_field="hosts")
 declare_kind("request", link_param="request_id", link_window=False)
+declare_kind("fleet")  # a minute in which a large share of the services or hosts is anomalous

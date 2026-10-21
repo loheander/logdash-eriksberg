@@ -208,12 +208,13 @@ def test_structural_detectors_flag_a_few_windows_per_entity(stage):
     for key, evidence in (("structural_pca", "SPE "), ("structural_iforest", "isolation score ")):
         detector = DETECTORS.get(key)
         found = detector.detect(ctx)
-        assert found["evidence"].str.starts_with(evidence).all()
-        assert (found["raw"] >= detector.threshold).all() and found.height > 0
+        own = found.filter(pl.col("kind") != "fleet")
+        assert own["evidence"].str.starts_with(evidence).all()
+        assert (found["raw"] >= detector.threshold).all() and own.height > 0
         assert (found["window_s"] % 60 == 0).all()
         kept, above = base.finish(detector, found, 20_000, an.MAX_PER_ENTITY)
         assert above == found.height == kept.height  # episodes are few, nothing is cut
-        assert {"service", "host"} >= set(found["kind"])
+        assert {"service", "host", "fleet"} >= set(found["kind"])
         assert ctx.meta["host"]["episodes"] > 0
 
 
@@ -276,24 +277,34 @@ def test_fleet_wide_minutes_are_dropped_and_counted():
     names = [f"h{i}" for i in range(8)]
     every = windows({n: [1.0] * 10 for n in names})
     flagged = every.filter(pl.col("bin") == datetime(2023, 5, 21, 0, 3))  # all 8 at minute 3
+    flagged = flagged.with_columns(raw=pl.Series([1.0 + i for i in range(8)]))
     flagged = pl.concat(
         [
             flagged,
             every.filter(
                 (pl.col("bin") == datetime(2023, 5, 21, 0, 7)) & (pl.col("entity") == "h0")
-            ),
+            ).with_columns(raw=pl.lit(2.0)),
         ]
     )
-    kept, drop = episodes.drop_fleet_wide(flagged, every)
+    kept, drop = episodes.drop_fleet_wide(flagged, every, 60, "hosts")
     assert kept["entity"].to_list() == ["h0"] and kept["bin"][0].minute == 7
     assert (drop.windows, drop.minutes) == (8, 1)
     assert drop.worst == [{"minute": "2023-05-21 00:03:00", "share": 1.0}]
+    # the minute stays visible as one row of kind fleet: severity share / 25 %, worst entities
+    row = drop.rows.row(0, named=True)
+    assert drop.rows.height == 1 and row["kind"] == "fleet" and row["entity"] == "all hosts"
+    assert (row["bin"], row["window_s"], row["raw"]) == (datetime(2023, 5, 21, 0, 3), 60, 4.0)
+    assert row["evidence"] == "8 of 8 hosts flagged (100%); highest: h7, h6, h5"
+    assert base.finish(DETECTORS.get("structural_pca"), drop.rows, 10).rows.height == 1
     # a small fleet is never fleet-wide: two of two entities flagged is two anomalies
     small = every.filter(pl.col("entity").is_in(["h0", "h1"]))
     kept, drop = episodes.drop_fleet_wide(
-        small.filter(pl.col("bin") == datetime(2023, 5, 21, 0, 3)), small
+        small.filter(pl.col("bin") == datetime(2023, 5, 21, 0, 3)).with_columns(raw=pl.lit(2.0)),
+        small,
+        60,
+        "hosts",
     )
-    assert kept.height == 2 and drop.minutes == 0
+    assert kept.height == 2 and drop.minutes == 0 and drop.rows.is_empty()
 
 
 def test_episodes_merge_close_windows_per_entity():
@@ -339,7 +350,7 @@ def test_iforest_scores_an_entity_on_its_own_history():
         np.datetime64("2023-05-21T00:00", "us") + np.arange(n) * np.timedelta64(60, "s"), 2
     )
     matrix = ft.Matrix(counts, bins, np.repeat([0, 1], n), ["a", "b"], np.array([7, 8]), 60)
-    scores, _, skipped, _ = iforest.score_grid(matrix, counts)
+    scores, skipped, _ = iforest.score_grid(matrix, counts)
     assert skipped == 0
     top = scores.sort("s", descending=True).head(1)
     assert top["entity"][0] == "a" and top["row"][0] == 100
@@ -377,7 +388,9 @@ def test_combined_top_mixes_types_and_entities(stage):
     ranked = an.sort_rows(rows, "overall")
     assert set(rows["type"]) <= set(ranked.head(20)["type"])  # no type is crowded out
     top = ranked.head(an.TABLE_ROWS)
-    assert top.group_by("kind", "entity").len()["len"].max() <= 0.25 * top.height
+    # the synthetic stage has 12 entities in its 23 rows: the plan's 10 % per entity (of 100 rows)
+    # is checked on the real cache (``tests/benchmark``); here no entity may have a fifth
+    assert top.group_by("kind", "entity").len()["len"].max() <= 0.2 * top.height
     assert an.DEFAULT_SORT == "overall"
 
 
@@ -754,7 +767,7 @@ def test_select_by_range_type_and_entity(stage):
     assert set(by_service.filter(pl.col("kind") == "service")["entity"]) == {"haproxy"}
     assert (by_service["kind"] == "host").any()  # the service filter leaves host rows alone
     by_host = an.select(rows, Filters(hosts=("nope",)), [])
-    assert (by_host["kind"] == "service").all()
+    assert (by_host["kind"] != "host").all()  # fleet rows are not restricted by a host filter
 
 
 def stamp(value):
@@ -821,6 +834,12 @@ def test_the_table_sorts_the_whole_selection_not_its_top_rows(stage, monkeypatch
     _, table, _ = an.draw_anomalies(stage, Filters(), [], "time", None)
     first = an.stamp(earliest)
     assert first in str(table)  # the earliest anomaly is shown, wherever it ranks by score
+
+
+def test_the_table_shows_min_of_the_default_rows_and_the_selection(stage):
+    rows = an.load_anomalies(stage)
+    _, table, _ = an.draw_anomalies(stage, Filters(), [], "score", None)
+    assert str(table).count("/explorer") == min(an.TABLE_ROWS, rows.height)
 
 
 def test_timeline_samples_every_type(monkeypatch):
