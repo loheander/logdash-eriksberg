@@ -42,7 +42,7 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
 | pca | 12 fits (group x window x scaling); about 4 s for a synthetic 230k-window x 281-template matrix at 3 % density (not yet measured on the real data) |
 | hosts | 3 s on the real data (162 hosts, 281 templates, 559 service x host pairs; one aggregate over `events` for the matrix) |
-| anomalies | 26 s (four detectors: PCA residual, 1,232 windows above the entity's level, 377 episodes kept; Isolation Forest per entity, 25 s, 1,405 windows flagged, 438 episodes; volume, 87 episodes; contextual, 496 windows above the threshold, 456 kept) |
+| anomalies | 26 s (six detectors: PCA residual, 1,232 windows above the entity's level, 377 episodes kept; Isolation Forest per entity, 25 s, 1,405 windows flagged, 438 episodes; volume, 87 episodes; contextual, 496 windows above the threshold, 456 kept; novel and rare templates, 15 and 166 rows, 0.03 s) |
 | total | 1 min 58 s (measured before the features, pca and anomalies stages existed) |
 
 `cache/` is 622 MB (281 templates from 73,583 unique masked lines).
@@ -184,6 +184,12 @@ follows the data (type filter, timeline, table, explorer links).
   still run, and the page names it. The page shows "kept N of M" per type.
 - The page links each row to `/explorer?[start=&end=&]service=|host=|request_id=[&template=]`
   (start and end only for kinds whose lines stay inside the window).
+
+`novel.py` has two detectors of type `novel` (kind `service`): `novel_template` (a template first seen in the
+last `LOGDASH_NOVEL_FRACTION` of the span, raw `-b * log2(1 - u)` bits with `b` its runs of active minutes (a gap over 10 minutes starts a new run) and `u` the
+position of its first line; threshold `log2(1 / fraction)`) and `rare_template` (a (template, minute, service)
+window of a template with at most `LOGDASH_RARE_THRESHOLD` events; raw `(threshold + 0.5) / count`, threshold 1).
+Real data: 15 novel rows (an operator episode at 22:03 to 22:10 and two at 23:54) and 166 rare ones.
 
 `structural_pca.py` and `structural_iforest.py` are the structural type (shared helpers in
 `detectors/_episodes.py`, which `load_builtin` skips). `spe / limit >= 1` is not usable on the real data (the

@@ -39,6 +39,12 @@ class Settings:
     rare_threshold: int = DEFAULT_RARE_THRESHOLD  # templates with at most this many events are rare
     novel_fraction: float = DEFAULT_NOVEL_FRACTION  # first seen in the last fraction of the span
 
+    def __post_init__(self) -> None:
+        if not 0 < self.novel_fraction < 1:
+            raise ValueError(
+                f"novel_fraction must be between 0 and 1 (exclusive), got {self.novel_fraction}"
+            )
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
         env = os.environ if env is None else env

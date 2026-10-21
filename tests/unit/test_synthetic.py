@@ -3,7 +3,15 @@ import io
 
 import zstandard
 
-from tests.synthetic import COLUMNS, SyntheticSpec, generate_rows, rows_to_csv, utc, write_dataset
+from tests.synthetic import (
+    COLUMNS,
+    HOSTS,
+    SyntheticSpec,
+    generate_rows,
+    rows_to_csv,
+    utc,
+    write_dataset,
+)
 
 
 def _read(path):
@@ -52,5 +60,7 @@ def test_anomalies_injected(synthetic):
     assert novel and min(r["@timestamp"] for r in novel) >= truth.novel_first_seen.strftime(
         "%Y-%m-%dT%H:%M:%S"
     )
+    rare = [r for r in rows if r["Payload"].startswith("Watchdog rebooted")]
+    assert len(rare) == 2 and {r["Hostname"] for r in rare} == {HOSTS[3]}
     by_req = [r for r in rows if r["request_id"] == truth.out_of_order_request_ids[0]]
     assert len(by_req) == 4
