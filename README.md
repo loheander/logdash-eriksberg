@@ -38,7 +38,8 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | Stage | Time |
 |---|---|
 | events (normalised, hour-partitioned Parquet) | 97 s |
-| overview, distributions, temporal, templates, explorer | under 8 s each |
+| overview, distributions, temporal, templates, explorer | under 8 s each (measured before the templates stage also wrote the per-host counts) |
+| features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
 | total | 1 min 58 s |
 
 `cache/` is 622 MB (281 templates from 73,583 unique masked lines).
@@ -51,10 +52,11 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | Distributions | level, program, host, logger, module, tenant, payload length, lines per request, request duration, inter-arrival times; linear/log |
 | Temporal | event rate (1 s to 5 min bins by zoom), host x time heatmap, autocorrelation and periodogram, bursts and gaps; drag on the rate chart to set the global time range |
 | Templates | Drain3 templates: top, volume over time, parameter distributions, rare and novel lists |
+| Features | window x template count matrix (1, 5, 15 min; per service or host; log1p or TF-IDF): template correlation heatmap, template-entity association, variance ranking, mutual information |
 | Explorer | paged grid over raw events with filters, template, request id and text search; other pages link here |
 
 Global filters (date range, level, service, host) live in the sidebar. The time
-range is respected by Temporal, Templates and Explorer; the other pages state which
+range is respected by Temporal, Templates, Features and Explorer; the other pages state which
 filters they honour.
 
 Screenshots (`docs/screenshots/`):
