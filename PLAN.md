@@ -348,6 +348,25 @@ Status: **Phase 1 done** (steps 1 to 9).
   87 episodes of 42 entities (426 before merging; 91 spikes before the full-hour baseline rule
   removed 4 start-up artefacts), no drops or gaps, 0.4 s. Framework score normalisation is
   unchanged: 2 of the top 100 anomalies are volume.
+- Module 7 (hosts and services, issue 10) done: `analyses/hosts.py` from `templates/template_counts_host.parquet`
+  and one aggregate over `events` (service x host lines). A host's profile is its template mix over the whole
+  span, compared as `sqrt(share)` (Hellinger). k-means (fixed seed) chooses k in 2..10 by silhouette among the k
+  where every cluster keeps at least 3 hosts (without that rule silhouette isolates a lone odd host in a cluster
+  of its own, where it has no peers and no score); Ward linkage on the same vectors gives the dendrogram. Outlier
+  hosts have a robust z-score (median and MAD of the distances to the centroid within the cluster, scale floored at 10 %
+  of the median) above 3.5, with the three most deviating templates as evidence. Stored for the contextual
+  detector (issue 5): `hosts.parquet` (`cluster`, `distance`, `z`, `outlier` per host), `clusters.parquet`
+  (distance statistics), `centroids.parquet` (long, `root` in the clustering space and `share`),
+  `deviations.parquet`, `linkage.parquet`, `service_host.parquet`, `fit.json`; accessors `load_assignments`,
+  `load_clusters`, `load_centroids` and `centroid_distance` (sparse window counts against a centroid without
+  densifying). The page reads these files only: silhouette per k, a 2D projection, cluster and outlier tables,
+  a tall scrolling dendrogram (every host named, markers by cluster, dashed cut) or one collapsed to the cut
+  clusters, and the service x host heatmap in dendrogram order (events on a log scale or share of the host's
+  lines). Whole span only (time and level filters do not apply; the host filter selects rows and the service
+  filter columns). Real data: 162 hosts, k = 7 (silhouette 0.87), clusters of 122, 18, 9, 4, 3, 3 and 3 hosts, the
+  k-means and Ward cuts agree (ARI 1.0), 32 outlier hosts of which 28 form a tight second mode of the 122-host
+  cluster (about 0.085 from its centroid, against a median of 0.022), so the flag is relative to the
+  cluster centroid rather than a statement about single faulty hosts; stage 3 s, page callbacks at most 91 ms.
 
 ## 9. Open decisions
 

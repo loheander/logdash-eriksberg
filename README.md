@@ -41,6 +41,7 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | overview, distributions, temporal, templates, explorer | under 8 s each (measured before the templates stage also wrote the per-host counts) |
 | features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
 | pca | 12 fits (group x window x scaling); about 4 s for a synthetic 230k-window x 281-template matrix at 3 % density (not yet measured on the real data) |
+| hosts | 3 s on the real data (162 hosts, 281 templates, 559 service x host pairs; one aggregate over `events` for the matrix) |
 | anomalies | 0.5 s (two detectors: PCA residual, 73,421 windows above the limit, 11,446 kept: at most 100 per service or host; volume, 87 episodes) |
 | total | 1 min 58 s (measured before the features, pca and anomalies stages existed) |
 
@@ -57,10 +58,11 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | Features | window x template count matrix (1, 5, 15 min; per service or host; log1p or TF-IDF): template correlation heatmap, template-entity association, variance ranking, mutual information |
 | PCA | PCA of the window x template matrix (precomputed per grouping, window and scaling): scree plot, 2D and 3D projections coloured by time, service or host, or SPE; loadings per component; residual SPE per window against its control limit, and the windows above it with their top residual templates |
 | Anomalies | every registered detector's anomalies: score timeline coloured by type, per-type filter, table sortable (the whole selection) by score, time, type or entity, "N of M kept" per type, with a link per row to the raw lines of its window in the explorer |
+| Hosts | host profiles (template mix per host): silhouette for k-means, 2D projection, cluster table, outlier hosts with the templates that deviate, Ward dendrogram (every host, or collapsed to the clusters) and the service x host matrix in dendrogram order |
 | Explorer | paged grid over raw events with filters, template, request id and text search; other pages link here |
 
 Global filters (date range, level, service, host) live in the sidebar. The time
-range is respected by Temporal, Templates, Features, PCA, Anomalies and Explorer; the other pages state which
+range is respected by Temporal, Templates, Features, PCA, Anomalies and Explorer; Hosts uses the whole span (its host and service filters select rows and columns); the other pages state which
 filters they honour.
 
 Screenshots (`docs/screenshots/`):
@@ -81,6 +83,28 @@ limit (Gaussian theory at 99.9 %: a reference line, not a false-alarm rate), and
 Downstream modules read them with `pca.load_spe(store, group, window_s, scaling)`
 (`row, bin, entity, spe, limit, ratio`; rank by `ratio = spe / limit` rather than the flag) and `pca.load_residuals(...)`
 (`row, rank, template_id, residual, share`); `row` is the row of the features index.
+
+## Host clusters
+
+The `hosts` stage (module 7) clusters hosts on their template mix over the whole span and stores
+the result for the contextual detector. A host's profile is `h = sqrt(share)` of its template
+counts (Hellinger space); k-means picks `k` (2 to 10) by silhouette among the `k` where every cluster has at
+least 3 hosts, so that a lone odd host is scored against peers; Ward linkage on the same profiles gives the dendrogram. Files in `cache/hosts/`:
+
+| File | Content |
+|---|---|
+| `hosts.parquet` | `row, host, events, cluster, hier_cluster, distance, z, outlier, leaf, x, y`: `cluster` is the k-means peer group (1 is the largest), `distance` the Euclidean distance of `h` to the cluster centroid, `z` the robust z-score of that distance in the cluster, `outlier` is `z > 3.5` |
+| `clusters.parquet` | `cluster, n_hosts, median_distance, scale, max_distance, outliers`; `z = (distance - median_distance) / scale` |
+| `centroids.parquet` | long, `cluster, template_id, share, root`: `root` is the centroid in `h` space, `share` the mean template share |
+| `deviations.parquet` | `row, host, rank, template_id, delta, share`: the three templates that contribute most to a host's squared distance |
+| `linkage.parquet`, `service_host.parquet`, `fit.json` | Ward linkage matrix, lines per host and service, chosen `k` with the silhouette per `k`, template ids |
+
+Read them with `hosts.load_assignments(store)`, `hosts.load_clusters(store)` and
+`hosts.load_centroids(store, template_ids=None, column="root")` (cluster ids and a `k x templates` matrix whose columns follow
+the template ids you pass). To score a host window against its peers, give the window's counts
+(dense or sparse, one row per window, same template columns) and the centroid row of the host's cluster
+to `hosts.centroid_distance(counts, clusters, centroids)`; windows are much noisier than a
+whole-span profile, so threshold them on their own distribution rather than on `clusters.parquet`.
 
 ## Adding an anomaly detector
 
