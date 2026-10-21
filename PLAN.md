@@ -98,10 +98,10 @@ Every analysis implements one interface and registers itself:
 
 ```python
 class Analysis(Protocol):
-    key: str                    # "temporal"; also the cache subdirectory and URL path
-    title: str                  # nav label
-    version: str                # bump to invalidate this module's cache
-    depends_on: tuple[str, ...] # upstream analyses (e.g. pca depends on features)
+    key: str  # "temporal"; also the cache subdirectory and URL path
+    title: str  # nav label
+    version: str  # bump to invalidate this module's cache
+    depends_on: tuple[str, ...]  # upstream analyses (e.g. pca depends on features)
 
     def compute(self, ctx: ComputeContext) -> None: ...
     def layout(self, store: CacheStore) -> Component: ...

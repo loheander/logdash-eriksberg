@@ -1,2 +1,12 @@
 data/
 cache/
+.venv/
+__pycache__/
+*.pyc
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+*.egg-info/
