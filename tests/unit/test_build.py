@@ -38,8 +38,6 @@ def test_cli_build_status_serve(synthetic, cache_dir, capsys):
         assert "stale" in capsys.readouterr().out
     finally:
         (synthetic.data_dir / "other.csv.zst").unlink()
-    assert main(["serve"]) == 1
-    assert "not implemented yet" in capsys.readouterr().out
 
 
 def test_cli_without_command_prints_help(capsys):

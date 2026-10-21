@@ -10,6 +10,7 @@ from logdash import __version__
 from logdash.analyses import load_builtin
 from logdash.analyses.base import REGISTRY, RegistryError
 from logdash.build import run_build, stage_statuses
+from logdash.cache.store import CacheStore
 from logdash.config import Settings
 
 
@@ -39,6 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
     _common(serve)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8050)
+    serve.add_argument("--debug", action="store_true", help="Dash debug mode with reloader")
+    serve.add_argument("--no-build", action="store_true", help="do not build stale stages first")
     return parser
 
 
@@ -72,8 +75,24 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    print("serve: not implemented yet")
-    return 1
+    from logdash.app.main import create_app  # Dash is only needed to serve
+
+    load_builtin()
+    settings = _settings(args)
+    if not args.no_build:
+        try:
+            run_build(settings)
+        except RegistryError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    store = CacheStore(settings.cache_dir, settings)
+    try:
+        app = create_app(store)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    app.run(host=args.host, port=args.port, debug=args.debug)
+    return 0
 
 
 COMMANDS = {"build": cmd_build, "status": cmd_status, "serve": cmd_serve}
