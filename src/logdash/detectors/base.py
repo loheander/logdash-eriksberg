@@ -10,18 +10,23 @@ page nor the framework: create the module, decorate the class with ``@register``
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from dataclasses import dataclass, fields
+from typing import NamedTuple, Protocol, runtime_checkable
 
 import polars as pl
 
+from logdash.analyses.explorer import LINK_KEYS
+from logdash.app.filters import Filters
 from logdash.cache.store import CacheStore
 from logdash.config import Settings
+
+# Bump when the score formula, the columns or the caps' meaning change; part of the stage version.
+FRAMEWORK_VERSION = "3"
 
 Schema = dict[str, pl.DataType | type[pl.DataType]]
 
 # Columns a detector returns. ``raw`` is the detector's own score (larger is more anomalous),
-# ``kind`` says what ``entity`` is (``service``, ``host`` or ``request``) and ``template_id``
+# ``kind`` says what ``entity`` is (one of ``KINDS``) and ``template_id``
 # is optional (null when the row is not about one template). The framework adds ``detector``,
 # ``type`` and the normalised ``score``.
 REQUIRED: Schema = {
@@ -51,6 +56,43 @@ ANOMALY_SCHEMA: Schema = {
 
 
 @dataclass(frozen=True)
+class EntityKind:
+    """What a page needs to know about one kind of entity; declared once with ``declare_kind``.
+
+    ``link_param`` is the explorer query key the entity goes into (None: the explorer cannot
+    filter on it). ``filter_field`` is the ``Filters`` attribute whose values restrict rows of
+    this kind (None: the global filters do not apply). ``link_window`` says whether the explorer
+    link is limited to the anomaly's window; it is not for a kind whose lines span other times
+    (a request).
+    """
+
+    name: str
+    link_param: str | None = None
+    filter_field: str | None = None
+    link_window: bool = True
+
+
+KINDS: dict[str, EntityKind] = {}
+
+
+def declare_kind(
+    name: str,
+    link_param: str | None = None,
+    filter_field: str | None = None,
+    link_window: bool = True,
+) -> EntityKind:
+    """Declare an entity kind (the only place a new kind needs to be added); validated."""
+    if name in KINDS:
+        raise DetectorError(f"entity kind {name!r} already declared")
+    if link_param is not None and link_param not in LINK_KEYS:
+        raise DetectorError(f"kind {name!r}: the explorer has no {link_param!r} parameter")
+    if filter_field is not None and filter_field not in {f.name for f in fields(Filters)}:
+        raise DetectorError(f"kind {name!r}: Filters has no {filter_field!r} field")
+    KINDS[name] = EntityKind(name, link_param, filter_field, link_window)
+    return KINDS[name]
+
+
+@dataclass(frozen=True)
 class DetectContext:
     """What ``Detector.detect`` gets: the cache (read the upstream stages through it)."""
 
@@ -63,7 +105,13 @@ class DetectContext:
 class Detector(Protocol):
     """One anomaly detector; ``detect`` returns rows with the columns of ``DETECTED_SCHEMA``.
 
-    A detector may also have ``setting_names``, the settings that enter the cache fingerprint.
+    ``detect`` must return every row it considers anomalous: do not sort and cut before returning
+    (the framework caps per entity and keeps the counts; a NaN sorts as the largest value in
+    polars and would take a slot). Rows with a null or NaN ``raw``, or ``raw`` below the
+    threshold, are dropped; ``+inf`` counts as far above the threshold.
+
+    ``setting_names`` lists the settings that enter the cache fingerprint (``()`` if none). A
+    detector whose threshold depends on settings may also define ``threshold_for(settings)``.
     """
 
     key: str  # value of the ``detector`` column
@@ -72,12 +120,13 @@ class Detector(Protocol):
     version: str  # bump to invalidate the anomaly cache
     depends_on: tuple[str, ...]  # analyses whose cache ``detect`` reads
     threshold: float  # raw score at which a row counts as anomalous (> 0)
+    setting_names: tuple[str, ...]
 
     def detect(self, ctx: DetectContext) -> pl.DataFrame: ...
 
 
 class DetectorError(Exception):
-    """A detector is registered twice or returned a malformed frame."""
+    """A detector is registered twice, is malformed or returned a malformed frame."""
 
 
 class DetectorRegistry:
@@ -93,6 +142,8 @@ class DetectorRegistry:
         return key in self._items
 
     def add(self, detector: Detector) -> Detector:
+        if not isinstance(detector, Detector):
+            raise DetectorError(f"{detector!r} does not implement the Detector protocol")
         if detector.key in self._items:
             raise DetectorError(f"detector {detector.key!r} already registered")
         if not detector.threshold > 0:
@@ -121,48 +172,102 @@ DETECTORS = DetectorRegistry()
 
 
 def register[T](cls: type[T]) -> type[T]:
-    """Class decorator: instantiate the detector and add it to the global registry."""
+    """Class decorator: instantiate the detector (no arguments) and add it to the registry.
+
+    The registry checks the instance against the ``Detector`` protocol. Modules in ``detectors/``
+    are imported by ``load_builtin`` when ``analyses.anomalies`` is imported.
+    """
     DETECTORS.add(cls())  # type: ignore[arg-type]
     return cls
 
 
-def normalise(raw: pl.Expr | pl.Series, threshold: float) -> pl.Expr | pl.Series:
-    """Map raw scores to ``[0.5, 1]``: ``1 - threshold / (2 raw)``.
+def threshold_of(detector: Detector, settings: Settings) -> float:
+    """The detector's threshold for a run: ``threshold_for(settings)`` if it has one."""
+    method = getattr(detector, "threshold_for", None)
+    return float(method(settings)) if method is not None else detector.threshold
 
-    A row exactly at its detector's threshold scores 0.5; twice the threshold 0.75; the score
-    approaches 1 as the raw score grows, so the scale reads as "multiples of the detector's own
-    threshold" and stays comparable across detectors whose raw units differ. Callers pass raw
-    scores at or above the threshold.
+
+# A row's score blends where it ranks among the detector's rows of its kind with how far above
+# the threshold it is, relative to that kind's strong rows; see ``score_columns``.
+LOG_CAP = 10.0  # octaves above the threshold (a factor of 1024) beyond which raw is clipped
+SCALE_QUANTILE = 0.99  # the kind's rows at this quantile of the excess get full magnitude
+
+
+def score_columns(threshold: float) -> list[pl.Expr]:
+    """Expressions for ``score`` in ``[0, 1]``: ``0.5 * percentile + 0.5 * magnitude``.
+
+    ``percentile`` is the row's rank among the rows of the same detector and kind (ties share
+    the average rank), so a detector's units and tail behaviour do not matter and no kind
+    crowds out another. ``magnitude`` is the log-scale excess ``log2(raw / threshold)``, with
+    ``raw`` clipped to ``2 ** LOG_CAP`` times the threshold (so ``+inf`` is finite), divided by
+    the excess at the ``SCALE_QUANTILE`` of the same kind (at least one octave) and clipped to
+    ``[0, 1]``. Scaling per kind keeps a grouping with a heavier tail (host SPE ratios reach
+    thousands, service ratios tens) from filling the top of the ranking. The score keeps its
+    spread, orders rows within a detector and kind, and across them compares positions in each
+    one's ranking and excess; it is not a probability.
     """
-    return 1 - threshold / (2 * raw)
+    percentile = pl.col("raw").rank("average").over("kind") / pl.len().over("kind")
+    octaves = (pl.col("raw") / threshold).clip(1.0, 2.0**LOG_CAP).log(2)
+    scale = octaves.quantile(SCALE_QUANTILE).over("kind").clip(lower_bound=1.0)
+    magnitude = (octaves / scale).clip(0.0, 1.0)
+    return [(0.5 * percentile + 0.5 * magnitude).alias("score")]
 
 
-def finish(detector: Detector, found: pl.DataFrame, max_rows: int) -> pl.DataFrame:
+class Finished(NamedTuple):
+    """Result of ``finish``: the kept rows and how many rows reached the threshold."""
+
+    rows: pl.DataFrame
+    above_threshold: int
+
+
+def finish(
+    detector: Detector,
+    found: pl.DataFrame,
+    max_rows: int,
+    max_per_entity: int | None = None,
+    threshold: float | None = None,
+) -> Finished:
     """Validate a detector's rows, drop those below its threshold and add the common columns.
 
-    Keeps the ``max_rows`` highest-scoring rows, sorted by score (descending), then time.
+    The score is computed over every row at or above the threshold. Then at most
+    ``max_per_entity`` highest-scoring rows are kept per (kind, entity), so that a sustained
+    incident on a few entities does not hide an isolated anomaly on a quiet one, and finally the
+    ``max_rows`` highest overall; rows are sorted by score (descending), then time.
     """
     missing = set(REQUIRED) - set(found.columns)
     if missing:
         raise DetectorError(f"detector {detector.key!r} did not return {sorted(missing)}")
+    limit = detector.threshold if threshold is None else threshold
     if "template_id" not in found.columns:
         found = found.with_columns(pl.lit(None, dtype=pl.Int64).alias("template_id"))
+    typed = found.select(*DETECTED_SCHEMA).cast(pl.Schema(DETECTED_SCHEMA))
+    unknown = sorted(set(typed["kind"].drop_nulls()) - set(KINDS))
+    if unknown or typed["kind"].null_count():
+        raise DetectorError(
+            f"detector {detector.key!r} returned entity kind {unknown or 'null'}; declared "
+            f"kinds are {sorted(KINDS)} (add one with declare_kind in detectors/base.py)"
+        )
     rows = (
-        found.select(*DETECTED_SCHEMA)
-        .cast(pl.Schema(DETECTED_SCHEMA))
-        .filter(pl.col("raw").is_not_null() & ~pl.col("raw").is_nan())
-        .filter(pl.col("raw") >= detector.threshold)
+        typed.filter(pl.col("raw").is_not_null() & ~pl.col("raw").is_nan())
+        .filter(pl.col("raw") >= limit)
         .with_columns(
             pl.lit(detector.key).alias("detector"),
             pl.lit(detector.type).alias("type"),
-            normalise(pl.col("raw"), detector.threshold).alias("score"),
+            *score_columns(limit),
         )
         .sort(["score", "bin"], descending=[True, False])
-        .head(max_rows)
     )
-    return rows.select(*ANOMALY_SCHEMA)
+    above = rows.height
+    if max_per_entity is not None:
+        rows = rows.filter(pl.int_range(pl.len()).over("kind", "entity") < max_per_entity)
+    return Finished(rows.head(max_rows).select(*ANOMALY_SCHEMA), above)
 
 
 def empty() -> pl.DataFrame:
     """A frame with the columns of ``anomalies.parquet`` and no rows."""
     return pl.DataFrame(schema=ANOMALY_SCHEMA)
+
+
+declare_kind("service", link_param="service", filter_field="services")
+declare_kind("host", link_param="host", filter_field="hosts")
+declare_kind("request", link_param="request_id", link_window=False)

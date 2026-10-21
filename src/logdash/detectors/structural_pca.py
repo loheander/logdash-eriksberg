@@ -4,9 +4,10 @@ This is the PCA half of the *structural* type of ``PLAN.md`` module 6; the Isola
 belongs in a sibling module with ``type = "structural"`` (issue 6), so both share one type in
 the page. It reads ``pca.load_spe`` and ``pca.load_residuals`` of the per-service and per-host
 1-minute log1p fits and flags windows with ``ratio = spe / limit`` of at least ``THRESHOLD``.
-The limit is Gaussian theory on heavy-tailed counts, so many windows exceed it; the score keeps
-the ranking (``ratio`` is the raw score) and only the highest ``MAX_PER_GRID`` windows per
-grouping are kept. The evidence names the templates that contribute most to the window's
+The limit is Gaussian theory on heavy-tailed counts, so many windows exceed it. All of them are
+returned (``ratio`` is the raw score); the framework ranks them per kind and keeps the highest
+few per service or host, so a sustained incident does not hide an isolated one.
+The evidence names the templates that contribute most to the window's
 residual.
 """
 
@@ -22,7 +23,6 @@ from logdash.detectors.base import DetectContext, register
 WINDOW_S = 60
 SCALING = "log1p"
 THRESHOLD = 1.0  # SPE at the control limit
-MAX_PER_GRID = 5000  # highest ratios kept per grouping, so that neither crowds out the other
 TEXT_CHARS = 50
 GRIDS = (("service", "service"), ("host", "host"))  # (PCA grouping, entity kind)
 
@@ -67,7 +67,8 @@ class StructuralPca:
     key = "structural_pca"
     type = "structural"
     title = "PCA residual (SPE)"
-    version = "1"
+    version = f"1:{WINDOW_S}:{SCALING}:{THRESHOLD}"  # module constants change the output
+    setting_names: tuple[str, ...] = ()
     depends_on: tuple[str, ...] = ("pca", "templates")
     threshold = THRESHOLD
 
@@ -76,11 +77,8 @@ class StructuralPca:
         for group, kind in GRIDS:
             spe = pca.load_spe(ctx.store, group, WINDOW_S, SCALING)
             flagged = spe.filter(pl.col("ratio") >= THRESHOLD)
-            total = flagged.height
-            flagged = flagged.sort("ratio", descending=True).head(MAX_PER_GRID)
             ctx.log(
-                f"structural_pca: {group}: {total} of {spe.height} windows above the limit, "
-                f"keeping {flagged.height}"
+                f"structural_pca: {group}: {flagged.height} of {spe.height} windows above limit"
             )
             parts.append(
                 flagged.join(evidence(ctx.store, flagged, group), on="row")

@@ -3,9 +3,10 @@
 Build time runs every registered detector (``logdash/detectors/``) and writes one combined
 ``anomalies.parquet`` (columns in ``detectors.base.ANOMALY_SCHEMA``: ``detector, type, bin,
 window_s, kind, entity, template_id, raw, score, evidence``) plus ``meta.json`` with one entry
-per detector. Scores are normalised per detector to ``[0.5, 1]`` (``1 - threshold / (2 raw)``),
-so 0.5 means "at the detector's own threshold" and the types can be ranked together. At most
-``MAX_PER_DETECTOR`` rows are kept per detector, the highest scoring ones.
+per detector (rows above the threshold, rows kept, rows dropped, or the error of a detector that
+failed and was skipped). The score in ``[0, 1]`` blends a row's rank among the detector's rows of
+its kind with its log-scaled excess over the threshold (``detectors.base.score_columns``). At most
+``MAX_PER_ENTITY`` rows are kept per service or host, then ``MAX_PER_DETECTOR`` per detector.
 
 The page reads that table only. The analysis depends on, and is invalidated by, whatever the
 registered detectors depend on and their versions, so a new detector module changes neither this
@@ -35,21 +36,25 @@ from logdash.detectors import load_builtin
 from logdash.detectors.base import (
     ANOMALY_SCHEMA,
     DETECTORS,
+    FRAMEWORK_VERSION,
+    KINDS,
     DetectContext,
     DetectorRegistry,
+    EntityKind,
     empty,
     finish,
+    threshold_of,
 )
 
 KEY = "anomalies"
 FILE = "anomalies.parquet"
+MAX_PER_ENTITY = 100  # highest windows kept per service or host
 MAX_PER_DETECTOR = 20_000
-MAX_POINTS = 3000  # timeline points: the highest scores of the selection
+MAX_POINTS = 3000  # timeline points, shared between the types: the highest scores of each
 TABLE_ROWS = 100
 TEXT_CHARS = 110
 SORTS = {"score": "score", "time": "time", "type": "type", "entity": "entity"}
 DEFAULT_SORT = "score"
-LINK_PARAM = {"service": "service", "host": "host", "request": "request_id"}  # kind: explorer key
 SORT_COLUMNS = {
     "score": (["score", "bin"], [True, False]),
     "time": (["bin", "score"], [False, True]),
@@ -66,25 +71,41 @@ load_builtin()  # import the detector modules so that they register
 def run_detectors(
     registry: DetectorRegistry, ctx: DetectContext
 ) -> tuple[pl.DataFrame, list[dict[str, Any]]]:
-    """Combined rows of every detector and one meta entry (rows, seconds) per detector."""
+    """Combined rows of every detector and one meta entry per detector.
+
+    A detector that raises is logged, skipped and recorded in its meta entry (``error``); the
+    others still run, so one broken detector does not discard the stage.
+    """
     parts = [empty()]
     info = []
     for detector in registry.all():
         started = time.perf_counter()
-        rows = finish(detector, detector.detect(ctx), MAX_PER_DETECTOR)
+        entry: dict[str, Any] = {
+            "key": detector.key,
+            "type": detector.type,
+            "title": detector.title,
+        }
+        try:
+            threshold = threshold_of(detector, ctx.settings)
+            rows, above = finish(
+                detector, detector.detect(ctx), MAX_PER_DETECTOR, MAX_PER_ENTITY, threshold
+            )
+        except Exception as error:  # noqa: BLE001 - any failure of a plug-in is isolated
+            message = f"{type(error).__name__}: {error}"
+            ctx.log(f"detector {detector.key!r} failed and was skipped: {message}")
+            threshold, rows, above = detector.threshold, empty(), 0
+            entry["error"] = message
         seconds = time.perf_counter() - started
-        ctx.log(f"{detector.key}: {rows.height} anomalies in {seconds:.1f}s")
+        ctx.log(f"{detector.key}: kept {rows.height} of {above} anomalies in {seconds:.1f}s")
         parts.append(rows)
-        info.append(
-            {
-                "key": detector.key,
-                "type": detector.type,
-                "title": detector.title,
-                "threshold": detector.threshold,
-                "rows": rows.height,
-                "seconds": round(seconds, 3),
-            }
-        )
+        entry |= {
+            "threshold": threshold,
+            "above_threshold": above,
+            "rows": rows.height,
+            "dropped": above - rows.height,
+            "seconds": round(seconds, 3),
+        }
+        info.append(entry)
     combined = pl.concat(parts).sort(["score", "bin"], descending=[True, False])
     return combined, info
 
@@ -106,32 +127,46 @@ def load_anomalies(store: CacheStore) -> pl.DataFrame:
     return _FRAMES.get(key, lambda: pl.read_parquet(path))
 
 
+def load_meta(store: CacheStore) -> list[dict[str, Any]]:
+    """Per-detector meta entries of the built stage (empty if not built)."""
+    if not store.exists(KEY, "meta.json"):
+        return []
+    return list(store.read_json(KEY, "meta.json")["detectors"])
+
+
 def load_types(store: CacheStore) -> list[str]:
     """Anomaly types of the built table in detector order (the registry's if not built)."""
-    if not store.exists(KEY, "meta.json"):
-        return DETECTORS.types()
-    return list(dict.fromkeys(d["type"] for d in store.read_json(KEY, "meta.json")["detectors"]))
+    meta = load_meta(store)
+    return list(dict.fromkeys(d["type"] for d in meta)) if meta else DETECTORS.types()
 
 
 # ------------------------------------------------------------------------ pure helpers
 
 
-def select(frame: pl.DataFrame, filters: Filters, types: list[str]) -> pl.DataFrame:
-    """Rows in the filter's time range, of the chosen types (all if none) and entities.
+def filter_values(filters: Filters, kind: EntityKind) -> tuple[str, ...]:
+    """The values of the global filter that restricts rows of this kind (empty: none)."""
+    return getattr(filters, kind.filter_field) if kind.filter_field else ()
 
-    The service filter applies to service rows and the host filter to host rows; other kinds
-    (such as requests) are not restricted by them.
+
+def select(frame: pl.DataFrame, filters: Filters, types: list[str]) -> pl.DataFrame:
+    """Rows whose window overlaps the filter's time range, of the chosen types (all if none).
+
+    The service and host filters restrict the kinds that declare them (``KINDS``: service and
+    host rows); rows of other kinds (such as requests) are not restricted by them.
     """
     lo, hi = parse_time(filters.start), parse_time(filters.end)
     if lo is not None:
-        frame = frame.filter(pl.col("bin") >= lo)
+        frame = frame.filter(pl.col("bin") + pl.duration(seconds=pl.col("window_s")) > lo)
     if hi is not None:
         frame = frame.filter(pl.col("bin") < hi)
     if types:
         frame = frame.filter(pl.col("type").is_in(types))
-    for kind, values in (("service", filters.services), ("host", filters.hosts)):
+    for kind in KINDS.values():
+        values = filter_values(filters, kind)
         if values:
-            frame = frame.filter((pl.col("kind") != kind) | pl.col("entity").is_in(list(values)))
+            frame = frame.filter(
+                (pl.col("kind") != kind.name) | pl.col("entity").is_in(list(values))
+            )
     return frame
 
 
@@ -147,13 +182,14 @@ def stamp(value: datetime) -> str:
 def explorer_url(
     bin_: datetime, window_s: int, kind: str, entity: str, template_id: int | None
 ) -> str:
-    """Explorer link for one anomaly: its window, its entity and its template if it has one."""
-    params: dict[str, object] = {
-        "start": stamp(bin_),
-        "end": stamp(bin_ + timedelta(seconds=window_s)),
-    }
-    if kind in LINK_PARAM:
-        params[LINK_PARAM[kind]] = entity
+    """Explorer link for one anomaly: its entity, its template if it has one and, for a kind
+    whose lines stay inside the window, the window (a request's lines may fall outside it)."""
+    declared = KINDS.get(kind) or EntityKind(kind)  # an undeclared kind: window only
+    params: dict[str, object] = {}
+    if declared.link_window:
+        params = {"start": stamp(bin_), "end": stamp(bin_ + timedelta(seconds=window_s))}
+    if declared.link_param:
+        params[declared.link_param] = entity
     if template_id is not None:
         params["template"] = template_id
     return page_url("/explorer", **params)
@@ -196,15 +232,19 @@ def hover(rows: pl.DataFrame) -> list[str]:
 
 
 def timeline_figure(rows: pl.DataFrame, types: list[str], scheme: str | None) -> go.Figure:
-    """Score against time, one trace per type; the highest scores when there are many."""
+    """Score against time, one trace per type; the highest scores of each type when many."""
     if rows.is_empty():
         return figures.empty_figure("no anomalies in the selection", scheme)
-    shown = rows.head(MAX_POINTS)  # rows arrive sorted by descending score
+    present = [t for t in types if (rows["type"] == t).any()]
+    per_type = MAX_POINTS // max(1, len(present))  # no type crowds out the others
+    shown = 0
     fig = go.Figure()
     for i, kind in enumerate(types):
-        part = shown.filter(pl.col("type") == kind)
+        # rows arrive sorted by descending score
+        part = rows.filter(pl.col("type") == kind).head(per_type)
         if part.is_empty():
             continue
+        shown += part.height
         fig.add_trace(
             go.Scattergl(
                 x=part["bin"].to_list(),
@@ -216,9 +256,11 @@ def timeline_figure(rows: pl.DataFrame, types: list[str], scheme: str | None) ->
                 hovertemplate="%{text}<extra></extra>",
             )
         )
-    fig.update_yaxes(title="score (0.5 = detector threshold)", range=[0.48, 1.02])
-    if shown.height < rows.height:
-        figures.add_note(fig, f"{shown.height:,} highest of {rows.height:,} anomalies")
+    fig.update_yaxes(title="score", range=[-0.02, 1.02])
+    if shown < rows.height:
+        figures.add_note(
+            fig, f"{shown:,} of {rows.height:,} anomalies: the highest {per_type:,} of each type"
+        )
     return figures.style(fig, scheme, height=380)
 
 
@@ -239,16 +281,49 @@ def draw_anomalies(
     known = load_types(store)
     fig = timeline_figure(rows, known, scheme)
     if rows.is_empty():
-        return fig, dmc.Text("no anomalies in the selection"), hint(filters, 0)
-    table, hrefs = table_rows(sort_rows(rows.head(TABLE_ROWS), sort))
-    return fig, ui.link_table(table, hrefs, max_rows=TABLE_ROWS), hint(filters, rows.height)
+        return (
+            fig,
+            dmc.Text("no anomalies in the selection"),
+            hint(filters, 0, sort, load_meta(store)),
+        )
+    ordered = rows if sort == DEFAULT_SORT else sort_rows(rows, sort)  # sort the whole selection
+    table, hrefs = table_rows(ordered.head(TABLE_ROWS))
+    shown = ui.link_table(table, hrefs, max_rows=TABLE_ROWS)
+    return fig, shown, hint(filters, rows.height, sort, load_meta(store))
 
 
-def hint(filters: Filters, count: int) -> str:
-    text = f"{count:,} anomalies in the selection; the table shows the {TABLE_ROWS} highest."
+def kept_text(meta: list[dict[str, Any]]) -> str:
+    """'N of M kept' per type, and the detectors that failed."""
+    kept: dict[str, list[int]] = {}
+    for entry in meta:
+        counts = kept.setdefault(entry["type"], [0, 0])
+        counts[0] += entry.get("rows", 0)
+        counts[1] += entry.get("above_threshold", 0)
+    text = (
+        "Kept "
+        + "; ".join(f"{k:,} of {m:,} {t}" for t, (k, m) in kept.items())
+        + (f" windows above threshold (at most {MAX_PER_ENTITY} per service or host).")
+    )
+    failed = [f"{e['key']} ({e['error']})" for e in meta if e.get("error")]
+    return text + (" Failed and skipped: " + "; ".join(failed) + "." if failed else "")
+
+
+def hint(
+    filters: Filters, count: int, sort: str = DEFAULT_SORT, meta: list[dict[str, Any]] | None = None
+) -> str:
+    text = (
+        f"{count:,} anomalies in the selection; the table shows the first {TABLE_ROWS} by {sort}."
+    )
+    applied = [
+        f"{k.filter_field} filter applies to {k.name} rows only"
+        for k in KINDS.values()
+        if filter_values(filters, k)
+    ]
+    if applied:
+        text += " The " + "; the ".join(applied) + "; other kinds stay in the view."
     if filters.levels:
         text += " The level filter does not apply here."
-    return text
+    return text + (" " + kept_text(meta) if meta else "")
 
 
 def sort_value(value: str | None) -> str:
@@ -274,7 +349,9 @@ class Anomalies:
 
     @property
     def version(self) -> str:
-        return "1:" + ",".join(f"{d.key}={d.version}" for d in self.detectors.all())
+        caps = f"{MAX_PER_ENTITY}:{MAX_PER_DETECTOR}"
+        detectors = ",".join(f"{d.key}={d.version}" for d in self.detectors.all())
+        return f"{FRAMEWORK_VERSION}:{caps}:{detectors}"
 
     @property
     def setting_names(self) -> tuple[str, ...]:
@@ -286,7 +363,13 @@ class Anomalies:
         rows, info = run_detectors(self.detectors, DetectContext(store, ctx.settings, ctx.progress))
         store.write_parquet(KEY, FILE, rows.cast(pl.Schema(ANOMALY_SCHEMA)))
         store.write_json(
-            KEY, "meta.json", {"detectors": info, "max_per_detector": MAX_PER_DETECTOR}
+            KEY,
+            "meta.json",
+            {
+                "detectors": info,
+                "max_per_entity": MAX_PER_ENTITY,
+                "max_per_detector": MAX_PER_DETECTOR,
+            },
         )
         for entry in info:
             ctx.note_rows(f"detector_{entry['key']}", entry["rows"])
@@ -326,10 +409,10 @@ class Anomalies:
             ui.card("Highest scoring anomalies", dmc.Box(id="anomalies-table")),
             dmc.Text(id="anomalies-hint", size="sm", c="dimmed"),
             description=(
-                "Every registered detector writes its candidates at build time; scores are "
-                "normalised per detector so that 0.5 is the detector's own threshold and 1 "
-                "is far above it. The time range, service and host filters apply (service "
-                "filters service rows, host filters host rows); each row links to the raw "
+                "Every registered detector writes its candidates at build time. The score in "
+                "[0, 1] blends a row's rank among the detector's rows of the same kind with its "
+                "log-scaled excess over the detector's threshold. The time range, service and "
+                "host filters apply (each to its own kind of row); each row links to the raw "
                 "lines of its window in the explorer."
             ),
         )
