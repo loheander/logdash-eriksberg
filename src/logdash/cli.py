@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Sequence
 
 from logdash import __version__
-from logdash.build import events_fingerprint, run_build
-from logdash.cache.store import EVENTS_KEY, CacheStore
+from logdash.analyses import load_builtin
+from logdash.analyses.base import REGISTRY, RegistryError
+from logdash.build import run_build, stage_statuses
 from logdash.config import Settings
 
 
@@ -50,26 +52,22 @@ def _settings(args: argparse.Namespace) -> Settings:
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    run_build(_settings(args), force=args.force, strict=args.strict)
+    load_builtin()
+    try:
+        run_build(_settings(args), only=args.only, force=args.force, strict=args.strict)
+    except RegistryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    settings = _settings(args)
-    manifest = CacheStore(settings.cache_dir, settings).manifest()
-    entry = manifest.get(EVENTS_KEY)
-    if entry is None:
-        state = "missing"
-    elif settings.data_files() and manifest.is_stale(
-        EVENTS_KEY, events_fingerprint(settings, strict=args.strict)
-    ):
-        state = "stale"
-    else:
-        state = "fresh"
-    print(f"{'stage':<16}{'state':<9}{'duration':>10}  created")
-    duration = f"{entry.duration_s:.1f}s" if entry else "-"
-    created = entry.created_at if entry else "-"
-    print(f"{EVENTS_KEY:<16}{state:<9}{duration:>10}  {created}")
+    load_builtin()
+    print(f"{'stage':<16}{'state':<11}{'duration':>10}  created")
+    for st in stage_statuses(_settings(args), REGISTRY, strict=args.strict):
+        duration = f"{st.entry.duration_s:.1f}s" if st.entry else "-"
+        created = st.entry.created_at if st.entry else "-"
+        print(f"{st.key:<16}{st.state:<11}{duration:>10}  {created}")
     return 0
 
 
