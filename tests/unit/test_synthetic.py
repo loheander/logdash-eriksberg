@@ -62,5 +62,5 @@ def test_anomalies_injected(synthetic):
     )
     rare = [r for r in rows if r["Payload"].startswith("Watchdog rebooted")]
     assert len(rare) == 2 and {r["Hostname"] for r in rare} == {HOSTS[3]}
-    by_req = [r for r in rows if r["request_id"] == truth.out_of_order_request_ids[0]]
+    by_req = [r for r in rows if r["request_id"] == truth.swapped_request_ids[0]]
     assert len(by_req) == 4

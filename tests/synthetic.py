@@ -93,9 +93,9 @@ REQUEST_STEPS = [
     "Scheduling instance on node{n}",
     "Instance {uuid} spawned in {n} seconds",
 ]
-# Indices into REQUEST_STEPS of the two lines of a broken request: spawned straight after the
-# request was received (a step skipped), and received again after the quota check (starts over).
-BROKEN_FLOWS = [(0, 3), (1, 0), (2, 0)]
+# Indices into REQUEST_STEPS of the one out-of-order request: two lines, the quota check and then
+# the receipt (the flow starts over). That pair is seen once among 150 requests, so it is rare.
+OUT_OF_ORDER_STEPS = (1, 0)
 REQUEST_HOST = HOSTS[1]
 CONTEXT_HOST = HOSTS[5]
 CONTEXT_TEMPLATE = 0  # in the window the host logs only this template (of the first service)
@@ -109,7 +109,7 @@ class SyntheticSpec:
     n_malformed: int = 12
     spike_rows: int = 2_500
     n_requests: int = 150
-    n_out_of_order: int = 5
+    n_swapped: int = 5
     # Host-specific template-mix deviation (0: none). It needs a busy host (extra rows, enough
     # lines for 1-minute windows) and shifts the structural fits of the shared data, so only the
     # contextual tests ask for it (``tests/unit/test_contextual.py``, a dataset of their own).
@@ -134,8 +134,8 @@ class GroundTruth:
     rare_template: str = RARE_TEMPLATE
     rare_first_seen: datetime = START
     request_ids: list[str] = field(default_factory=list)
-    out_of_order_request_ids: list[str] = field(default_factory=list)
-    broken_request_ids: list[str] = field(default_factory=list)
+    swapped_request_ids: list[str] = field(default_factory=list)  # a common variant (3 %)
+    out_of_order_request_ids: list[str] = field(default_factory=list)  # one request, rare
     n_rows: int = 0
     n_malformed: int = 0
     context_host: str = CONTEXT_HOST
@@ -255,9 +255,9 @@ def generate_rows(spec: SyntheticSpec) -> tuple[list[dict], GroundTruth]:
     for r in range(spec.n_requests):
         rid = f"req-{uuid.UUID(int=rng.getrandbits(128), version=4)}"
         steps = list(REQUEST_STEPS)
-        if r < spec.n_out_of_order:
+        if r < spec.n_swapped:
             steps[1], steps[2] = steps[2], steps[1]
-            truth.out_of_order_request_ids.append(rid)
+            truth.swapped_request_ids.append(rid)
         truth.request_ids.append(rid)
         ts = _random_time(rng, START, end - timedelta(minutes=1))
         for step in steps:
@@ -266,20 +266,18 @@ def generate_rows(spec: SyntheticSpec) -> tuple[list[dict], GroundTruth]:
             row["request_id"], row["log_level"] = rid, "INFO"
             rows.append(row)
 
-    # Requests that break the flow in a way nothing else does (two lines, each a step pair seen
-    # once: a step skipped, and the flow starting over). The 5 swapped requests above are a
-    # variant seen in 3 % of the requests, which is not rare. A separate generator keeps the
-    # rest of the data as it was.
-    broken = random.Random(spec.seed + 3000)
-    for first, second in BROKEN_FLOWS:
-        rid = f"req-{uuid.UUID(int=broken.getrandbits(128), version=4)}"
-        truth.broken_request_ids.append(rid)
-        ts = _random_time(broken, START, end - timedelta(minutes=1))
-        for step in (REQUEST_STEPS[first], REQUEST_STEPS[second]):
-            ts += timedelta(milliseconds=broken.randint(5, 400))
-            row = _row(ts, broken, REQUEST_HOST, request_service, _fill(broken, step))
-            row["request_id"], row["log_level"] = rid, "INFO"
-            rows.append(row)
+    # One request out of order: its pair of steps is seen once, so it is rare (the swapped
+    # requests above are a variant seen in 3 % of the requests, which is not). A separate
+    # generator keeps the rest of the data as it was.
+    odd = random.Random(spec.seed + 3000)
+    rid = f"req-{uuid.UUID(int=odd.getrandbits(128), version=4)}"
+    truth.out_of_order_request_ids.append(rid)
+    ts = _random_time(odd, START, end - timedelta(minutes=1))
+    for step in OUT_OF_ORDER_STEPS:
+        ts += timedelta(milliseconds=odd.randint(5, 400))
+        row = _row(ts, odd, REQUEST_HOST, request_service, _fill(odd, REQUEST_STEPS[step]))
+        row["request_id"], row["log_level"] = rid, "INFO"
+        rows.append(row)
 
     rows.sort(key=lambda r: r["@timestamp"])
     for _ in range(spec.n_malformed):

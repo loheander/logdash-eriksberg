@@ -57,7 +57,10 @@ def test_smoothed_nll_is_in_the_evidence_not_the_score():
     rows = score_requests(transitions(*population(990, 5), ("x", [1, 4])), TEMPLATES, 3)
     one = rows.filter(pl.col("entity") == "x")
     assert f"mean NLL {-math.log(1.5 / 997.5):.2f}" in one["evidence"][0]
-    assert "seen 1/996 times (P=0.0010)" in one["evidence"][0]
+    assert (
+        "seen 1/996 times (rarest transition P=0.0010 of 1 distinct, request p=0.0010)"
+        in (one["evidence"][0])
+    )
     assert one["raw"][0] == pytest.approx(math.log10(996))  # p = 1 / 996, L = 1
 
 
@@ -92,15 +95,69 @@ def test_requests_are_combined_over_their_transitions():
     p = 1 - (1 - 3 / 703) ** 2  # Sidak over the two transitions
     assert row["raw"][0] == pytest.approx(-math.log10(p))
     assert "T1 -> T3 seen 3/703 times" in row["evidence"][0] and "3 lines" in row["evidence"][0]
+    assert f"of 2 distinct, request p={p:.4f})" in row["evidence"][0]  # the score's own p
     assert row["window_s"][0] == 2
+
+
+def test_a_repeated_pair_is_one_test_in_the_sidak_correction():
+    reqs = [*population(2000, 2), ("loop", [1, 3, 1, 3, 1, 3, 1])]
+    # 1->3 is seen 5 of 2005 times; L = 6 would be 0.015 (not flagged), L = 2 is 0.005
+    pairs = fit_pairs(transitions(*reqs), 3)
+    p = {(r["src"], r["dst"]): r["p"] for r in pairs.iter_rows(named=True)}
+    row = score_requests(transitions(*reqs), TEMPLATES, 3).filter(pl.col("entity") == "loop")
+    p_min = min(p[(1, 3)], p[(3, 1)])
+    assert row["raw"][0] == pytest.approx(-math.log10(1 - (1 - p_min) ** 2))  # L = 2, not 6
+    assert "of 2 distinct" in row["evidence"][0]
 
 
 def test_one_rare_transition_lists_at_most_max_per_pair_requests():
     reqs = [*population(2000, 12), *[(f"d{i}", [2, 1]) for i in range(2)]]
     rows = score_requests(transitions(*reqs), TEMPLATES, 3)
     assert rows.height == MAX_PER_PAIR  # 12 requests share 1->3; the pair 2->1 is common
-    ids = sorted(f"r1_{i}" for i in range(12))  # equal strength and time: by request id
-    assert rows["entity"].to_list() == ids[:MAX_PER_PAIR]
+    # equal strength and time: the first (by request id), the last and three spread between
+    ids = sorted(f"r1_{i}" for i in range(12))
+    assert sorted(rows["entity"]) == [ids[i] for i in (0, 3, 6, 8, 11)]
+    assert all(
+        "one of 12 requests with it, 05-21 12:00 to 05-21 12:00" in e for e in rows["evidence"]
+    )
+
+
+def test_the_per_pair_cap_keeps_the_strongest_and_a_spread_over_time():
+    reqs = [*population(3000, 20)]
+    frame = transitions(*reqs).with_columns(
+        first=pl.col("first")
+        + pl.duration(minutes=pl.col("request_id").str.extract(r"_(\d+)$").cast(pl.Int64))
+    )
+    capped = sq.cap_per_pair(sq.flag_requests(frame, 3))
+    assert capped.height == MAX_PER_PAIR
+    assert set(capped["group_n"]) == {20}
+    assert set(capped["group_first"]) == {T0} and set(capped["group_last"]) == {
+        T0 + timedelta(minutes=19)
+    }
+    assert capped["first"].min() == T0 and capped["first"].max() == T0 + timedelta(minutes=19)
+    assert capped["first"].sort().diff().drop_nulls().max() <= timedelta(minutes=6)  # no burst
+
+
+def test_the_version_embeds_the_constants_that_change_the_output():
+    for value in (sq.FORMULA, sq.MIN_LINES, sq.MAX_LINES, sq.ALPHA, sq.MAX_PER_PAIR, sq.TEXT_CHARS):
+        assert str(value) in sq.Sequence.version.split(":")
+    assert sq.Sequence.version == (
+        f"{sq.FORMULA}:{sq.MIN_LINES}:{sq.MAX_LINES}:{sq.ALPHA}:{sq.MAX_PER_PAIR}:{sq.TEXT_CHARS}"
+    )
+
+
+def test_the_note_gives_the_coverage_and_the_programs_left_out():
+    tr = transitions(*population(120, 3), *population(10, 1, state=2))
+    counts = {
+        "scored": 134,
+        "too_long": 3,
+        "long_lines": 900,
+        "by_program": [("agent", 2, 800), ("server", 1, 100)],
+    }
+    text = sq.note(counts, tr, 7, 3)
+    assert "only the 1 of 2 source states seen at least 100 times can flag (123 of 134" in text
+    assert "agent 2 requests / 800 lines, server 1 requests / 100 lines" in text
+    assert "7 further requests" in text
 
 
 def test_empty_input_returns_the_schema():
@@ -111,15 +168,16 @@ def test_empty_input_returns_the_schema():
 
 
 def connection(lines: list[tuple[str | None, int, int, bool]]) -> duckdb.DuckDBPyConnection:
-    """(request id, seconds, masked_hash, malformed) -> an ``events`` table."""
+    """(request id, seconds, masked_hash, malformed) -> an ``events`` table (program ``p``)."""
     con = duckdb.connect()
     con.execute(
         "CREATE TABLE events (request_id VARCHAR, ts TIMESTAMP, masked_hash BIGINT, "
-        "malformed BOOLEAN)"
+        "malformed BOOLEAN, program VARCHAR)"
     )
     for rid, sec, mh, bad in lines:
         con.execute(
-            "INSERT INTO events VALUES (?, ?, ?, ?)", [rid, T0 + timedelta(seconds=sec), mh, bad]
+            "INSERT INTO events VALUES (?, ?, ?, ?, 'p')",
+            [rid, T0 + timedelta(seconds=sec), mh, bad],
         )
     return con
 
@@ -153,7 +211,12 @@ def test_fetch_orders_ties_by_template_and_leaves_out_unscorable_requests(tmp_pa
     assert got["request_id"].to_list() == ["a", "a"]
     assert list(zip(got["src"], got["dst"], strict=True)) == [(2, 3), (3, 1)]
     assert got["n"].to_list() == [3, 3] and got["last"][0] == T0 + timedelta(seconds=5)
-    assert counts == {"too_long": 1, "long_lines": MAX_LINES + 1, "scored": 1}
+    assert counts == {
+        "too_long": 1,
+        "long_lines": MAX_LINES + 1,
+        "scored": 1,
+        "by_program": [("p", 1, MAX_LINES + 1)],
+    }
 
 
 def test_a_request_of_exactly_max_lines_is_scored(tmp_path):
@@ -165,4 +228,9 @@ def test_a_request_of_exactly_max_lines_is_scored(tmp_path):
 
 def test_no_events_with_a_request_id_gives_no_transitions(tmp_path):
     frame, counts = fetch_transitions(connection([]), assignments(tmp_path))
-    assert frame.is_empty() and counts == {"too_long": 0, "long_lines": 0, "scored": 0}
+    assert frame.is_empty() and counts == {
+        "too_long": 0,
+        "long_lines": 0,
+        "scored": 0,
+        "by_program": [],
+    }

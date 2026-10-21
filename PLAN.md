@@ -406,14 +406,16 @@ Status: **Phase 1 done** (steps 1 to 9).
   the population; a pair's tail mass `p = sum(c' <= c) / tot(src)` is the chance a draw from the state is as rare,
   the request's `p` is Sidak over its `L` transitions and `raw = -log10(p)`; mean smoothed NLL (`(c + 0.5) /
   (tot + 0.5 K)`) is only evidence, since 96 % of the scored requests have one transition. Deviations from the
-  plan: no `ALPHA = 0.05` and no `tot >= 20` rule: at 0.05 the 6,711 requests with a per-transition p are
-  not strict, so `ALPHA = 0.01` (a state seen under 100 times cannot flag anything), and at most 5 requests per
-  transition are listed (51 of the 91 flagged were one identical pair). The 5 swapped synthetic requests (3 % of
-  requests) are a common variant (tail mass 0.033, Sidak over 3 transitions 0.096), so they are not flagged and a
-  test says so; the injection that is found is three broken two-line requests (a skipped step, two restarts, from
-  their own generator, `truth.broken_request_ids`), each pair seen once among 150 requests (`P = 0.0066`). The
-  strict xfail is removed. Real data: 203,308 requests scored; `p <= 0.01` per transition 1,045, after Sidak 91,
-  38 kept (53 at 0.001), 2 s, peak 2.8 GB; the top row is `GET -> returned with HTTP` seen 51 of 190,285 times
+  plan: `ALPHA` is 0.01 instead of 0.05 (6,711 requests at 0.05 per transition is not a strict level), and there is
+  no `tot >= 20` rule; at most 5 requests per rarest transition are listed (the most extreme and an even spread
+  over the group's time order, with the group size and span in the evidence; 51 of the flagged were one identical
+  pair). Sidak is over the request's distinct pairs. The synthetic out-of-order request is one request with a
+  pair seen once among 150 (own generator, `truth.out_of_order_request_ids`), so it is found at alpha 0.01; the
+  5 swapped requests (3 %, `truth.swapped_request_ids`) are a common variant (tail mass 0.033) that a first-order
+  chain cannot call anomalous, and a test documents that limit. Only 5 of 70 source states can flag; the 871
+  requests over 100 lines are not scored (README gives them by program). The detector version embeds its
+  constants. The strict xfail is removed. Real data: 203,308 requests scored; 98 flagged after Sidak, 40 kept, 3 s,
+  peak 2.8 GB; the top row is `GET -> returned with HTTP` seen 51 of 190,285 times
   (P = 0.0003). The combined top 100 holds 8 sequence rows (25 PCA, 25 forest, 16 volume, 9 contextual, 9 rare,
   8 novel); the first is at position 12.
 - Module 7 (hosts and services, issue 10) done: `analyses/hosts.py` from `templates/template_counts_host.parquet`

@@ -718,7 +718,7 @@ def rare_window(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
 
 
 def out_of_order_requests(truth: GroundTruth, rows: pl.DataFrame) -> Rank:
-    ranks = [first_match(rows, pl.col("entity") == r) for r in truth.broken_request_ids]
+    ranks = [first_match(rows, pl.col("entity") == r) for r in truth.out_of_order_request_ids]
     return None if None in ranks else max(r for r in ranks if r is not None)
 
 
@@ -781,13 +781,14 @@ def test_novel_and_rare_rows_do_not_overlap(stage, synthetic):
     assert rare["raw"].min() >= 1.0
 
 
-def test_sequence_rows_are_the_broken_requests_only(stage, synthetic):
+def test_sequence_rows_are_the_out_of_order_request_only(stage, synthetic):
     truth = synthetic.truth
     rows = an.load_anomalies(stage).filter(pl.col("type") == "sequence")
-    assert sorted(rows["entity"]) == sorted(truth.broken_request_ids)
+    assert sorted(rows["entity"]) == sorted(truth.out_of_order_request_ids)
     assert (rows["kind"] == "request").all() and (rows["template_id"].is_not_null()).all()
-    # the 5 swapped requests are a variant seen in 3 % of the requests: not rare enough
-    assert not set(truth.out_of_order_request_ids) & set(rows["entity"])
+    # the 5 swapped requests are a variant seen in 3 % of the requests: a first-order chain
+    # cannot call that anomalous at alpha 0.01 (a known limit, see the README)
+    assert not set(truth.swapped_request_ids) & set(rows["entity"])
     meta = {d["key"]: d for d in stage.read_json("anomalies", "meta.json")["detectors"]}
     assert "0 longer requests" in meta["sequence"]["info"]["note"]
 
