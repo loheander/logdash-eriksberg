@@ -42,7 +42,7 @@ Reference laptop (16 cores, 31 GB RAM, DuckDB limited to 8 GB / 8 threads), real
 | features | about 1 s for a synthetic 600k-row template count table (not yet measured on the real data) |
 | pca | 12 fits (group x window x scaling); about 4 s for a synthetic 230k-window x 281-template matrix at 3 % density (not yet measured on the real data) |
 | hosts | 3 s on the real data (162 hosts, 281 templates, 559 service x host pairs; one aggregate over `events` for the matrix) |
-| anomalies | 26 s (six detectors: PCA residual, 1,232 windows above the entity's level, 377 episodes kept; Isolation Forest per entity, 25 s, 1,405 windows flagged, 438 episodes; volume, 87 episodes; contextual, 496 windows above the threshold, 456 kept; novel and rare templates, 15 and 166 rows, 0.03 s) |
+| anomalies | 28 s (seven detectors: PCA residual, 1,232 windows above the entity's level, 377 episodes kept; Isolation Forest per entity, 25 s, 1,405 windows flagged, 438 episodes; volume, 87 episodes; contextual, 496 windows above the threshold, 456 kept; novel and rare templates, 15 and 166 rows, 0.03 s; sequence, 40 requests, 3 s) |
 | total | 1 min 58 s (measured before the features, pca and anomalies stages existed) |
 
 `cache/` is 622 MB (281 templates from 73,583 unique masked lines).
@@ -190,6 +190,33 @@ last `LOGDASH_NOVEL_FRACTION` of the span, raw `-b * log2(1 - u)` bits with `b` 
 position of its first line; threshold `log2(1 / fraction)`) and `rare_template` (a (template, minute, service)
 window of a template with at most `LOGDASH_RARE_THRESHOLD` events; raw `(threshold + 0.5) / count`, threshold 1).
 Real data: 15 novel rows (an operator episode at 22:03 to 22:10 and two at 23:54) and 166 rare ones.
+
+`sequence.py` is the `sequence` type (kind `request`, `depends_on` the templates stage): the lines of a request id
+(2 to 100 lines) are ordered by `(ts, template id)` and their consecutive template pairs
+fitted as a first-order Markov chain. The score is a tail mass, not the NLL (96 % of the requests have one
+transition, so the NLL is tie-ridden and depends on length): for a pair seen `c` of `tot` times from its source
+state, `p = sum(c' <= c) / tot` over the state's next templates, the request's `p` is `1 - (1 - p_min) ** L`
+(Sidak, over its `L` distinct `(src, dst)` pairs; approximate, conservative for the dependent transitions of a
+chain) and `raw = -log10(p)`, threshold `-log10(0.01)`. The level is strict on purpose. The evidence shows the
+rarest transition's `P` beside the request's `p` (the one the score and threshold use). On the real data 203,308
+requests are scored, 98 pass 0.01 after the correction (at most 5 requests are listed per rarest transition, the
+most extreme and an even spread over the group's time order; their evidence gives the group size and time span,
+the note counts the rest), 40 are kept. The smoothed NLL is in the evidence. Real data: 40 rows, 3 s, 2.8 GB peak
+build memory; the largest group is 5 of 40 rows, and the combined top 100 holds 8 sequence rows, the first at
+position 12. The detector version embeds its constants (and a formula number), so editing them rebuilds.
+
+Limits, also in the page note:
+- Coverage: a source state seen fewer than `1 / alpha` = 100 times cannot flag anything, so only 5 of the 70
+  source states can (213,283 of 213,939 transitions); a rare transition out of the other 65 is invisible. All
+  flags come from a few of those 5 states.
+- Requests of more than 100 lines are not scored at all: 871 ids with 28.0 M of the 30.7 M lines with a request id
+  (91 %). By program (a request counts for each program it has lines in): neutron-openvswitch-agent 162 requests
+  and 21.2 M lines, neutron-l3-agent 695 and 6.8 M, neutron-server 703 and 29,548, nova-compute 9 and 1,228, one
+  more. These are periodic agent loops for the bulk of the lines; the 28 requests of 101 to 1,000 lines (10 k lines) are
+  not shown to be. A per-id loop-aware model is future work.
+- A first-order chain cannot call a cohesive variant anomalous: in the synthetic data the 5 swapped requests (3 %
+  of 150) are not flagged at alpha 0.01 (tail mass 0.033), a test documents it; the one out-of-order request (a
+  pair seen once) is.
 
 `structural_pca.py` and `structural_iforest.py` are the structural type (shared helpers in
 `detectors/_episodes.py`, which `load_builtin` skips). `spe / limit >= 1` is not usable on the real data (the
