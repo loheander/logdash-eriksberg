@@ -20,6 +20,8 @@ DEFAULT_TEMPLATE_TOP_K = 50
 DEFAULT_PARAM_SAMPLE = 2000
 DEFAULT_RARE_THRESHOLD = 5
 DEFAULT_NOVEL_FRACTION = 0.1
+DEFAULT_JEV_MODEL = "typesafe/jev-1.14"
+DEFAULT_JEV_TIMEOUT_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,8 @@ class Settings:
     param_sample: int = DEFAULT_PARAM_SAMPLE  # raw payloads sampled per top template
     rare_threshold: int = DEFAULT_RARE_THRESHOLD  # templates with at most this many events are rare
     novel_fraction: float = DEFAULT_NOVEL_FRACTION  # first seen in the last fraction of the span
+    jev_model: str = DEFAULT_JEV_MODEL  # decision model of the triage page (called live)
+    jev_timeout_s: float = DEFAULT_JEV_TIMEOUT_S  # per attempt; the client retries once
 
     def __post_init__(self) -> None:
         if not 0 < self.novel_fraction < 1:
@@ -61,6 +65,8 @@ class Settings:
             param_sample=int(env.get("LOGDASH_PARAM_SAMPLE", DEFAULT_PARAM_SAMPLE)),
             rare_threshold=int(env.get("LOGDASH_RARE_THRESHOLD", DEFAULT_RARE_THRESHOLD)),
             novel_fraction=float(env.get("LOGDASH_NOVEL_FRACTION", DEFAULT_NOVEL_FRACTION)),
+            jev_model=env.get("LOGDASH_JEV_MODEL", DEFAULT_JEV_MODEL),
+            jev_timeout_s=float(env.get("LOGDASH_JEV_TIMEOUT_S", DEFAULT_JEV_TIMEOUT_S)),
         )
 
     def with_overrides(self, **overrides: Any) -> Settings:

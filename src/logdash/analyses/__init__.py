@@ -14,6 +14,7 @@ BUILTIN: tuple[str, ...] = (
     "anomalies",
     "hosts",
     "explorer",
+    "triage",
 )
 
 

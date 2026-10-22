@@ -16,7 +16,7 @@ from typing import Any
 import polars as pl
 import pytest
 
-from logdash.analyses import anomalies, features, hosts, load_builtin, pca
+from logdash.analyses import anomalies, features, hosts, load_builtin, pca, triage
 from logdash.analyses.base import REGISTRY
 from logdash.analyses.explorer import fetch_page, search_page
 from logdash.analyses.temporal import Temporal
@@ -44,6 +44,9 @@ class Recorder:
             return fn
 
         return deco
+
+    def clientside_callback(self, *_args: Any, **_kwargs: Any) -> None:
+        """Clientside callbacks run in the browser; there is nothing to time here."""
 
 
 @pytest.fixture(scope="module")
@@ -343,6 +346,68 @@ def test_anomalies_cold(store: CacheStore) -> None:
     results.append(("anomalies.draw (cold)", "no filters", cold, _time(draw)))
     if cold >= LAYOUT_BUDGET_S:
         over.append(f"anomalies.draw cold {cold * 1000:.0f} ms")
+
+
+def fake_jev(_key: str, body: dict[str, Any], _timeout_s: float) -> dict[str, Any]:
+    """Stands in for the model: the benchmark covers the page, not the live call."""
+    answers = {}
+    for qid, q in body["questions"].items():
+        if q["type"] == "noul":
+            answers[qid] = {"type": "noul", "noul": 0.7}
+        elif q["type"] == "choice":
+            first = next(iter(q["criteria"]))
+            probs = {o: (1.0 if o == first else 0.0) for o in q["criteria"]}
+            answers[qid] = {"type": "choice", "choice": first, "probabilities": probs,
+                            "confidence": 1.0}  # fmt: skip
+        else:
+            probs = {str(i): (1.0 if i == 1 else 0.0) for i in range(len(q["criteria"]))}
+            answers[qid] = {"type": "score", "score": 1.0, "probabilities": probs,
+                            "confidence": 1.0}  # fmt: skip
+    return {"answers": answers, "usage": {"cost": 0.0}}
+
+
+def test_triage(store: CacheStore) -> None:
+    rec = Recorder()
+    triage.Triage(poster=fake_jev, env={"OPENROUTER_API_KEY": "fake"}).register_callbacks(
+        rec,  # type: ignore[arg-type]
+        store,
+    )
+    for name, filters in _cases(store).items():
+        for types, sort in ANOMALY_CASES:
+            measure(
+                "triage.draw",
+                f"{name}, types={types or 'all'}, sort={sort}",
+                CALLBACK_BUDGET_S,
+                partial(rec.funcs["draw"], types, sort, filters, "light", {}),
+            )
+    rows = triage.load_rows(store)
+    for kind in sorted(set(rows["kind"])):
+        # the widest window of each kind: the slowest state query
+        row = (
+            rows.filter(pl.col("kind") == kind).sort("window_s", descending=True).row(0, named=True)
+        )
+        out = measure(
+            "triage.ask (fake jev)",
+            f"{kind}, {row['window_s']} s",
+            CALLBACK_BUDGET_S,
+            partial(rec.funcs["ask"], {"key": row["row_key"], "n": 1}),
+        )
+        assert out["error"] is None, out["error"]
+
+
+def test_triage_cold(store: CacheStore) -> None:
+    """First request after start-up: the table is read from the cache, not from memory."""
+    rec = Recorder()
+    triage.Triage(poster=fake_jev, env={}).register_callbacks(rec, store)  # type: ignore[arg-type]
+    triage.clear_caches()
+    anomalies.clear_caches()
+    draw = partial(rec.funcs["draw"], [], "overall", None, "light", {})
+    t0 = time.perf_counter()
+    draw()
+    cold = time.perf_counter() - t0
+    results.append(("triage.draw (cold)", "no filters", cold, _time(draw)))
+    if cold >= LAYOUT_BUDGET_S:
+        over.append(f"triage.draw cold {cold * 1000:.0f} ms")
 
 
 def test_explorer(store: CacheStore) -> None:
