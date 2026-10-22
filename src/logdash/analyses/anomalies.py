@@ -33,9 +33,8 @@ from dash.development.base_component import Component
 from logdash.analyses.base import ComputeContext, register
 from logdash.analyses.features import Lru, segmented
 from logdash.analyses.templates import short
-from logdash.app import figures, ui
+from logdash.app import figures, theme, ui
 from logdash.app.filters import FILTER_STORE_ID, Filters, from_dict, page_url, parse_time
-from logdash.app.shell import THEME_STORE_ID
 from logdash.cache.store import CacheStore
 from logdash.detectors import load_builtin
 from logdash.detectors.base import (
@@ -281,7 +280,7 @@ def timeline_figure(rows: pl.DataFrame, types: list[str], scheme: str | None) ->
                 y=part["score"].to_list(),
                 mode="markers",
                 name=kind,
-                marker={"size": 7, "color": figures.PALETTE[i % len(figures.PALETTE)]},
+                marker={"size": 7, "color": theme.PALETTE[i % len(theme.PALETTE)]},
                 text=hover(part),
                 hovertemplate="%{text}<extra></extra>",
             )
@@ -289,9 +288,11 @@ def timeline_figure(rows: pl.DataFrame, types: list[str], scheme: str | None) ->
     fig.update_yaxes(title="score", range=[-0.02, 1.02])
     if shown < rows.height:
         figures.add_note(
-            fig, f"{shown:,} of {rows.height:,} anomalies: the highest {per_type:,} of each type"
+            fig,
+            f"{shown:,} of {rows.height:,} anomalies: the highest {per_type:,} of each type",
+            scheme,
         )
-    return figures.style(fig, scheme, height=380)
+    return theme.style(fig, scheme, height=380)
 
 
 def unavailable(store: CacheStore) -> str | None:
@@ -460,7 +461,7 @@ class Anomalies:
             Input("anomalies-types", "value"),
             Input("anomalies-sort", "value"),
             Input(FILTER_STORE_ID, "data"),
-            Input(THEME_STORE_ID, "data"),
+            theme.theme_input(),
         )
         def draw(
             types: list[str] | None,

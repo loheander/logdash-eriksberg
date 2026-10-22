@@ -54,9 +54,8 @@ from logdash.analyses.features import (
     WINDOWS,
     Lru,
 )
-from logdash.app import figures, ui
+from logdash.app import figures, theme, ui
 from logdash.app.filters import FILTER_STORE_ID, Filters, from_dict, page_url
-from logdash.app.shell import THEME_STORE_ID
 from logdash.cache.store import CacheStore
 
 KEY = "pca"
@@ -421,20 +420,20 @@ def scree_figure(fit: Fit, scheme: str | None) -> go.Figure:
     x = list(range(1, len(fit.explained) + 1))
     fig = go.Figure(
         [
-            go.Bar(
-                x=x, y=fit.explained.tolist(), name="explained", marker_color=figures.PALETTE[0]
-            ),
+            go.Bar(x=x, y=fit.explained.tolist(), name="explained", marker_color=theme.PALETTE[0]),
             go.Scatter(
                 x=x, y=np.cumsum(fit.explained).tolist(), name="cumulative", mode="lines+markers"
             ),
         ]
     )
-    fig.add_vline(x=fit.k + 0.5, line_dash="dash", line_color=figures.PALETTE[1])
+    fig.add_vline(x=fit.k + 0.5, line_dash="dash", line_color=theme.PALETTE[1])
     fig.update_xaxes(title="component", dtick=max(len(x) // 10, 1))
     fig.update_yaxes(title="share of variance", tickformat=".0%")
     cumulative = float(np.sum(fit.explained[: fit.k]))
-    figures.add_note(fig, f"{fit.k} components keep {cumulative:.0%}; the SPE is what they miss")
-    return figures.style(fig, scheme, height=360)
+    figures.add_note(
+        fig, f"{fit.k} components keep {cumulative:.0%}; the SPE is what they miss", scheme
+    )
+    return theme.style(fig, scheme, height=360)
 
 
 def spe_figure(fit: Fit, rows: np.ndarray, scheme: str | None) -> go.Figure:
@@ -444,8 +443,8 @@ def spe_figure(fit: Fit, rows: np.ndarray, scheme: str | None) -> go.Figure:
     above = fit.spe[shown] > fit.limit
     fig = go.Figure()
     for flag, name, color in (
-        (False, "within limit", figures.PALETTE[0]),
-        (True, "above limit", figures.PALETTE[1]),
+        (False, "within limit", theme.PALETTE[0]),
+        (True, "above limit", theme.PALETTE[1]),
     ):
         mask = above == flag
         fig.add_trace(
@@ -456,11 +455,13 @@ def spe_figure(fit: Fit, rows: np.ndarray, scheme: str | None) -> go.Figure:
             )
         )  # fmt: skip
     if math.isfinite(fit.limit):
-        fig.add_hline(y=fit.limit, line_dash="dash", line_color=figures.PALETTE[1])
+        fig.add_hline(y=fit.limit, line_dash="dash", line_color=theme.PALETTE[1])
     fig.update_yaxes(title="SPE", type="log")
     flagged = int((fit.spe[rows] > fit.limit).sum())
-    figures.add_note(fig, f"{flagged} of {len(rows)} windows above the limit {fit.limit:.3g}")
-    return figures.style(fig, scheme, height=360)
+    figures.add_note(
+        fig, f"{flagged} of {len(rows)} windows above the limit {fit.limit:.3g}", scheme
+    )
+    return theme.style(fig, scheme, height=360)
 
 
 def entity_traces(fit: Fit, rows: np.ndarray) -> list[tuple[str, np.ndarray]]:
@@ -503,7 +504,11 @@ def projection_figure(
         else:
             values = np.log10(np.maximum(score_ratio(fit, shown), 1e-3))
             title = "log10 SPE / limit"
-        marker = {"color": values, "colorscale": "Viridis", "colorbar": {"title": title}}
+        marker = {
+            "color": values,
+            "colorscale": theme.magnitude(scheme),
+            "colorbar": {"title": title},
+        }
         fig.add_trace(trace(shown, marker=marker, showlegend=False))
     titles = [f"PC{i + 1}" for i in range(dims)]
     if dims == 3:
@@ -514,8 +519,10 @@ def projection_figure(
     shown_note = (
         f"{len(shown)} of {len(rows)} windows" if len(shown) < len(rows) else f"{len(rows)} windows"
     )
-    figures.add_note(fig, f"{shown_note}, coloured by {color if color != 'entity' else entity}")
-    return figures.style(fig, scheme, height=520)
+    figures.add_note(
+        fig, f"{shown_note}, coloured by {color if color != 'entity' else entity}", scheme
+    )
+    return theme.style(fig, scheme, height=520)
 
 
 def loadings_figure(
@@ -537,8 +544,8 @@ def loadings_figure(
     fig.update_yaxes(autorange="reversed", type="category")
     fig.update_xaxes(title=f"loading on PC{component}")
     share = float(fit.explained[component - 1]) if component <= len(fit.explained) else 0.0
-    figures.add_note(fig, f"PC{component} explains {share:.1%} of the variance")
-    return figures.style(fig, scheme, height=420)
+    figures.add_note(fig, f"PC{component} explains {share:.1%} of the variance", scheme)
+    return theme.style(fig, scheme, height=420)
 
 
 def flagged_table(
@@ -722,7 +729,7 @@ class Pca:
             Input("pca-color", "value"),
             Input("pca-component", "value"),
             Input(FILTER_STORE_ID, "data"),
-            Input(THEME_STORE_ID, "data"),
+            theme.theme_input(),
         )
         def draw(
             window: str | None,

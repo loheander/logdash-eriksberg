@@ -1,4 +1,4 @@
-"""Shared Plotly styling and small figure helpers (downsampling, top-N, binning)."""
+"""Small figure helpers (downsampling, top-N, binning)."""
 
 from __future__ import annotations
 
@@ -10,54 +10,12 @@ import numpy as np
 import plotly.graph_objects as go
 import polars as pl
 
+from logdash.app import theme
+
 MAX_POINTS = 5000
-LIGHT = "light"
-DARK = "dark"
-
-PALETTE = (
-    "#4c6ef5", "#fa5252", "#40c057", "#fab005", "#15aabf",
-    "#be4bdb", "#fd7e14", "#82c91e", "#e64980", "#868e96",
-)  # fmt: skip
-
-_SCHEMES = {
-    LIGHT: {"text": "#212529", "grid": "#dee2e6", "bg": "rgba(0,0,0,0)"},
-    DARK: {"text": "#c9c9c9", "grid": "#424242", "bg": "rgba(0,0,0,0)"},
-}
 
 # Bin sizes in seconds offered by the time-series pages.
 BIN_LADDER = (1, 10, 60, 300, 900, 3600)
-
-
-def scheme_name(value: str | None) -> str:
-    return DARK if value == DARK else LIGHT
-
-
-def template(scheme: str | None = LIGHT) -> go.layout.Template:
-    """Plotly template matching the Mantine light or dark colour scheme."""
-    colors = _SCHEMES[scheme_name(scheme)]
-    axis = {
-        "gridcolor": colors["grid"],
-        "zerolinecolor": colors["grid"],
-        "linecolor": colors["grid"],
-    }
-    return go.layout.Template(
-        layout={
-            "colorway": PALETTE,
-            "paper_bgcolor": colors["bg"],
-            "plot_bgcolor": colors["bg"],
-            "font": {"color": colors["text"]},
-            "xaxis": {**axis, "automargin": True},
-            "yaxis": {**axis, "automargin": True},
-            "margin": {"l": 56, "r": 16, "t": 32, "b": 48},
-            "legend": {"orientation": "v", "x": 1.02, "xanchor": "left", "y": 1, "yanchor": "top"},
-        }
-    )
-
-
-def style(fig: go.Figure, scheme: str | None = LIGHT, **layout: object) -> go.Figure:
-    """Apply the shared template (and optional layout overrides) to ``fig``."""
-    fig.update_layout(template=template(scheme), **layout)
-    return fig
 
 
 def shorten_middle(text: str, limit: int = 28) -> str:
@@ -69,22 +27,22 @@ def shorten_middle(text: str, limit: int = 28) -> str:
     return f"{text[:head]}…{text[len(text) - tail :]}"
 
 
-def add_note(fig: go.Figure, text: str) -> go.Figure:
+def add_note(fig: go.Figure, text: str, scheme: str | None) -> go.Figure:
     """Small dimmed note above the plot area, top left (never overlaps the plot)."""
     if text:
         fig.add_annotation(
             text=text, xref="paper", yref="paper", x=0, y=1, xanchor="left", yanchor="bottom",
-            showarrow=False, font={"size": 12, "color": "#868e96"},
+            showarrow=False, font={"size": 12, "color": theme.colors(scheme).note},
         )  # fmt: skip
     return fig
 
 
-def empty_figure(message: str, scheme: str | None = LIGHT) -> go.Figure:
+def empty_figure(message: str, scheme: str | None = theme.LIGHT) -> go.Figure:
     fig = go.Figure()
     fig.add_annotation(text=message, showarrow=False, font={"size": 14})
     fig.update_xaxes(visible=False)
     fig.update_yaxes(visible=False)
-    return style(fig, scheme)
+    return theme.style(fig, scheme)
 
 
 def axis_type(log: bool) -> str:

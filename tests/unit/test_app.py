@@ -7,7 +7,7 @@ from dash import dcc
 from logdash.analyses.base import Registry
 from logdash.app import ui
 from logdash.app.main import create_app, filter_options, home_layout
-from logdash.app.shell import make_layout, navbar_links, next_theme
+from logdash.app.shell import make_layout, navbar_links
 from tests.conftest import build_with
 
 
@@ -38,14 +38,6 @@ class Dummy:
 def app(built):
     registry = build_with(built, Dummy())
     return create_app(built.store, registry)
-
-
-def test_next_theme():
-    assert (
-        next_theme("light") == "dark"
-        and next_theme("dark") == "light"
-        and next_theme(None) == "dark"
-    )
 
 
 def test_filter_options(built):
@@ -95,16 +87,6 @@ def test_pages_and_callbacks_over_http(app):
     )
     assert resp.status_code == 200
     assert resp.get_json()["response"]["dummy-graph"]["figure"]["layout"]["title"]["text"] == "dark"
-    shell_body = {
-        "output": "mantine-provider.forceColorScheme",
-        "outputs": {"id": "mantine-provider", "property": "forceColorScheme"},
-        "inputs": [{"id": "theme", "property": "data", "value": "dark"}],
-        "changedPropIds": ["theme.data"],
-    }
-    resp = client.post(
-        "/_dash-update-component", data=json.dumps(shell_body), content_type="application/json"
-    )
-    assert resp.get_json()["response"]["mantine-provider"]["forceColorScheme"] == "dark"
 
 
 def test_serve_cli_runs_app(built, monkeypatch, synthetic):
@@ -156,12 +138,8 @@ def post(client, output, inputs, state=()):
     return resp.get_json()["response"][prop_id][prop]
 
 
-def test_theme_toggle_and_filter_callbacks(app):
+def test_filter_callback(app):
     client = app.server.test_client()
-    assert (
-        post(client, "theme.data", [("theme-toggle", "n_clicks", 1)], [("theme", "data", "light")])
-        == "dark"
-    )
     ins = [
         ("filter-dates", "value", ["2023-05-21", "2023-05-21"]),
         ("filter-levels", "value", ["INFO"]),

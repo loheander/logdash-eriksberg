@@ -10,12 +10,11 @@ import dash_mantine_components as dmc
 import duckdb
 import plotly.graph_objects as go
 import polars as pl
-from dash import Dash, Input, Output
+from dash import Dash, Output
 from dash.development.base_component import Component
 
 from logdash.analyses.base import ComputeContext, register
-from logdash.app import figures, ui
-from logdash.app.shell import THEME_STORE_ID
+from logdash.app import figures, theme, ui
 from logdash.cache.store import CacheStore
 from logdash.ingest.normalize import EVENT_COLUMNS
 
@@ -93,7 +92,7 @@ def missing_figure(columns: pl.DataFrame, scheme: str | None = "light") -> go.Fi
         )
     )
     fig.update_xaxes(title="missing (%)", range=[0, 100])
-    return figures.style(fig, scheme, height=420)
+    return theme.style(fig, scheme, height=420)
 
 
 def headline_cards(head: dict[str, Any]) -> list[Component]:
@@ -167,7 +166,7 @@ class Overview:
         )
 
     def register_callbacks(self, app: Dash, store: CacheStore) -> None:
-        @app.callback(Output("overview-missing", "figure"), Input(THEME_STORE_ID, "data"))
+        @app.callback(Output("overview-missing", "figure"), theme.theme_input())
         def draw_missing(theme: str | None) -> go.Figure:
             return missing_figure(store.read_parquet(KEY, "columns.parquet"), theme)
 

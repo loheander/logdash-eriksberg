@@ -31,7 +31,7 @@ from drain3 import TemplateMiner
 from drain3.template_miner_config import TemplateMinerConfig
 
 from logdash.analyses.base import ComputeContext, register
-from logdash.app import figures, ui
+from logdash.app import figures, theme, ui
 from logdash.app.filters import (
     FILTER_STORE_ID,
     Filters,
@@ -40,7 +40,6 @@ from logdash.app.filters import (
     page_url,
     parse_time,
 )
-from logdash.app.shell import THEME_STORE_ID
 from logdash.cache.store import CacheStore
 from logdash.config import Settings
 from logdash.ingest.masking import MASK_RULES, mask_sql
@@ -264,8 +263,8 @@ def volume_figure(
     full = figures.fill_bins(binned, lo.replace(second=0), hi, size)
     fig = go.Figure(go.Bar(x=full["bin"].to_list(), y=full["n"].to_list()))
     fig.update_yaxes(title=f"events per {size // 60} min")
-    figures.add_note(fig, f"template {template_id}")
-    return figures.style(fig, scheme, height=320)
+    figures.add_note(fig, f"template {template_id}", scheme)
+    return theme.style(fig, scheme, height=320)
 
 
 def param_options(params: pl.DataFrame, template_id: int | None) -> list[dict[str, str]]:
@@ -313,8 +312,8 @@ def param_figure(
         )
         fig.update_yaxes(autorange="reversed", type="category")
         fig.update_xaxes(title="sampled lines")
-    figures.add_note(fig, f"parameter #{int(position) + 1} ({kind})")
-    return figures.style(fig, scheme, height=320)
+    figures.add_note(fig, f"parameter #{int(position) + 1} ({kind})", scheme)
+    return theme.style(fig, scheme, height=320)
 
 
 def grid_rows(templates: pl.DataFrame, limit: int = GRID_ROWS) -> list[dict[str, Any]]:
@@ -451,7 +450,7 @@ class Templates:
             Output("templates-link", "href"),
             Input("templates-grid", "selectedRows"),
             Input(FILTER_STORE_ID, "data"),
-            Input(THEME_STORE_ID, "data"),
+            theme.theme_input(),
         )
         def draw_volume(
             rows: list[dict[str, Any]] | None, filters: dict[str, Any] | None, theme: str | None
@@ -476,7 +475,7 @@ class Templates:
             Output("templates-params", "figure"),
             Input("templates-param", "value"),
             Input("templates-grid", "selectedRows"),
-            Input(THEME_STORE_ID, "data"),
+            theme.theme_input(),
         )
         def draw_params(
             choice: str | None, rows: list[dict[str, Any]] | None, theme: str | None

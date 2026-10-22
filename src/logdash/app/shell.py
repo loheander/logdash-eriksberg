@@ -1,4 +1,4 @@
-"""Mantine AppShell: header, registry-driven navigation, theme toggle, filter controls."""
+"""Mantine AppShell: header, registry-driven navigation, filter controls."""
 
 from __future__ import annotations
 
@@ -11,12 +11,9 @@ from dash import Dash, Input, Output, State, ctx, dcc, page_container
 from dash.development.base_component import Component
 
 from logdash.analyses.base import Registry
-from logdash.app.figures import DARK, LIGHT, scheme_name
+from logdash.app import theme
 from logdash.app.filters import FILTER_STORE_ID, build_filters, parse_time, with_time_range
 
-THEME_STORE_ID = "theme"
-PROVIDER_ID = "mantine-provider"
-THEME_TOGGLE_ID = "theme-toggle"
 LEVEL_OPTIONS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "UNKNOWN")
 
 
@@ -28,10 +25,6 @@ class FilterOptions:
     hosts: tuple[str, ...] = ()
     min_date: str | None = None
     max_date: str | None = None
-
-
-def next_theme(current: str | None) -> str:
-    return LIGHT if scheme_name(current) == DARK else DARK
 
 
 def navbar_links(registry: Registry) -> list[Component]:
@@ -81,7 +74,7 @@ def header() -> Component:
     return dmc.Group(
         [
             dmc.Title("logdash", order=3),
-            dmc.ActionIcon("◐", id=THEME_TOGGLE_ID, variant="default", size="lg"),
+            theme.toggle(),
         ],
         justify="space-between",
         h="100%",
@@ -92,11 +85,10 @@ def header() -> Component:
 def make_layout(registry: Registry, options: FilterOptions) -> Component:
     """Full page skeleton; pages render into ``page_container``."""
     return dmc.MantineProvider(
-        id=PROVIDER_ID,
-        defaultColorScheme=LIGHT,
-        forceColorScheme=LIGHT,
+        id=theme.PROVIDER_ID,
+        **theme.provider_props(),
         children=[
-            dcc.Store(id=THEME_STORE_ID, storage_type="local", data=LIGHT),
+            *theme.stores(),
             dcc.Store(
                 id=FILTER_STORE_ID,
                 storage_type="session",
@@ -141,18 +133,7 @@ def merge_filters(
 
 
 def register_shell_callbacks(app: Dash) -> None:
-    @app.callback(
-        Output(THEME_STORE_ID, "data"),
-        Input(THEME_TOGGLE_ID, "n_clicks"),
-        State(THEME_STORE_ID, "data"),
-        prevent_initial_call=True,
-    )
-    def toggle_theme(_clicks: int | None, current: str | None) -> str:
-        return next_theme(current)
-
-    @app.callback(Output(PROVIDER_ID, "forceColorScheme"), Input(THEME_STORE_ID, "data"))
-    def apply_theme(theme: str | None) -> str:
-        return scheme_name(theme)
+    theme.register_theme_callbacks(app)
 
     @app.callback(
         Output(FILTER_STORE_ID, "data"),

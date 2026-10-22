@@ -97,9 +97,8 @@ from logdash.analyses import features
 from logdash.analyses.base import ComputeContext, register
 from logdash.analyses.features import Lru
 from logdash.analyses.templates import MISSING
-from logdash.app import figures, ui
+from logdash.app import figures, theme, ui
 from logdash.app.filters import FILTER_STORE_ID, Filters, from_dict, page_url
-from logdash.app.shell import THEME_STORE_ID
 from logdash.cache.store import CacheStore
 
 KEY = "hosts"
@@ -122,7 +121,6 @@ DEFAULT_MODE = "count"
 OUTLIER_ROWS = 25
 LABELED_OUTLIERS = 6
 LABEL_SIDES = ("top center", "bottom center", "middle right", "middle left")
-EXCLUDED_COLOR = "#adb5bd"
 TEXT_CHARS = 60
 MEMBERS_SHOWN = 8
 EXAMPLES = 3
@@ -728,7 +726,7 @@ def load_peer_centroids(store: CacheStore, template_ids: np.ndarray | None = Non
 
 
 def cluster_color(cluster: int) -> str:
-    return figures.PALETTE[(cluster - 1) % len(figures.PALETTE)]
+    return theme.PALETTE[(cluster - 1) % len(theme.PALETTE)]
 
 
 def cluster_label(profile: Profile, cluster: int) -> str:
@@ -775,8 +773,8 @@ def silhouette_figure(profile: Profile, scheme: str | None) -> go.Figure:
         return figures.empty_figure("fewer than 3 hosts: one cluster", scheme)
     values = [c["silhouette"] or 0.0 for c in cands]
     colors = [
-        figures.PALETTE[1] if c["chosen"] else figures.PALETTE[0] if c["feasible"]
-        else EXCLUDED_COLOR
+        theme.PALETTE[1] if c["chosen"] else theme.PALETTE[0] if c["feasible"]
+        else theme.colors(scheme).excluded
         for c in cands
     ]  # fmt: skip
     status = [
@@ -805,8 +803,8 @@ def silhouette_figure(profile: Profile, scheme: str | None) -> go.Figure:
             f"; grey k ({', '.join(map(str, excluded))}) are excluded because a cluster would "
             f"have fewer than {profile.fit.get('min_peers', MIN_PEERS)} hosts (hover for details)"
         )
-    figures.add_note(fig, note)
-    return figures.style(fig, scheme, height=320)
+    figures.add_note(fig, note, scheme)
+    return theme.style(fig, scheme, height=320)
 
 
 def projection_figure(profile: Profile, filters: Filters, scheme: str | None) -> go.Figure:
@@ -839,7 +837,7 @@ def projection_figure(profile: Profile, filters: Filters, scheme: str | None) ->
                 text=[figures.shorten_middle(h, 20) for h in top["host"]],
                 textposition=[LABEL_SIDES[i % len(LABEL_SIDES)] for i in range(top.height)],
                 hoverinfo="skip",
-                marker={"symbol": "diamond-open", "size": 14, "color": figures.PALETTE[1]},
+                marker={"symbol": "diamond-open", "size": 14, "color": theme.PALETTE[1]},
             )
         )  # fmt: skip
     share = profile.fit["projection_explained"]
@@ -850,8 +848,9 @@ def projection_figure(profile: Profile, filters: Filters, scheme: str | None) ->
         fig,
         f"{len(chosen)} hosts; PC1 and PC2 keep {sum(share):.0%} of the profile variance"
         + labelled,
+        scheme,
     )
-    return figures.style(fig, scheme, height=420)
+    return theme.style(fig, scheme, height=420)
 
 
 def cut_height(tree: np.ndarray, k: int) -> float | None:
@@ -901,7 +900,7 @@ def dendrogram_figure(profile: Profile, view: str, scheme: str | None) -> tuple[
     fig = go.Figure(
         go.Scatter(
             x=line_x, y=line_y, mode="lines", hoverinfo="skip", showlegend=False,
-            line={"color": "#868e96", "width": 1},
+            line={"color": theme.colors(scheme).edge, "width": 1},
         )
     )  # fmt: skip
     ypos = [float(i) for i in range(len(nodes))]
@@ -916,7 +915,7 @@ def dendrogram_figure(profile: Profile, view: str, scheme: str | None) -> tuple[
         )  # fmt: skip
     cut = cut_height(tree, cuts)
     if cut is not None:
-        fig.add_vline(x=cut, line_dash="dash", line_color=figures.PALETTE[1])
+        fig.add_vline(x=cut, line_dash="dash", line_color=theme.PALETTE[1])
     fig.update_yaxes(
         tickmode="array",
         tickvals=ypos,
@@ -929,10 +928,9 @@ def dendrogram_figure(profile: Profile, view: str, scheme: str | None) -> tuple[
         fig,
         (f"{cuts} clusters at the dashed cut; " if cut is not None else "")
         + (f"{len(nodes)} leaves" if collapsed else f"{n} hosts"),
+        scheme,
     )
-    return figures.style(fig, scheme, height=ui.pixel_height(len(nodes))), ui.pixel_height(
-        len(nodes)
-    )
+    return theme.style(fig, scheme, height=ui.pixel_height(len(nodes))), ui.pixel_height(len(nodes))
 
 
 def matrix_data(profile: Profile, filters: Filters) -> tuple[list[str], list[str], np.ndarray]:
@@ -975,7 +973,7 @@ def matrix_figure(
     fig = go.Figure(
         go.Heatmap(
             z=values, x=services, y=[figures.shorten_middle(h, 30) for h in hosts],
-            colorscale="Viridis", colorbar=bar, xgap=1, ygap=1,
+            colorscale=theme.magnitude(scheme), colorbar=bar, xgap=1, ygap=1,
             customdata=np.stack([counts, np.repeat(totals, counts.shape[1], axis=1)], axis=-1),
             text=[[h] * len(services) for h in hosts],
             hovertemplate=(
@@ -986,8 +984,10 @@ def matrix_figure(
     )  # fmt: skip
     fig.update_yaxes(autorange="reversed", type="category", tickfont={"size": 10})
     fig.update_xaxes(type="category", tickangle=-45, tickfont={"size": 10}, side="top")
-    figures.add_note(fig, f"{len(hosts)} hosts in dendrogram order x {len(services)} services")
-    return figures.style(fig, scheme, height=ui.pixel_height(len(hosts)) + 80), ui.pixel_height(
+    figures.add_note(
+        fig, f"{len(hosts)} hosts in dendrogram order x {len(services)} services", scheme
+    )
+    return theme.style(fig, scheme, height=ui.pixel_height(len(hosts)) + 80), ui.pixel_height(
         len(hosts)
     ) + 80
 
@@ -1241,7 +1241,7 @@ class Hosts:
             Input("hosts-view", "value"),
             Input("hosts-mode", "value"),
             Input(FILTER_STORE_ID, "data"),
-            Input(THEME_STORE_ID, "data"),
+            theme.theme_input(),
         )
         def draw(
             view: str | None,

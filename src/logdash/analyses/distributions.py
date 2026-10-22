@@ -16,9 +16,8 @@ from dash import Dash, Input, Output
 from dash.development.base_component import Component
 
 from logdash.analyses.base import ComputeContext, register
-from logdash.app import figures, ui
+from logdash.app import figures, theme, ui
 from logdash.app.filters import FILTER_STORE_ID, Filters, filter_frame, from_dict
-from logdash.app.shell import THEME_STORE_ID
 from logdash.cache.store import CacheStore
 from logdash.ingest.normalize import LEVELS
 
@@ -155,7 +154,7 @@ def bar_figure(
     count_axis(type=figures.axis_type(log), title="events")
     if horizontal:
         fig.update_yaxes(autorange="reversed")
-    return figures.style(fig, scheme, height=max(280, 24 * len(labels) + 120))
+    return theme.style(fig, scheme, height=max(280, 24 * len(labels) + 120))
 
 
 def histogram_figure(
@@ -180,8 +179,8 @@ def histogram_figure(
         note = (
             f"{note}; {zero:,} zero values not shown" if note else f"{zero:,} zero values not shown"
         )
-    figures.add_note(fig, note)
-    return figures.style(fig, scheme, showlegend=False)
+    figures.add_note(fig, note, scheme)
+    return theme.style(fig, scheme, showlegend=False)
 
 
 def interarrival_figure(
@@ -203,7 +202,7 @@ def interarrival_figure(
         )
     fig.update_xaxes(type="log", title="seconds between consecutive events")
     fig.update_yaxes(type=figures.axis_type(log), title="count")
-    return figures.style(fig, scheme)
+    return theme.style(fig, scheme)
 
 
 def build_figures(
@@ -262,7 +261,7 @@ class Distributions:
             [Output(gid, "figure") for gid in GRAPH_IDS],
             Input(FILTER_STORE_ID, "data"),
             Input("dist-scale", "value"),
-            Input(THEME_STORE_ID, "data"),
+            theme.theme_input(),
         )
         def update(
             filters: dict[str, Any] | None, scale: str | None, theme: str | None

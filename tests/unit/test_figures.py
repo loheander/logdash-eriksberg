@@ -1,19 +1,14 @@
 import numpy as np
+import plotly.graph_objects as go
 import polars as pl
 
-from logdash.app import figures
-
-
-def test_template_schemes_differ():
-    light, dark = figures.template("light"), figures.template(None)
-    assert light.layout.font.color != figures.template("dark").layout.font.color
-    assert dark.layout.font.color == light.layout.font.color
-    assert figures.scheme_name("dark") == "dark" and figures.scheme_name("x") == "light"
+from logdash.app import figures, theme
 
 
 def test_style_and_empty_figure():
     fig = figures.empty_figure("no data", "dark")
     assert fig.layout.annotations[0].text == "no data"
+    assert fig.layout.template.layout.font.color == theme.template("dark").layout.font.color
     assert figures.axis_type(True) == "log" and figures.axis_type(False) == "linear"
 
 
@@ -44,3 +39,10 @@ def test_choose_bin_seconds():
     assert figures.choose_bin_seconds(0, 86400) == 60
     assert figures.choose_bin_seconds(0, 86400 * 365) == 3600
     assert figures.choose_bin_seconds(5, 1) == 1
+
+
+def test_add_note_follows_scheme():
+    light = figures.add_note(go.Figure(), "n", "light").layout.annotations[0].font.color
+    dark = figures.add_note(go.Figure(), "n", "dark").layout.annotations[0].font.color
+    assert light != dark
+    assert not figures.add_note(go.Figure(), "", "dark").layout.annotations
