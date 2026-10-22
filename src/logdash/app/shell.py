@@ -36,9 +36,7 @@ def next_theme(current: str | None) -> str:
 
 def navbar_links(registry: Registry) -> list[Component]:
     links = [dmc.NavLink(label="Home", href="/", refresh=False)]
-    links += [
-        dmc.NavLink(label=a.title, href=f"/{a.key}", refresh=False) for a in registry.ordered()
-    ]
+    links += [dmc.NavLink(label=a.title, href=f"/{a.key}", refresh=False) for a in registry.pages()]
     return links
 
 

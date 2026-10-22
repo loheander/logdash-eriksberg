@@ -81,7 +81,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     settings = _settings(args)
     if not args.no_build:
         try:
-            run_build(settings)
+            run_build(settings, allow_model=False)  # serve never calls a language model (ADR001)
         except RegistryError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2

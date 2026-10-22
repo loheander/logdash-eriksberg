@@ -62,7 +62,10 @@ if any of its dependencies were merged since it was planned. If that merge confl
 send the story back to the planner.
 
 When an agent returns, check `board.sh list` against what it says it did. If the board
-disagrees, report the difference instead of fixing it silently. Three rejections of the
+disagrees, report the difference instead of fixing it silently. Then remove its worktree
+(`.claude/worktrees/agent-*`) once it is clean and fully pushed (`git status --porcelain`
+empty, `git log HEAD --not --remotes` empty). A leftover worktree keeps its story branch
+checked out, and the next agent for that story cannot check it out. Three rejections of the
 same story mean a planning problem: stop dispatching it and ask the user.
 
 ## 3. Close out
