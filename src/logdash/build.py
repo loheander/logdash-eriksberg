@@ -20,7 +20,7 @@ Log = Callable[[str], None]
 @dataclass(frozen=True)
 class StageResult:
     key: str
-    status: str  # "built" or "fresh"
+    status: str  # "built", "fresh" or "skipped" (model stage, serve)
     duration_s: float = 0.0
 
 
@@ -83,12 +83,15 @@ def run_build(
     strict: bool = False,
     registry: Registry | None = None,
     log: Log = print,
+    allow_model: bool = True,
 ) -> list[StageResult]:
     """Build stale stages (``events`` first, then analyses in topological order).
 
     ``only`` restricts the run to one stage plus its dependencies; ``force`` then
     applies to that stage alone. A stage is rebuilt if forced, missing, fingerprint
-    changed, or any upstream stage was rebuilt in this run.
+    changed, or any upstream stage was rebuilt in this run. With ``allow_model=False``
+    (used by ``serve``), stages with ``calls_model = True`` are not built even if
+    stale; they are reported as ``skipped`` and keep their previous cache.
     """
     registry = REGISTRY if registry is None else registry
     if only is None or only == EVENTS_KEY:
@@ -128,6 +131,14 @@ def run_build(
 
     for analysis in analyses:
         upstream = {EVENTS_KEY, *analysis.depends_on}
+        if not allow_model and getattr(analysis, "calls_model", False):
+            if needs_build(analysis.key, upstream):
+                log(f"{analysis.key}: stale, not built by serve (run `logdash build`)")
+                results.append(StageResult(analysis.key, "skipped"))
+            else:
+                log(f"{analysis.key}: up to date")
+                results.append(StageResult(analysis.key, "fresh"))
+            continue
         if needs_build(analysis.key, upstream):
             results.append(_build_analysis(analysis, store, manifest, settings, log, record))
         else:
