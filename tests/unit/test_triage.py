@@ -262,6 +262,7 @@ def test_judge_success(stage, con, built):
     assert out["state_ms"] > 0 and out["jev_ms"] >= 0 and out["severity"] == 2.4
     assert out["key"] == row_of(stage)["row_key"] and len(out["view"]) == len(tr.VIEW_OUTPUTS)
     body = fake.bodies[0]
+    assert out["request"] == body and out["response"] == fake.response  # for "show raw prompt"
     assert body["model"] == built.settings.jev_model and body["state"]["context"] == tr.CONTEXT
     assert body["state"]["item"]["entity"] == row_of(stage)["entity"]
 
@@ -381,7 +382,7 @@ def test_callbacks_over_http(stage, built):
         for d in deps
         if (d.get("clientside_function") or {}).get("namespace") == "triage"
     }
-    assert names == {"select", "open", "tick", "arrive", "count", "judged"}
+    assert names == {"select", "open", "tick", "arrive", "count", "judged", "raw"}
     arrive = next(d for d in deps if (d.get("clientside_function") or {}).get("function_name")
                   == "arrive")  # fmt: skip
     assert arrive["output"].count("...") + 1 == tr.FIXED_OUTPUTS + len(tr.VIEW_OUTPUTS)
@@ -498,3 +499,30 @@ def test_js_count_and_judged():
     }
     assert run_js(f"t => t.judged({{j: {{severity: 1}}}}, {rows})") == "NU"
     assert run_js(f"t => t.judged({{k: 2, j: null}}, {rows})") == "NU"  # an older session format
+
+
+def test_judge_keeps_the_raw_exchange_when_an_answer_is_wrong(stage, con, built):
+    bad = {"answers": {**answers(), "severity": {"type": "noul", "noul": 1}}}
+    out = tr.judge(con, row_of(stage), {}, built.settings, "sk", Fake(bad))
+    assert out["error"] and out["response"] == bad and out["request"]["questions"]
+    failed = tr.judge(con, row_of(stage), {}, built.settings, None, Fake())
+    assert failed["response"] is None and failed["request"]["state"]["context"] == tr.CONTEXT
+
+
+@needs_node
+def test_js_raw():
+    assert run_js("t => t.raw(0, null, null)") == ["NU"] * 5
+    waiting = run_js("t => t.raw(1, {key: 'a', n: 1, request: {}}, {key: 'b', n: 2})")
+    assert waiting[0] is True and "not answered yet" in waiting[1]
+    assert "No row" in run_js("t => t.raw(1, null, null)")[1]
+    request = {"model": "m", "state": {"context": "ctx", "item": {"entity": "e"}},
+               "questions": {"q": {"type": "noul"}}}  # fmt: skip
+    result = {"key": "k", "n": 3, "error": None, "request": request, "response": {"answers": {}}}
+    out = run_js(f"t => t.raw(2, {json.dumps(result)}, {{key: 'k', n: 3}})")
+    assert out[0] is True and out[1] == "Call 3 for this row." and out[2] == "ctx"
+    prompt = json.loads(out[3])
+    assert prompt == {"model": "m", "state": {"item": {"entity": "e"}}, "questions": request[
+        "questions"]} and json.loads(out[4]) == {"answers": {}}  # fmt: skip
+    failed = {**result, "error": "HTTP 401", "response": None}
+    out = run_js(f"t => t.raw(2, {json.dumps(failed)}, {{key: 'k', n: 3}})")
+    assert "failed: HTTP 401" in out[1] and out[4] == "(no response: HTTP 401)"

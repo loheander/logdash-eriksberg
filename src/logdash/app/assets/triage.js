@@ -7,6 +7,7 @@
  *         a result for another call than the selected one is ignored.
  * count:  count the numbers up from their previous values over the same 250 ms.
  * judged: put the session's severities and subsystems into the grid rows.
+ * raw:    show the request sent to Jev and the response of the selected row's last call.
  */
 (function () {
   var FIXED = 9; // fixed outputs of arrive before the view outputs (triage.FIXED_OUTPUTS)
@@ -148,6 +149,21 @@
         return Object.assign({}, r, {judged: e.severity, subsystem: e.subsystem || r.subsystem});
       });
       return update.length ? {update: update} : dc().no_update;
+    },
+
+    raw: function (clicks, result, selected) {
+      if (!clicks) return same(5, dc().no_update);
+      var pretty = function (value) { return JSON.stringify(value, null, 2); };
+      if (!result || !selected || result.key !== selected.key || !result.request) {
+        var why = selected ? "The call for this row has not answered yet." : "No row is selected.";
+        return [true, why, "", "", ""];
+      }
+      var request = result.request;
+      var state = request.state || {};
+      var prompt = {model: request.model, state: {item: state.item}, questions: request.questions};
+      var output = result.response ? pretty(result.response) : "(no response: " + result.error + ")";
+      var note = "Call " + result.n + " for this row" + (result.error ? ", failed: " + result.error : "") + ".";
+      return [true, note, state.context || "", pretty(prompt), output];
     },
   };
 

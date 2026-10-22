@@ -587,7 +587,11 @@ def judge(
     key: str | None,
     poster: jev.Poster = jev.http_post,
 ) -> dict[str, Any]:
-    """Build the state of one row and ask Jev; a failure is an ``error``, never a default."""
+    """Build the state of one row and ask Jev; a failure is an ``error``, never a default.
+
+    The result keeps the exact ``request`` body and the raw ``response`` (None when no answer
+    came back), shown by "show raw prompt".
+    """
     t0 = time.perf_counter()
     result: dict[str, Any] = {"key": row["row_key"], "state_ms": None, "jev_ms": None}
     try:
@@ -595,20 +599,19 @@ def judge(
     except duckdb.Error as error:
         return {**result, "error": f"the state query failed: {error}"}
     state = build_state(row, facts, templates)
-    result |= {"state_ms": (time.perf_counter() - t0) * 1000, "subsystem": state["subsystem"]}
+    body = jev.request_body(settings.jev_model, CONTEXT, QUESTIONS, state)
+    result |= {
+        "state_ms": (time.perf_counter() - t0) * 1000,
+        "subsystem": state["subsystem"],
+        "request": body,
+        "response": None,
+    }
     if key is None:
         return {**result, "error": f"{jev.KEY_ENV} is not set, so the model cannot be asked."}
     t1 = time.perf_counter()
     try:
-        decision = jev.decide(
-            key,
-            state,
-            questions=QUESTIONS,
-            context=CONTEXT,
-            model=settings.jev_model,
-            timeout_s=settings.jev_timeout_s,
-            poster=poster,
-        )
+        result["response"] = jev.post_with_retry(poster, key, body, settings.jev_timeout_s)
+        decision = jev.parse_decision(result["response"], QUESTIONS, settings.jev_model)
     except jev.JevError as error:
         return {**result, "jev_ms": (time.perf_counter() - t1) * 1000, "error": str(error)}
     view, numbers = answer_view(decision.answers)
@@ -915,6 +918,11 @@ def drawer(model: str) -> Component:
                         refresh=False,
                     ),
                     dmc.Anchor("all anomalies", href="/anomalies", size="xs", refresh=False),
+                    html.Span(
+                        dmc.Text("show raw prompt", size="xs", style=LINK),
+                        id="triage-raw-open",
+                        n_clicks=0,
+                    ),
                 ],
                 gap="md",
             ),  # fmt: skip
@@ -962,6 +970,46 @@ def drawer(model: str) -> Component:
         closeOnClickOutside=False,
         title=dmc.Text("Triage", fw=600),
     )
+
+
+# A text that looks like the Anchors next to it but runs a callback instead of following a link.
+LINK = {"color": "var(--mantine-color-anchor)", "cursor": "pointer"}
+
+PRE = {
+    "whiteSpace": "pre-wrap",
+    "wordBreak": "break-word",
+    "fontSize": 12,
+    "maxHeight": 320,
+    "overflow": "auto",
+    "margin": 0,
+    "padding": 8,
+    "borderRadius": 4,
+    "background": "var(--mantine-color-default-hover)",
+}
+
+
+def raw_modal() -> Component:
+    """What was sent to and returned by Jev for the selected row, filled clientside."""
+    block = lambda title, id_: dmc.Stack(  # noqa: E731
+        [dmc.Text(title, fw=600, size="sm"), html.Pre("", id=id_, style=PRE)], gap=4
+    )
+    return dmc.Modal(
+        dmc.Stack(
+            [
+                dmc.Text("", id="triage-raw-note", size="xs", c="dimmed"),
+                block("Context (shared by every item)", "triage-raw-context"),
+                block("Prompt (model, item and questions; the context is shown above)",
+                      "triage-raw-prompt"),
+                block("Output (the response as returned)", "triage-raw-output"),
+            ],
+            gap="sm",
+        ),
+        id="triage-raw",
+        title=dmc.Text("Raw prompt", fw=600),
+        size="xl",
+        opened=False,
+        zIndex=400,  # above the drawer
+    )  # fmt: skip
 
 
 def grid() -> Component:
@@ -1119,6 +1167,7 @@ class Triage:
                 data={"model": model.split("/")[-1], "view_n": len(VIEW_OUTPUTS)},
             ),
             dcc.Interval(id="triage-tick", interval=TICK_MS, disabled=True),
+            raw_modal(),
             description=(
                 "The detectors say how unusual a window is, not whether anyone must act. A "
                 f"click on a row or a point sends one request to {model} with the row's "
@@ -1241,6 +1290,18 @@ class Triage:
             Output("triage-grid", "rowTransaction"),
             Input("triage-session", "data"),
             State("triage-grid", "rowData"),
+            prevent_initial_call=True,
+        )
+        app.clientside_callback(
+            ClientsideFunction("triage", "raw"),
+            Output("triage-raw", "opened"),
+            Output("triage-raw-note", "children"),
+            Output("triage-raw-context", "children"),
+            Output("triage-raw-prompt", "children"),
+            Output("triage-raw-output", "children"),
+            Input("triage-raw-open", "n_clicks"),
+            State("triage-result", "data"),
+            State("triage-selected", "data"),
             prevent_initial_call=True,
         )
 

@@ -183,7 +183,11 @@ def decide(
 ) -> Decision:
     """Ask every question about ``item``; raises ``JevError`` if the call or an answer fails."""
     body = request_body(model, context, questions, item)
-    resp = post_with_retry(poster, key, body, timeout_s)
+    return parse_decision(post_with_retry(poster, key, body, timeout_s), questions, model)
+
+
+def parse_decision(resp: Mapping[str, Any], questions: Mapping[str, Any], model: str) -> Decision:
+    """The normalised answers of a response; raises ``JevError`` for a missing or wrong one."""
     got = resp.get("answers")
     if not isinstance(got, dict):
         raise JevError("the response has no answers")

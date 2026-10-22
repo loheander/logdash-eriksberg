@@ -68,7 +68,8 @@ decision model on OpenRouter (`typesafe/jev-1.14`) and shows the answers in a dr
 
 The call is live and not cached: a timer runs while it waits, and the delay is split into
 the state query, the Jev call and the rest (about 0.3 to 0.5 s in all). "ask again" repeats
-the call. The questions are a constant in `analyses/triage.py`; the drawer footer shows the
+the call, and "show raw prompt" opens the exact request (context, item and questions) and
+the response as returned. The questions are a constant in `analyses/triage.py`; the drawer footer shows the
 model and the hash of the spec. The subsystem of a row comes from its service name, not
 from the model.
 
