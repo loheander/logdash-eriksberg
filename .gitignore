@@ -11,3 +11,4 @@ htmlcov/
 dist/
 *.egg-info/
 .env
+.mcp.json
