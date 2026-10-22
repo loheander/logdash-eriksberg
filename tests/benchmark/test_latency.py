@@ -85,7 +85,7 @@ def test_app_start(store: CacheStore) -> None:
 
 
 def test_layouts(store: CacheStore) -> None:
-    for analysis in REGISTRY.ordered():
+    for analysis in REGISTRY.pages():
         measure(f"{analysis.key}.layout", "-", LAYOUT_BUDGET_S, lambda a=analysis: a.layout(store))  # type: ignore[misc]
 
 
