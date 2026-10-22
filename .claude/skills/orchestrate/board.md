@@ -73,9 +73,9 @@ Slugs are kebab-case and at most 5 words.
   not `main`.
 - When all stories are Done, the orchestrator opens a PR from the feature branch to
   `main` for human review. No PR is merged without review.
-- Plans live at `plans/yyyy-mm-dd-<story-slug>-vv.md` (vv = 01, 02, …; a replan adds a
+- Plans live at `plans/yyyy-mm-dd-<story-slug>-v<n>.md` (v1, v2, …; a replan adds a
   new version, never edits an old one). Conventions: the `plan-story` skill.
-- Architectural decisions: `adr/ADRXXX-title.md`.
+- Architectural decision records: `adrs/ADR<nnn>-title.md` (see `plan-story`).
 - The planner opens a **draft PR** for the story branch, with body `Story #<story>`.
   (`Closes` only fires on merges to `main`, so the orchestrator closes merged stories.)
   All discussion about the story (rejections, review findings) goes on that PR.
@@ -100,7 +100,9 @@ All must pass (coverage gate 90 %). Never weaken a test or the gate to make it p
 ## Commands
 
 Use `board.sh` (same folder) for the board. For issues, always use `--json`:
-plain `gh issue view` prints nothing in this environment.
+plain `gh issue view` prints nothing in this environment. In agent worktrees, run git
+and `gh` commands one at a time (no `&&` chains) and pass multi-line text with
+`--body-file`; chained commands and inline multi-line bodies are refused there.
 
 ```bash
 B=.claude/skills/orchestrate/board.sh

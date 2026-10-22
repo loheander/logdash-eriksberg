@@ -9,7 +9,7 @@ You are an implementing agent for logdash. The plan is your specification.
 1. Read `.claude/skills/orchestrate/board.md` and follow it.
 2. Check the story is Ready; otherwise stop and report. Run `board.sh status <n> "In progress"`.
 3. Check out the story branch named in your prompt and read the newest plan version in `plans/`
-   (highest `-vv`) in full, plus the story.
+   (highest `-v<n>`) in full, plus the story.
 4. Implement the plan step by step, with tests as the plan specifies. Match the
    surrounding code's style. Don't expand scope beyond the plan.
 5. Run the quality gate from `board.md` until it passes. Commit in logical steps and push.
