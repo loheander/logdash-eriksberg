@@ -46,3 +46,38 @@ def test_novel_fraction_must_be_between_zero_and_one(bad):
         Settings.from_env({"LOGDASH_NOVEL_FRACTION": bad})
     with pytest.raises(ValueError, match="novel_fraction"):
         Settings().with_overrides(novel_fraction=float(bad))
+
+
+def test_tag_model_from_env_and_default():
+    from logdash.config import DEFAULT_TAG_MODEL
+
+    assert Settings.from_env({}).tag_model == DEFAULT_TAG_MODEL
+    assert Settings.from_env({"LOGDASH_TAG_MODEL": "x/y"}).tag_model == "x/y"
+    assert Settings.from_env({"LOGDASH_TAG_MODEL": ""}).tag_model == DEFAULT_TAG_MODEL
+
+
+def test_key_from_env_and_dotenv(tmp_path, monkeypatch):
+    from logdash import config
+
+    monkeypatch.setattr(config, "DOTENV_PATH", tmp_path / "missing.env")
+    assert Settings.from_env().openrouter_api_key is None
+    assert not Settings.from_env().tagging_enabled
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("OPENROUTER_API_KEY=sk-secret\n")
+    monkeypatch.setattr(config, "DOTENV_PATH", dotenv)
+    s = Settings.from_env()
+    assert s.openrouter_api_key == "sk-secret" and s.tagging_enabled
+    assert "sk-secret" not in repr(s)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-env")
+    assert Settings.from_env().openrouter_api_key == "sk-env"
+    assert Settings.from_env({}).openrouter_api_key is None  # explicit env: no .env
+
+
+def test_read_dotenv_parsing(tmp_path):
+    from logdash.config import read_dotenv
+
+    path = tmp_path / ".env"
+    path.write_text(
+        "# comment\n\nA=1\nexport B = two \nC='quoted'\nD=\"dq\"\nno equals here\nE=\nF='\n"
+    )
+    assert read_dotenv(path) == {"A": "1", "B": "two", "C": "quoted", "D": "dq", "E": "", "F": "'"}
