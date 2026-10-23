@@ -18,10 +18,11 @@ import pytest
 
 from logdash.analyses import anomalies, features, hosts, load_builtin, pca
 from logdash.analyses.base import REGISTRY
-from logdash.analyses.explorer import fetch_page, search_page
+from logdash.analyses.explorer import TagRestriction, fetch_page, search_page, tag_restriction
 from logdash.analyses.temporal import Temporal
 from logdash.app.filters import from_dict
 from logdash.app.main import create_app, filter_options
+from logdash.app.tag_filters import TagFilter, load_tags
 from logdash.cache.store import CacheStore
 from logdash.config import Settings
 
@@ -389,6 +390,60 @@ def test_explorer(store: CacheStore) -> None:
                 con.cursor(), store, from_dict(f), **k
             ),
         )
+
+
+ACTIONABLE_PROXY = r"(?i)error|fail|exception|refused|timeout"
+
+
+def _tag_restrictions(
+    store: CacheStore,
+) -> tuple[str, TagRestriction | None, TagRestriction | None]:
+    """(source, hide noise, actionable only): real tags if cached, else stand-ins.
+
+    Stand-ins: template 1 (the largest) as noise, and the templates whose text reads like a
+    failure as actionable (53 templates, about 119 000 lines on the real cache).
+    """
+    if load_tags(store) is not None:
+        return (
+            "real",
+            tag_restriction(store, TagFilter(hide_noise=True)),
+            tag_restriction(store, TagFilter(actionable_only=True)),
+        )
+    t = store.read_parquet("templates", "templates.parquet")
+    ids = t.filter(pl.col("template").str.contains(ACTIONABLE_PROXY))["template_id"].to_list()
+    return "proxy", TagRestriction((1,), keep=False), TagRestriction(tuple(sorted(ids)), keep=True)
+
+
+def test_explorer_tags(store: CacheStore) -> None:
+    con = store.connect()
+    src, hide, act = _tag_restrictions(store)
+    hour = _hour_filters(store)
+    host = _cases(store)["host"]
+    cases: dict[str, tuple[dict[str, Any] | None, dict[str, Any]]] = {
+        "hide noise": (None, {"tags": hide}),
+        "hide noise, page 50": (None, {"tags": hide, "page": 50}),
+        "hide noise, template 5": (None, {"tags": hide, "template": 5}),
+        "actionable": (None, {"tags": act}),
+        "actionable, page 5": (None, {"tags": act, "page": 5}),
+        "actionable, 1 hour": (hour, {"tags": act}),
+        "actionable, host": (host, {"tags": act}),
+        "actionable, text 'error'": (None, {"tags": act, "text": "error"}),
+    }
+    for name, (filters, kw) in cases.items():
+        measure(
+            "explorer.fetch_page",
+            f"tags ({src}): {name}",
+            CALLBACK_BUDGET_S,
+            lambda f=filters, k=kw: (search_page if "text" in k else fetch_page)(  # type: ignore[misc]
+                con.cursor(), store, from_dict(f), **k
+            ),
+        )
+    measure(
+        "explorer.tag_restriction",
+        "all three",
+        CALLBACK_BUDGET_S,
+        lambda: tag_restriction(store, TagFilter(True, True, ("network", "storage"))),
+    )
 
 
 def test_zz_print_table() -> None:
