@@ -27,6 +27,8 @@ Other commands:
 ```bash
 uv run logdash build --only templates --force   # rebuild one stage
 uv run logdash build --only tags --force        # retry untagged templates (answers are memoised)
+uv run logdash spot-check sample                # review sheet of 30 tagged templates (cache only)
+uv run logdash spot-check score                 # agreement from the marked sheet
 uv run logdash build --strict                   # fingerprint file content, not mtime
 uv run logdash status                           # cache state per stage
 uv run logdash serve --no-build --port 8051     # serve the existing cache as is

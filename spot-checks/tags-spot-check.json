@@ -1,0 +1,18 @@
+{
+  "model": "anthropic/claude-haiku-5.5",
+  "prompt_version": "1",
+  "seed": 24,
+  "size": 30,
+  "templates": 281,
+  "untagged": 0,
+  "population": {
+    "actionable": 37,
+    "noise": 188,
+    "other": 56
+  },
+  "sampled": {
+    "actionable": 10,
+    "noise": 10,
+    "other": 10
+  }
+}
