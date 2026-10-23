@@ -30,8 +30,7 @@ SHEET_COLUMNS = (
     *AGREE_COLUMNS,
     "note",
 )
-AGREE_WORDS = frozenset({"agree", "a", "yes", "y"})
-DISAGREE_WORDS = frozenset({"disagree", "d", "no", "n"})
+MARKS: dict[str, bool] = {"agree": True, "disagree": False}
 DEFAULT_SHEET = Path("spot-checks/tags-spot-check.csv")
 DEFAULT_REPORT = Path("spot-checks/tags-spot-check-results.md")
 META_KEYS = (
@@ -186,13 +185,14 @@ def write_sheet(path: Path, picked: pl.DataFrame, meta: Mapping[str, Any]) -> Pa
 
 
 def parse_mark(value: str | None, where: str) -> bool | None:
+    """`agree` -> True, `disagree` -> False, empty -> None (case and outer
+    whitespace ignored). Anything else is an error: yes/no would clash with the
+    yes/no tag columns."""
     v = (value or "").strip().lower()
     if not v:
         return None
-    if v in AGREE_WORDS:
-        return True
-    if v in DISAGREE_WORDS:
-        return False
+    if v in MARKS:
+        return MARKS[v]
     raise ValueError(f"{where}: {value!r} is not agree or disagree")
 
 

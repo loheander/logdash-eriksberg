@@ -11,14 +11,16 @@ template text, the service and the line count, not from the log level.
 
 | Column | Write `agree` when |
 |---|---|
-| `agree_actionable` | you would also say the message does (`yes`) or does not (`no`) report a failure or degraded state an operator should look into |
+| `agree_actionable` | you would also say the message does (tag `yes`) or does not (tag `no`) report a failure or degraded state an operator should look into |
 | `agree_component` | the component is the one area the message is about, or a defensible choice when two fit |
-| `agree_noise` | you would also hide (`yes`) or keep (`no`) this message while triaging |
+| `agree_noise` | you would also hide (tag `yes`) or keep (tag `no`) this message while triaging |
 | `agree_summary` | the summary says correctly, in plain language, what happened |
 
-Write `agree` or `disagree` (`a`/`d`, `yes`/`no` and `y`/`n` also work). Leave a cell
-empty only if you cannot judge it; empty cells are not counted. Say why in `note` when
-you disagree. Do not change `template_id`.
+In each `agree_*` cell write exactly `agree` or `disagree` (upper or lower case is
+fine). Do not write `yes`/`no`, `y`/`n` or `a`/`d`: the tag columns already hold
+`yes`/`no`, so those would be ambiguous, and `spot-check score` rejects them with the
+line and column. Leave a cell empty only if you cannot judge it; empty cells are not
+counted. Say why in `note` when you disagree. Do not change `template_id`.
 
 Then run `uv run logdash spot-check score` and commit the sheet and
 `tags-spot-check-results.md`.

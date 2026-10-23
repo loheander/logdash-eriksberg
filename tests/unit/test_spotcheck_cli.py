@@ -77,14 +77,14 @@ def test_cli_spot_check_errors(cache_dir, tmp_path, monkeypatch, capsys):
     sheet = tmp_path / spotcheck.DEFAULT_SHEET
     with open(sheet, encoding="utf-8-sig", newline="") as fh:
         rows = list(csv.DictReader(fh))
-    rows[0]["agree_noise"] = "maybe"
+    rows[0]["agree_noise"] = "no"
     with open(sheet, "w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=spotcheck.SHEET_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
     capsys.readouterr()
     assert main(["spot-check", "score"]) == 2
-    assert "not agree or disagree" in capsys.readouterr().err
+    assert "agree_noise: 'no' is not agree or disagree" in capsys.readouterr().err
 
 
 def test_cli_spot_check_requires_action():

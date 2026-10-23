@@ -184,7 +184,7 @@ def sheet_text(rows, delimiter=","):
 def test_read_sheet_variants(tmp_path, delimiter):
     text = sheet_text(
         [
-            (1, ["Agree", " y ", "D", "no"], "  two   words "),
+            (1, ["Agree", " agree ", "DISAGREE", " disagree "], "  two   words "),
             (2, ["", "", "", ""], ""),
         ],
         delimiter,
@@ -203,6 +203,10 @@ def test_read_sheet_variants(tmp_path, delimiter):
     ("text", "match"),
     [
         (sheet_text([(1, ["maybe", "", "", ""], "")]), r":2: agree_actionable"),
+        (
+            sheet_text([(1, ["no", "", "", ""], "")]),
+            r":2: agree_actionable: 'no' is not agree or disagree",
+        ),
         (sheet_text([(1, ["", "", "", ""], ""), (2, ["", "", "x", ""], "")]), r":3: agree_noise"),
         ("template_id,template\n1,x\n", "missing column"),
         (
@@ -217,6 +221,27 @@ def test_read_sheet_errors(tmp_path, text, match):
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError, match=match):
         sc.read_sheet(path)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("agree", True),
+        ("AGREE", True),
+        (" Disagree\t", False),
+        ("", None),
+        ("   ", None),
+        (None, None),
+    ],
+)
+def test_parse_mark_accepts(value, expected):
+    assert sc.parse_mark(value, "w") == expected
+
+
+@pytest.mark.parametrize("value", ["yes", "no", "y", "n", "a", "d", "Yes", "agreed", "x"])
+def test_parse_mark_rejects(value):
+    with pytest.raises(ValueError, match=r"^w: .* is not agree or disagree$"):
+        sc.parse_mark(value, "w")
 
 
 def marked(tid, marks, note="", values=None):
