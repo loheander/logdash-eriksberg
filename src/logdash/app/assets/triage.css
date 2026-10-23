@@ -1,0 +1,5 @@
+/* Triage drawer: the confidence rings move like the bars (RingProgress has no transition prop). */
+.triage-ring .mantine-RingProgress-curve {
+  transition: stroke-dasharray 250ms ease-out, stroke-dashoffset 250ms ease-out,
+    stroke 250ms ease-out;
+}
