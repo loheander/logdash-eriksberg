@@ -78,3 +78,21 @@ to see the timing table.
 bigger machine (set `LOGDASH_THREADS` and `LOGDASH_MEMORY_LIMIT`), copy the whole
 `cache/` directory to the laptop and run `uv run logdash serve --no-build`. The app
 never reads `data/`.
+
+## Agent SDLC
+
+Issues on the [project board](https://github.com/users/loheander/projects/1) are
+planned, implemented, reviewed and merged by Claude Code agents. See
+[ADR001](adrs/ADR001-agent-orchestrated-sdlc.md) for the design and
+`.claude/sdlc/protocol.md` for the rules.
+
+```bash
+claude --agent orchestrator "/orchestrate-kanban dry-run"      # what would be dispatched
+claude --agent orchestrator "/orchestrate-kanban only 26"      # run one issue end to end
+claude --agent orchestrator "/loop 30m /orchestrate-kanban"    # keep working the board
+```
+
+Backlog → planner (plan comment) → Ready → implementer (PR) → In review → reviewer
+(review rounds, fixes by the implementer) → Jev gate → Done (auto-merged) or Human
+review. Every 5 finished PRs a retrospective opens a PR that tunes the agents. Humans
+answer `needs-human` questions on issues (then remove the label) and merge Human-review and retrospective PRs.
