@@ -113,6 +113,16 @@ SEMANTIC_TEMPLATE = "Lost connection to AMQP server on {ip}:{n}, retrying in {n}
 SEMANTIC_SERVICE = SERVICES[3]  # libvirt
 SEMANTIC_HOST = HOSTS[4]
 CONTEXT_TEMPLATE = 0  # in the window the host logs only this template (of the first service)
+# Spikes to forecast (``SyntheticSpec.forecast_spikes``): each one is preceded by a short burst
+# of a WARNING template, too small to be a spike itself, so a model can see it coming. They skip
+# the silent host (a spike inside its gap would make the precursor a spike too) and the spike
+# host (one of them would land on its spike at 30 % of the span).
+FORECAST_HOSTS = [h for h in HOSTS if h not in (SILENT_HOST, SPIKE_HOST)]
+FORECAST_SERVICE = SERVICES[3]  # libvirt: one template, the spike lines use it
+PRECURSOR_TEMPLATE = "Memory pressure on hypervisor: {n} pages reclaimed in the last interval"
+FORECAST_SPIKE_ROWS = 600  # over two minutes: about 300 lines per minute
+PRECURSOR_RATE = 8  # WARNING lines in each precursor minute
+FORECAST_JITTER = 3  # minutes, either way
 
 
 @dataclass(frozen=True)
@@ -135,6 +145,11 @@ class SyntheticSpec:
     # contextual tests ask for it (``tests/unit/test_contextual.py``, a dataset of their own).
     context_minutes: int = 0
     context_busy_rows: int = 0
+    # Spikes with a precursor for the forecasting lab (0: none), from a generator of their own.
+    # Each spike fills two whole minutes on one host, after ``precursor_minutes`` minutes of a
+    # few WARNING lines of PRECURSOR_TEMPLATE.
+    forecast_spikes: int = 0
+    precursor_minutes: int = 3
 
 
 @dataclass
@@ -167,6 +182,10 @@ class GroundTruth:
     semantic_start: datetime = START
     semantic_end: datetime = START
     semantic_service: str = SEMANTIC_SERVICE[0]
+    # Onsets (whole minutes, time-zone aware) and hosts (as in the cache: no DNS domain) of the
+    # spikes injected with ``forecast_spikes``
+    forecast_onsets: list[datetime] = field(default_factory=list)
+    forecast_hosts: list[str] = field(default_factory=list)
 
 
 def _fill(rng: random.Random, template: str) -> str:
@@ -286,6 +305,29 @@ def generate_rows(spec: SyntheticSpec) -> tuple[list[dict], GroundTruth]:
         row = _row(ts, err, ERROR_HOST, ERROR_SERVICE, _fill(err, ERROR_TEMPLATE))
         row["log_level"] = "ERROR"
         rows.append(row)
+
+    # Spikes to forecast, each after a short WARNING precursor on the same host. Onsets fall on
+    # whole minutes so a spike fills exactly two 1-minute bins. A separate generator keeps the rest
+    # of the data as it was.
+    fc = random.Random(spec.seed + 5000)
+    for i in range(spec.forecast_spikes):
+        at = START + (end - START) * (0.10 + 0.85 * (i + 0.5) / spec.forecast_spikes)
+        jitter = timedelta(minutes=fc.randint(-FORECAST_JITTER, FORECAST_JITTER))
+        onset = at.replace(second=0, microsecond=0) + jitter
+        host = FORECAST_HOSTS[i % len(FORECAST_HOSTS)]
+        truth.forecast_onsets.append(onset)
+        truth.forecast_hosts.append(host.split(".", 1)[0])
+        for m in range(spec.precursor_minutes):
+            lo = onset - timedelta(minutes=spec.precursor_minutes - m)
+            for _ in range(PRECURSOR_RATE):
+                ts = _random_time(fc, lo, lo + timedelta(minutes=1))
+                row = _row(ts, fc, host, FORECAST_SERVICE, _fill(fc, PRECURSOR_TEMPLATE))
+                row["log_level"] = "WARNING"
+                rows.append(row)
+        for _ in range(FORECAST_SPIKE_ROWS):
+            ts = _random_time(fc, onset, onset + timedelta(minutes=2))
+            payload = _fill(fc, FORECAST_SERVICE[3][0])
+            rows.append(_row(ts, fc, host, FORECAST_SERVICE, payload))
 
     # INFO lines of a failure-like template: the main generator is not touched
     sem = random.Random(spec.seed + 5000)

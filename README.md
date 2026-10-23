@@ -60,6 +60,10 @@ Variables can also be set in `.env` in the working directory; the real environme
 Only `logdash build` calls the model; `serve` builds every other stale stage but leaves
 `tags` as it is.
 
+## Forecasting lab
+
+The **Forecasting** page (`/forecast`) is built by the `forecast` stage (after `hosts`; rebuilt when `LOGDASH_BURST_K` changes). The stage writes `cache/forecast/frame.parquet`, one row per host and minute with the spike label and five feature groups (templates, levels, services, peers, lags), and `meta.json`. The page shows the spike minutes over time with the train, validation and test periods (first 7/12, next 1/12, last 1/3 of the span) and the share of positive samples for 1, 5 and 15 minute horizons. Global filters do not apply. Design: [ADR003](adrs/ADR003-spike-forecasting-lab.md).
+
 ## Tests
 
 ```bash
@@ -69,7 +73,7 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy src
 ```
 
 The benchmark times every page layout and callback (no filter, one hour, host,
-template, text search, brushing, anomaly types and sorts, template and explorer tag filters) and asserts each is under 300 ms; run it with `-s`
+template, text search, brushing, anomaly types and sorts, template and explorer tag filters, forecast chart) and asserts each is under 300 ms; run it with `-s`
 to see the timing table.
 
 ## Building elsewhere

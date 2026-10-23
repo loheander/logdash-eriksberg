@@ -323,6 +323,17 @@ def test_hosts_cold(store: CacheStore) -> None:
         over.append(f"hosts.draw cold {cold * 1000:.0f} ms")
 
 
+def test_forecast(store: CacheStore) -> None:
+    fns = _recorded(store, "forecast")
+    for theme in ("light", "dark"):
+        measure(
+            "forecast.draw_spikes",
+            theme,
+            CALLBACK_BUDGET_S,
+            lambda t=theme: fns["draw_spikes"](t),  # type: ignore[misc]
+        )
+
+
 ANOMALY_CASES = (
     ([], "overall"),
     (["structural"], "time"),
