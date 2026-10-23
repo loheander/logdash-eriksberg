@@ -26,6 +26,7 @@ Other commands:
 
 ```bash
 uv run logdash build --only templates --force   # rebuild one stage
+uv run logdash build --only tags --force        # retry untagged templates (answers are memoised)
 uv run logdash build --strict                   # fingerprint file content, not mtime
 uv run logdash status                           # cache state per stage
 uv run logdash serve --no-build --port 8051     # serve the existing cache as is
@@ -50,6 +51,12 @@ Environment variables; CLI flags (`--data`, `--cache`, `--memory-limit`, `--thre
 | `LOGDASH_PARAM_SAMPLE` | `2000` | payloads sampled per top template |
 | `LOGDASH_RARE_THRESHOLD` | `5` | a template with at most this many events is rare |
 | `LOGDASH_NOVEL_FRACTION` | `0.1` | novel: first seen in the last fraction of the span |
+| `LOGDASH_TAG_MODEL` | `anthropic/claude-haiku-5.5` | OpenRouter model for semantic template tags (it must support structured outputs) |
+| `OPENROUTER_API_KEY` | (unset) | enables the `tags` stage; without it the stage is skipped |
+
+Variables can also be set in `.env` in the working directory; the real environment wins.
+Only `logdash build` calls the model; `serve` builds every other stale stage but leaves
+`tags` as it is.
 
 ## Tests
 
@@ -60,7 +67,7 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy src
 ```
 
 The benchmark times every page layout and callback (no filter, one hour, host,
-template, text search, brushing, anomaly types and sorts) and asserts each is under 300 ms; run it with `-s`
+template, text search, brushing, anomaly types and sorts, template tag filters) and asserts each is under 300 ms; run it with `-s`
 to see the timing table.
 
 ## Building elsewhere

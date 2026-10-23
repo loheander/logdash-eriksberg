@@ -17,6 +17,7 @@ from logdash.analyses.explorer import fetch_page, link_from_query, merge_link
 from logdash.analyses.features import Features
 from logdash.analyses.hosts import Hosts
 from logdash.analyses.pca import Pca
+from logdash.analyses.tags import Tags
 from logdash.analyses.templates import Templates
 from logdash.analyses.temporal import Temporal
 from logdash.app.filters import Filters
@@ -40,7 +41,7 @@ from tests.synthetic import GroundTruth, utc
 
 @pytest.fixture(scope="module")
 def stage(built):
-    build_with(built, Templates(), Features(), Pca(), Temporal(), Hosts(), Anomalies())
+    build_with(built, Templates(), Tags(), Features(), Pca(), Temporal(), Hosts(), Anomalies())
     return built.store
 
 
@@ -404,7 +405,7 @@ def test_analysis_follows_the_registered_detectors():
     registry.add(Fake("other"))
     assert analysis.version != version and "other=1" in analysis.version
     assert analysis.version.startswith(f"{base.FRAMEWORK_VERSION}:{an.MAX_PER_ENTITY}:")
-    assert Anomalies().depends_on == ("features", "hosts", "pca", "templates", "temporal")
+    assert Anomalies().depends_on == ("features", "hosts", "pca", "tags", "templates", "temporal")
 
 
 def run_stage(built, tmp_path, registry, log=None):
@@ -1021,7 +1022,8 @@ def test_layout_and_callback_over_http(stage, built):
 
     assert "anomalies-timeline" in str(Anomalies().layout(stage))
     app = create_app(
-        stage, build_with(built, Templates(), Features(), Pca(), Temporal(), Hosts(), Anomalies())
+        stage,
+        build_with(built, Templates(), Tags(), Features(), Pca(), Temporal(), Hosts(), Anomalies()),
     )
     client = app.server.test_client()
     assert client.get("/anomalies").status_code == 200

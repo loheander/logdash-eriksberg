@@ -16,6 +16,7 @@ from logdash.analyses.base import Registry
 from logdash.analyses.features import Features
 from logdash.analyses.hosts import Centroids, Hosts
 from logdash.analyses.pca import Pca
+from logdash.analyses.tags import Tags
 from logdash.analyses.templates import Templates
 from logdash.analyses.temporal import Temporal
 from logdash.build import run_build
@@ -162,7 +163,7 @@ def injected(tmp_path_factory: pytest.TempPathFactory) -> tuple[CacheStore, Any]
     settings = Settings(data_dir, tmp_path_factory.mktemp("context_cache"), "1GB", 2)
     run_build(settings, registry=Registry(), log=lambda _: None)
     built = Built(settings, CacheStore(settings.cache_dir, settings))
-    build_with(built, Templates(), Features(), Pca(), Temporal(), Hosts(), Anomalies())
+    build_with(built, Templates(), Tags(), Features(), Pca(), Temporal(), Hosts(), Anomalies())
     return built.store, truth
 
 
