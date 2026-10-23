@@ -12,7 +12,8 @@ kind) is what the page sorts by, so that no detector with many rows fills the to
 
 The page reads that table only. The analysis depends on, and is invalidated by, whatever the
 registered detectors depend on and their versions, so a new detector module changes neither this
-file nor the page: the type filter, the timeline and the table follow the data.
+file nor the page: the type filter, the timeline and the table follow the data. Semantic tag
+filters (ADR002) restrict the rows that have a template; the others stay.
 """
 
 from __future__ import annotations
@@ -32,10 +33,19 @@ from dash.development.base_component import Component
 
 from logdash.analyses.base import ComputeContext, register
 from logdash.analyses.features import Lru, segmented
+from logdash.analyses.templates import KEY as TEMPLATES_KEY
 from logdash.analyses.templates import short
 from logdash.app import figures, ui
 from logdash.app.filters import FILTER_STORE_ID, Filters, from_dict, page_url, parse_time
 from logdash.app.shell import THEME_STORE_ID
+from logdash.app.tag_filters import (
+    TagFilter,
+    apply_tag_filter,
+    attach_tags,
+    load_tags,
+    tag_controls,
+    tag_filter,
+)
 from logdash.cache.store import CacheStore
 from logdash.detectors import load_builtin
 from logdash.detectors.base import (
@@ -67,6 +77,20 @@ SORT_COLUMNS = {
     "type": (["type", "score"], [False, True]),
     "entity": (["entity", "score"], [False, True]),
 }  # fmt: skip
+DESCRIPTION = (
+    "Every registered detector writes its candidates at build time. The score in "
+    "[0, 1] blends a row's rank among the detector's rows of the same kind with its "
+    "log-scaled excess over the detector's threshold; the default order, overall, "
+    "is the reciprocal rank (1 / (60 + rank by score within detector and kind)), "
+    "which compares detectors by position, not by how many rows each has. The time "
+    "range, service and host filters apply (each to its own kind of row); each row "
+    "links to the raw lines of its window in the explorer."
+)
+TAGS_DESCRIPTION = (
+    " Hide noise, actionable only and component use the semantic tags of a row's "
+    "template (from a language model at build time); rows without a template are not "
+    "filtered by them."
+)
 
 load_builtin()  # import the detector modules so that they register
 
@@ -198,6 +222,34 @@ def select(frame: pl.DataFrame, filters: Filters, types: list[str]) -> pl.DataFr
     return frame
 
 
+def template_tags(store: CacheStore) -> pl.DataFrame | None:
+    """Tags of the current templates by ``template_id`` (matched on the text, ADR002).
+
+    ``None`` when no tags are cached; the tag filters are then a no-op.
+    """
+    tags = load_tags(store)
+    if tags is None:
+        return None
+    templates = store.read_parquet(TEMPLATES_KEY, "templates.parquet")
+    return attach_tags(templates.select("template_id", "template"), tags)
+
+
+def restrict_by_tags(rows: pl.DataFrame, by_id: pl.DataFrame, wanted: TagFilter) -> pl.DataFrame:
+    """Rows that pass the tag filter by their template's tags, in their order.
+
+    Rows without a ``template_id`` are kept: the tags describe templates. An id missing from
+    ``by_id`` counts as untagged (ADR002: hide noise keeps it, the other filters drop it).
+    """
+    if not wanted.active:
+        return rows
+    ids = rows.select(pl.col("template_id").drop_nulls().unique())
+    passing = apply_tag_filter(ids.join(by_id, on="template_id", how="left"), wanted)
+    return rows.filter(
+        pl.col("template_id").is_null()
+        | pl.col("template_id").is_in(passing["template_id"].to_list())
+    )
+
+
 def sort_rows(frame: pl.DataFrame, sort: str) -> pl.DataFrame:
     by, descending = SORT_COLUMNS[sort]
     return frame.sort(by, descending=descending)
@@ -301,25 +353,44 @@ def unavailable(store: CacheStore) -> str | None:
 
 
 def draw_anomalies(
-    store: CacheStore, filters: Filters, types: list[str], sort: str, scheme: str | None
+    store: CacheStore,
+    filters: Filters,
+    types: list[str],
+    sort: str,
+    scheme: str | None,
+    by_tags: TagFilter | None = None,
 ) -> tuple[go.Figure, Component, str]:
-    """Timeline, ranked table with explorer links, and a hint on what was selected."""
+    """Timeline, ranked table with explorer links, and a hint on what was selected.
+
+    ``by_tags`` restricts the rows about one template by its semantic tags (no-op without
+    cached tags); rows without a template are kept.
+    """
     problem = unavailable(store)
     if problem is not None:
         return figures.empty_figure(problem, scheme), dmc.Text(problem), ""
     rows = select(load_anomalies(store), filters, types)  # sorted by descending score
+    untemplated: int | None = None
+    if by_tags is not None and by_tags.active:
+        by_id = template_tags(store)
+        if by_id is not None:
+            rows = restrict_by_tags(rows, by_id, by_tags)
+            untemplated = rows["template_id"].null_count()
     known = load_types(store)
     fig = timeline_figure(rows, known, scheme)
     if rows.is_empty():
         return (
             fig,
             dmc.Text("no anomalies in the selection"),
-            hint(filters, 0, sort, load_meta(store)),
+            hint(filters, 0, sort, load_meta(store), untemplated=untemplated),
         )
     ordered = rows if sort == "score" else sort_rows(rows, sort)  # sort the whole selection
     table, hrefs = table_rows(ordered.head(TABLE_ROWS))
     shown = ui.link_table(table, hrefs, max_rows=TABLE_ROWS)
-    return fig, shown, hint(filters, rows.height, sort, load_meta(store))
+    return (
+        fig,
+        shown,
+        hint(filters, rows.height, sort, load_meta(store), untemplated=untemplated),
+    )
 
 
 def kept_text(meta: list[dict[str, Any]]) -> str:
@@ -342,8 +413,14 @@ def kept_text(meta: list[dict[str, Any]]) -> str:
 
 
 def hint(
-    filters: Filters, count: int, sort: str = DEFAULT_SORT, meta: list[dict[str, Any]] | None = None
+    filters: Filters,
+    count: int,
+    sort: str = DEFAULT_SORT,
+    meta: list[dict[str, Any]] | None = None,
+    untemplated: int | None = None,
 ) -> str:
+    """What the selection is. ``untemplated``: rows without a template in the view while a
+    tag filter is active (None: no tag filter)."""
     text = (
         f"{count:,} anomalies in the selection; the table shows the first {TABLE_ROWS} by {sort}."
     )
@@ -354,6 +431,11 @@ def hint(
     ]
     if applied:
         text += " The " + "; the ".join(applied) + "; other kinds stay in the view."
+    if untemplated is not None:
+        text += (
+            " The tag filters apply to rows about one template only; "
+            f"{untemplated:,} rows without a template stay in the view."
+        )
     if filters.levels:
         text += " The level filter does not apply here."
     return text + (" " + kept_text(meta) if meta else "")
@@ -409,6 +491,7 @@ class Anomalies:
 
     def layout(self, store: CacheStore, **_query: Any) -> Component:
         types = load_types(store)
+        with_tags = load_tags(store) is not None
         controls = dmc.Group(
             [
                 dmc.MultiSelect(
@@ -438,18 +521,11 @@ class Anomalies:
         return ui.page(
             "Anomalies",
             controls,
+            tag_controls("anomalies", with_tags),
             ui.card("Anomalies over time", ui.graph("anomalies-timeline", 380)),
             ui.card("Highest scoring anomalies", dmc.Box(id="anomalies-table")),
             dmc.Text(id="anomalies-hint", size="sm", c="dimmed"),
-            description=(
-                "Every registered detector writes its candidates at build time. The score in "
-                "[0, 1] blends a row's rank among the detector's rows of the same kind with its "
-                "log-scaled excess over the detector's threshold; the default order, overall, "
-                "is the reciprocal rank (1 / (60 + rank by score within detector and kind)), "
-                "which compares detectors by position, not by how many rows each has. The time "
-                "range, service and host filters apply (each to its own kind of row); each row "
-                "links to the raw lines of its window in the explorer."
-            ),
+            description=DESCRIPTION + (TAGS_DESCRIPTION if with_tags else ""),
         )
 
     def register_callbacks(self, app: Dash, store: CacheStore) -> None:
@@ -461,15 +537,26 @@ class Anomalies:
             Input("anomalies-sort", "value"),
             Input(FILTER_STORE_ID, "data"),
             Input(THEME_STORE_ID, "data"),
+            Input("anomalies-hide-noise", "checked"),
+            Input("anomalies-actionable-only", "checked"),
+            Input("anomalies-components", "value"),
         )
         def draw(
             types: list[str] | None,
             sort: str | None,
             filters: dict[str, Any] | None,
             theme: str | None,
+            hide_noise: bool | None = None,
+            actionable_only: bool | None = None,
+            components: list[str] | None = None,
         ) -> tuple[go.Figure, Component, str]:
             return draw_anomalies(
-                store, from_dict(filters), type_values(types), sort_value(sort), theme
+                store,
+                from_dict(filters),
+                type_values(types),
+                sort_value(sort),
+                theme,
+                tag_filter(hide_noise, actionable_only, components),
             )
 
         try:  # load the table now so that the first request does not read the file

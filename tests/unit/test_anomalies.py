@@ -1,7 +1,9 @@
 import json
 import math
+import shutil
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlsplit
 
 import numpy as np
@@ -17,10 +19,11 @@ from logdash.analyses.explorer import fetch_page, link_from_query, merge_link
 from logdash.analyses.features import Features
 from logdash.analyses.hosts import Hosts
 from logdash.analyses.pca import Pca
-from logdash.analyses.tags import Tags
+from logdash.analyses.tags import Tags, tags_frame
 from logdash.analyses.templates import Templates
 from logdash.analyses.temporal import Temporal
 from logdash.app.filters import Filters
+from logdash.app.tag_filters import TagFilter
 from logdash.cache.store import CacheStore
 from logdash.config import Settings
 from logdash.detectors import _episodes as episodes
@@ -35,6 +38,7 @@ from logdash.detectors.base import (
     DetectorRegistry,
     declare_kind,
 )
+from logdash.tagging.model import Tag
 from tests.conftest import build_with
 from tests.synthetic import GroundTruth, utc
 
@@ -43,6 +47,47 @@ from tests.synthetic import GroundTruth, utc
 def stage(built):
     build_with(built, Templates(), Tags(), Features(), Pca(), Temporal(), Hosts(), Anomalies())
     return built.store
+
+
+NOISE = Tag(False, "network", True, "Harmless chatter.")
+FAILURE = Tag(True, "hypervisor", False, "A blade was rebooted after a thermal trip.")
+ROUTINE = Tag(False, "other", False, "Routine message.")
+
+
+@pytest.fixture
+def no_tags(stage):
+    shutil.rmtree(stage.module_dir("tags"), ignore_errors=True)
+    return stage
+
+
+@pytest.fixture
+def tagged(stage):
+    shutil.rmtree(stage.module_dir("tags"), ignore_errors=True)
+    ids = sorted(an.load_anomalies(stage)["template_id"].drop_nulls().unique().to_list())
+    assert len(ids) >= 3
+    noise, failure, untagged = ids[0], ids[1], ids[2]
+    templates = stage.read_parquet("templates", "templates.parquet")
+    text = dict(templates.select("template_id", "template").iter_rows())
+    mapping = {
+        t: NOISE if i == noise else FAILURE if i == failure else ROUTINE
+        for i, t in text.items()
+        if i != untagged
+    }
+    stage.write_parquet("tags", "tags.parquet", tags_frame(templates, mapping))
+    yield SimpleNamespace(store=stage, noise=noise, failure=failure, untagged=untagged)
+    shutil.rmtree(stage.module_dir("tags"), ignore_errors=True)
+
+
+def count(rows, tid):
+    return rows.filter(pl.col("template_id") == tid).height
+
+
+def walk(node):
+    yield node
+    children = getattr(node, "children", None)
+    for child in children if isinstance(children, list | tuple) else [children]:
+        if child is not None and not isinstance(child, str):
+            yield from walk(child)
 
 
 def naive(value: datetime) -> datetime:
@@ -950,6 +995,109 @@ def test_hints_name_the_kept_counts_and_the_filters_that_do_not_apply():
     assert "first 100 by time" in text and "Kept 4 of 11 t; 0 of 0 u" in text
     assert "services filter applies to service rows only" in text and "level filter" in text
     assert "Failed and skipped: c (ValueError: boom)" in text
+    assert "1,234 rows without a template stay in the view" in an.hint(
+        Filters(), 5, untemplated=1234
+    )
+    assert "tag filters" not in an.hint(Filters(), 5)
+
+
+def test_restrict_by_tags_semantics():
+    rows = pl.DataFrame(
+        {"template_id": [1, None, 2, 3, 4, 99, 1], "score": [7, 6, 5, 4, 3, 2, 1]},
+        schema={"template_id": pl.Int64, "score": pl.Int64},
+    )
+    templates = pl.DataFrame({"template_id": [1, 2, 3, 4], "template": ["a", "b", "c", "d"]})
+    by_id = tags_frame(
+        templates,
+        {
+            "a": Tag(False, "network", True, "-"),
+            "b": Tag(True, "network", False, "-"),
+            "c": Tag(False, "storage", False, "-"),
+        },
+    )
+
+    def ids(wanted):
+        out = an.restrict_by_tags(rows, by_id, wanted)
+        assert out["score"].to_list() == sorted(out["score"].to_list(), reverse=True)
+        return out["template_id"].to_list()
+
+    assert an.restrict_by_tags(rows, by_id, TagFilter()) is rows
+    assert ids(TagFilter(hide_noise=True)) == [None, 2, 3, 4, 99]
+    assert ids(TagFilter(actionable_only=True)) == [None, 2]
+    assert ids(TagFilter(components=("storage",))) == [None, 3]
+    assert ids(TagFilter(hide_noise=True, components=("network",))) == [None, 2]
+    assert ids(TagFilter(actionable_only=True, components=("storage",))) == [None]
+
+
+def test_template_tags_matches_current_ids_by_text(tagged):
+    store = tagged.store
+    by_id = an.template_tags(store)
+    assert by_id.height == store.read_parquet("templates", "templates.parquet").height
+    assert by_id.filter(pl.col("template_id") == tagged.noise)["noise"].to_list() == [True]
+    untagged = by_id.filter(pl.col("template_id") == tagged.untagged)
+    assert untagged["tagged"].to_list() == [False] and untagged["actionable"].to_list() == [None]
+
+
+def test_tag_filters_restrict_rows_with_a_template(tagged):
+    store = tagged.store
+    all_rows = an.select(an.load_anomalies(store), Filters(), [])
+    by_id = an.template_tags(store)
+    nulls = all_rows["template_id"].null_count()
+
+    def run(wanted):
+        rows = an.restrict_by_tags(all_rows, by_id, wanted)
+        assert rows["template_id"].null_count() == nulls
+        return rows
+
+    hidden = run(TagFilter(hide_noise=True))
+    assert hidden.height == all_rows.height - count(all_rows, tagged.noise)
+    assert count(hidden, tagged.noise) == 0
+    actionable = run(TagFilter(actionable_only=True))
+    assert actionable.height == nulls + count(all_rows, tagged.failure)
+    assert run(TagFilter(components=("hypervisor",))).equals(actionable)
+    assert run(TagFilter(components=("storage",))).height == nulls
+
+
+def test_draw_with_tag_filter_says_untemplated_rows_stay(tagged):
+    store = tagged.store
+    all_rows = an.select(an.load_anomalies(store), Filters(), [])
+    n = all_rows["template_id"].null_count()
+    text = an.draw_anomalies(store, Filters(), [], "score", None, TagFilter(actionable_only=True))[
+        2
+    ]
+    assert "tag filters apply to rows about one template only" in text
+    assert f"{n:,} rows without a template stay in the view" in text
+    assert text.startswith(f"{n + count(all_rows, tagged.failure):,} anomalies in the selection")
+    plain = an.draw_anomalies(store, Filters(), [], "score", None)[2]
+    assert an.draw_anomalies(store, Filters(), [], "score", None, TagFilter())[2] == plain
+    assert "tag filters" not in plain
+
+
+def test_tag_filters_are_a_no_op_without_tags(no_tags):
+    store = no_tags
+    wanted = TagFilter(True, True, ("storage",))
+    with_filter = an.draw_anomalies(store, Filters(), [], "score", None, wanted)
+    plain = an.draw_anomalies(store, Filters(), [], "score", None)
+    assert str(with_filter[1]) == str(plain[1]) and with_filter[2] == plain[2]
+    assert "tag filters" not in with_filter[2]
+    assert an.template_tags(store) is None
+
+
+def test_layout_hides_tag_controls_without_tags(no_tags):
+    page = Anomalies().layout(no_tags)
+    nodes = list(walk(page))
+    group = next(n for n in nodes if getattr(n, "id", None) == "anomalies-tag-filters")
+    assert group.style == {"display": "none"}
+    ids = {getattr(n, "id", None) for n in nodes}
+    assert {"anomalies-hide-noise", "anomalies-actionable-only", "anomalies-components"} <= ids
+    assert page.children[1].children == an.DESCRIPTION
+
+
+def test_layout_shows_tag_controls_with_tags(tagged):
+    page = Anomalies().layout(tagged.store)
+    group = next(n for n in walk(page) if getattr(n, "id", None) == "anomalies-tag-filters")
+    assert not getattr(group, "style", None)
+    assert page.children[1].children == an.DESCRIPTION + an.TAGS_DESCRIPTION
 
 
 def test_links_drill_down_to_the_raw_lines(stage, synthetic):
@@ -1017,9 +1165,35 @@ def test_value_helpers():
     assert an.type_values(None) == [] and an.type_values(["a", 3]) == ["a"]  # type: ignore[list-item]
 
 
-def test_layout_and_callback_over_http(stage, built):
+def draw_body(types, sort, actionable):
+    outputs = ["anomalies-timeline", "anomalies-table", "anomalies-hint"]
+    props = ["figure", "children", "children"]
+    return {
+        "output": ".." + "...".join(f"{o}.{p}" for o, p in zip(outputs, props, strict=True)) + "..",
+        "outputs": [{"id": o, "property": p} for o, p in zip(outputs, props, strict=True)],
+        "inputs": [
+            {"id": "anomalies-types", "property": "value", "value": types},
+            {"id": "anomalies-sort", "property": "value", "value": sort},
+            {"id": "filters", "property": "data", "value": {}},
+            {"id": "theme", "property": "data", "value": "dark"},
+            {"id": "anomalies-hide-noise", "property": "checked", "value": False},
+            {"id": "anomalies-actionable-only", "property": "checked", "value": actionable},
+            {"id": "anomalies-components", "property": "value", "value": []},
+        ],
+        "changedPropIds": ["anomalies-sort.value"],
+    }
+
+
+def post(client, body):
+    return client.post(
+        "/_dash-update-component", data=json.dumps(body), content_type="application/json"
+    )
+
+
+def test_layout_and_callback_over_http(no_tags, built):
     from logdash.app.main import create_app
 
+    stage = no_tags
     assert "anomalies-timeline" in str(Anomalies().layout(stage))
     app = create_app(
         stage,
@@ -1027,32 +1201,29 @@ def test_layout_and_callback_over_http(stage, built):
     )
     client = app.server.test_client()
     assert client.get("/anomalies").status_code == 200
-    outputs = ["anomalies-timeline", "anomalies-table", "anomalies-hint"]
-    props = ["figure", "children", "children"]
-    body = {
-        "output": ".." + "...".join(f"{o}.{p}" for o, p in zip(outputs, props, strict=True)) + "..",
-        "outputs": [{"id": o, "property": p} for o, p in zip(outputs, props, strict=True)],
-        "inputs": [
-            {"id": "anomalies-types", "property": "value", "value": ["structural"]},
-            {"id": "anomalies-sort", "property": "value", "value": "time"},
-            {"id": "filters", "property": "data", "value": {}},
-            {"id": "theme", "property": "data", "value": "dark"},
-        ],
-        "changedPropIds": ["anomalies-sort.value"],
-    }
-    resp = client.post(
-        "/_dash-update-component", data=json.dumps(body), content_type="application/json"
-    )
+    body = draw_body(["structural"], "time", False)
+    resp = post(client, body)
     assert resp.status_code == 200, resp.get_data()
     assert resp.get_json()["response"]["anomalies-timeline"]["figure"]["data"]
     body["inputs"][0]["value"] = None
     body["inputs"][1]["value"] = "bogus"
-    assert (
-        client.post(
-            "/_dash-update-component", data=json.dumps(body), content_type="application/json"
-        ).status_code
-        == 200
+    assert post(client, body).status_code == 200
+    resp = post(client, draw_body([], "score", True))
+    assert resp.status_code == 200
+    assert "tag filters" not in resp.get_json()["response"]["anomalies-hint"]["children"]
+
+
+def test_tag_filter_callback_over_http(tagged, built):
+    from logdash.app.main import create_app
+
+    app = create_app(
+        tagged.store,
+        build_with(built, Templates(), Tags(), Features(), Pca(), Temporal(), Hosts(), Anomalies()),
     )
+    resp = post(app.server.test_client(), draw_body([], "score", True))
+    assert resp.status_code == 200, resp.get_data()
+    hint = resp.get_json()["response"]["anomalies-hint"]["children"]
+    assert "rows without a template stay in the view" in hint
 
 
 def test_volume_rows_say_spike_or_gap_and_gaps_start_at_the_threshold(stage, synthetic):
