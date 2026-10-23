@@ -8,6 +8,8 @@ link here with the filters in the URL query (``/explorer?template=12&host=x``).
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -20,6 +22,7 @@ from dash.development.base_component import Component
 from logdash.analyses.base import ComputeContext, register
 from logdash.app import ui
 from logdash.app.filters import FILTER_STORE_ID, Filters, from_dict, parse_time, where_clause
+from logdash.app.tag_filters import TagFilter, apply_tag_filter, attach_tags, load_tags
 from logdash.cache.store import CacheStore
 
 KEY = "explorer"
@@ -31,6 +34,57 @@ SELECT = (
     "SELECT strftime(ts, '%Y-%m-%d %H:%M:%S.%g') AS time, level, host, program, logger, "
     "python_module, request_id, payload FROM events"
 )
+TS_SELECT = "SELECT ts FROM events"
+WINDOW_SELECT = (
+    "SELECT ts AS sort_ts, strftime(ts, '%Y-%m-%d %H:%M:%S.%g') AS time, level, host, "
+    "program, logger, python_module, request_id, payload FROM events"
+)
+WINDOW_CAP = 5000  # rows in a two-step window before falling back to one step
+
+
+@dataclass(frozen=True)
+class TagRestriction:
+    """Template ids a tag filter keeps (``keep``) or drops (not ``keep``)."""
+
+    ids: tuple[int, ...]
+    keep: bool
+
+    def excludes(self, template_id: int) -> bool:
+        """Whether lines of this template are filtered out."""
+        return template_id not in self.ids if self.keep else template_id in self.ids
+
+
+def tag_restriction(store: CacheStore, tag_filter: TagFilter) -> TagRestriction | None:
+    """Template ids for the tag filter (ADR002); ``None`` if it is off or there are no tags.
+
+    Only "hide noise" drops the noise templates and keeps lines without a template; with
+    "actionable only" or a component, only the passing templates are kept.
+    """
+    if not tag_filter.active:
+        return None
+    tags = load_tags(store)
+    if tags is None:
+        return None
+    templates = attach_tags(
+        store.read_parquet("templates", "templates.parquet").select("template_id", "template"),
+        tags,
+    )
+    passing = apply_tag_filter(templates, tag_filter)["template_id"].to_list()
+    if tag_filter.actionable_only or tag_filter.components:
+        return TagRestriction(tuple(sorted(passing)), keep=True)
+    dropped = sorted(set(templates["template_id"].to_list()) - set(passing))
+    return TagRestriction(tuple(dropped), keep=False) if dropped else None
+
+
+def tag_clause(path: str, tags: TagRestriction) -> str:
+    """``WHERE`` part for a tag restriction; ``path`` is the quoted assignments file."""
+    if not tags.ids:
+        return "FALSE" if tags.keep else "TRUE"
+    marks = ", ".join("?" for _ in tags.ids)
+    lines = f"SELECT masked_hash FROM read_parquet('{path}') WHERE template_id IN ({marks})"
+    if tags.keep:
+        return f"masked_hash IN ({lines})"
+    return f"(masked_hash IS NULL OR masked_hash NOT IN ({lines}))"
 
 
 def hour_values(start: datetime | None, end: datetime | None) -> list[str] | None:
@@ -80,14 +134,20 @@ def build_query(
     size: int = PAGE_SIZE,
     hour: str | None = None,
     limit: int | None = None,
+    tags: TagRestriction | None = None,
+    select: str = SELECT,
+    window: tuple[datetime, datetime] | None = None,
 ) -> tuple[str, list[Any]]:
     """``(sql, params)`` for one page; fetches ``size + 1`` rows to detect a next page.
 
     ``hour`` restricts the query to one hour partition and ``limit`` replaces the
-    page arithmetic by ``LIMIT limit`` (used by the chunked text search).
+    page arithmetic by ``LIMIT limit`` (used by the chunked text search). ``tags`` restricts
+    to template ids (needs ``assignments``); ``select`` replaces the column list; ``window``
+    keeps ``ts`` between two inclusive bounds.
     """
     where, params = where_clause(filters)
     parts = [where.removeprefix("WHERE ")] if where else []
+    path = assignments.replace("'", "''") if assignments is not None else None
     hours = (
         [hour]
         if hour is not None
@@ -96,23 +156,88 @@ def build_query(
     if hours is not None:
         parts.append(f"hour IN ({', '.join('?' for _ in hours)})")
         params.extend(hours)
-    if template is not None and assignments is not None:
-        path = assignments.replace("'", "''")
+    if template is not None and path is not None:
         parts.append(
             f"masked_hash IN (SELECT masked_hash FROM read_parquet('{path}') WHERE template_id = ?)"
         )
         params.append(template)
+    if tags is not None:
+        if path is None:
+            raise ValueError("a tag restriction needs the assignments path")
+        parts.append(tag_clause(path, tags))
+        params.extend(tags.ids)
     if request_id:
         parts.append("request_id = ?")
         params.append(request_id.strip())
     if text:
         parts.append("contains(lower(payload), ?)")
         params.append(text.lower())
+    if window is not None:
+        parts.append("ts >= ? AND ts <= ?")
+        params.extend(window)
     clause = f" WHERE {' AND '.join(parts)}" if parts else ""
     if limit is not None:
-        return f"{SELECT}{clause} ORDER BY ts LIMIT {int(limit)}", params
-    sql = f"{SELECT}{clause} ORDER BY ts LIMIT {int(size) + 1} OFFSET {int(page) * int(size)}"
+        return f"{select}{clause} ORDER BY ts LIMIT {int(limit)}", params
+    sql = f"{select}{clause} ORDER BY ts LIMIT {int(size) + 1} OFFSET {int(page) * int(size)}"
     return sql, params
+
+
+def page_slice(found: Sequence[tuple[Any, ...]], stamps: Sequence[Any]) -> list[tuple[Any, ...]]:
+    """The page inside window rows (``sort_ts`` first), without ``sort_ts``.
+
+    Lines at the first timestamp that belong to the previous page are skipped.
+    """
+    lead = sum(1 for s in stamps if s == stamps[0])
+    before = sum(1 for row in found if row[0] == stamps[0]) - lead
+    return [row[1:] for row in found[before : before + len(stamps)]]
+
+
+def window_rows(
+    con: duckdb.DuckDBPyConnection,
+    filters: Filters,
+    *,
+    assignments: str,
+    template: int | None,
+    request_id: str | None,
+    text: str | None,
+    tags: TagRestriction,
+    page: int,
+    size: int,
+) -> list[tuple[Any, ...]] | None:
+    """Rows of one page (up to ``size + 1``) in two steps: sort only ``ts``, then read the
+    full rows between the first and last stamp. ``None`` means "use the one-step query"
+    (all stamps equal, or ``WINDOW_CAP`` rows in the window)."""
+    sql, params = build_query(
+        filters,
+        assignments=assignments,
+        template=template,
+        request_id=request_id,
+        text=text,
+        tags=tags,
+        select=TS_SELECT,
+        page=page,
+        size=size,
+    )
+    stamps = [row[0] for row in con.execute(sql, params).fetchall()]
+    if not stamps:
+        return []
+    if stamps[0] == stamps[-1]:
+        return None
+    sql, params = build_query(
+        filters,
+        assignments=assignments,
+        template=template,
+        request_id=request_id,
+        text=text,
+        tags=tags,
+        select=WINDOW_SELECT,
+        window=(stamps[0], stamps[-1]),
+        limit=WINDOW_CAP,
+    )
+    found = con.execute(sql, params).fetchall()
+    if len(found) >= WINDOW_CAP:
+        return None
+    return page_slice(found, stamps)
 
 
 def fetch_page(
@@ -123,20 +248,37 @@ def fetch_page(
     template: int | None = None,
     request_id: str | None = None,
     text: str | None = None,
+    tags: TagRestriction | None = None,
     page: int = 0,
     size: int = PAGE_SIZE,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Rows of one page and whether another page follows."""
-    sql, params = build_query(
-        filters,
-        assignments=str(store.path("templates", "assignments.parquet")),
-        template=template,
-        request_id=request_id,
-        text=text,
-        page=page,
-        size=size,
-    )
-    rows = con.execute(sql, params).fetchall()
+    assignments = str(store.path("templates", "assignments.parquet"))
+    rows = None
+    if tags is not None:
+        rows = window_rows(
+            con,
+            filters,
+            assignments=assignments,
+            template=template,
+            request_id=request_id,
+            text=text,
+            tags=tags,
+            page=page,
+            size=size,
+        )
+    if rows is None:
+        sql, params = build_query(
+            filters,
+            assignments=assignments,
+            template=template,
+            request_id=request_id,
+            text=text,
+            tags=tags,
+            page=page,
+            size=size,
+        )
+        rows = con.execute(sql, params).fetchall()
     records = [dict(zip(COLUMNS, row, strict=True)) for row in rows[:size]]
     return records, len(rows) > size
 
@@ -149,6 +291,7 @@ def search_page(
     text: str,
     template: int | None = None,
     request_id: str | None = None,
+    tags: TagRestriction | None = None,
     page: int = 0,
     size: int = PAGE_SIZE,
     budget_s: float = SEARCH_BUDGET_S,
@@ -179,6 +322,7 @@ def search_page(
             text=text,
             hour=hour,
             limit=wanted - len(found),
+            tags=tags,
         )
         found.extend(con.execute(sql, params).fetchall())
         if len(found) >= wanted:
