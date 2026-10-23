@@ -1,13 +1,22 @@
 import json
+import shutil
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
 from logdash.analyses import explorer as ex
-from logdash.analyses.explorer import Explorer
+from logdash.analyses.explorer import Explorer, TagRestriction
+from logdash.analyses.tags import tags_frame
 from logdash.analyses.templates import Templates
 from logdash.app.filters import Filters
+from logdash.app.tag_filters import TagFilter
+from logdash.tagging.model import Tag
 from tests.conftest import build_with
+
+NOISE = Tag(False, "network", True, "Harmless duplicate firewall rule.")
+FAILURE = Tag(True, "network", False, "A peer closed a connection unexpectedly.")
+ROUTINE = Tag(False, "other", False, "Routine message.")
 
 
 @pytest.fixture(scope="module")
@@ -25,6 +34,68 @@ def con(exp):
 
 def page(con, store, filters=None, **kw):
     return ex.fetch_page(con, store, filters or Filters(), **kw)
+
+
+def drop_tags(store):
+    shutil.rmtree(store.module_dir("tags"), ignore_errors=True)
+
+
+@pytest.fixture
+def no_tags(exp):
+    store = exp[0]
+    drop_tags(store)
+    return store
+
+
+@pytest.fixture
+def tagged(exp):
+    store = exp[0]
+    drop_tags(store)
+    templates = store.read_parquet("templates", "templates.parquet").select(
+        "template_id", "template"
+    )
+
+    def find(needle):
+        hits = [t for t, text in templates.iter_rows() if needle in text]
+        assert len(hits) == 1
+        return hits[0]
+
+    noise = find("Duplicate iptables rule")
+    failure = find("closed unexpectedly")
+    untagged = find("bgp session reset")
+    mapping = {}
+    for tid, text in templates.iter_rows():
+        if tid == untagged:
+            continue
+        mapping[text] = NOISE if tid == noise else FAILURE if tid == failure else ROUTINE
+    store.write_parquet("tags", "tags.parquet", tags_frame(templates, mapping))
+    store.write_json(
+        "tags",
+        "meta.json",
+        {
+            "available": True,
+            "model": "stub",
+            "prompt_version": "1",
+            "templates": templates.height,
+            "tagged": templates.height - 1,
+            "untagged": 1,
+            "calls": 0,
+            "aborted": None,
+            "failures": [],
+        },
+    )
+    yield SimpleNamespace(store=store, noise=noise, failure=failure, untagged=untagged)
+    drop_tags(store)
+
+
+def count(con, store, template_ids):
+    marks = ", ".join(str(int(t)) for t in template_ids)
+    path = store.path("templates", "assignments.parquet")
+    return con.execute(
+        "SELECT count(*) FROM events WHERE masked_hash IN "
+        f"(SELECT masked_hash FROM read_parquet(?) WHERE template_id IN ({marks}))",
+        [str(path)],
+    ).fetchone()[0]
 
 
 def test_hour_values():
@@ -111,7 +182,49 @@ def test_helpers():
     )
 
 
-def test_layout_prefilled_and_callback(exp):
+def post(client, inputs, state, changed):
+    outs = ["explorer-grid.rowData", "explorer-page.data", "explorer-label.children",
+            "explorer-prev.disabled", "explorer-next.disabled"]  # fmt: skip
+    body = {
+        "output": ".." + "...".join(outs) + "..",
+        "outputs": [{"id": o.split(".")[0], "property": o.split(".")[1]} for o in outs],
+        "inputs": [{"id": i, "property": p, "value": v} for i, p, v in inputs],
+        "state": [{"id": "explorer-page", "property": "data", "value": state}],
+        "changedPropIds": [changed],
+    }
+    resp = client.post(
+        "/_dash-update-component", data=json.dumps(body), content_type="application/json"
+    )
+    assert resp.status_code == 200, resp.get_data()
+    return resp.get_json()["response"]
+
+
+def explorer_inputs(**over):
+    base = {
+        "filters": ("data", {}),
+        "explorer-link": ("data", {}),
+        "explorer-template": ("value", ""),
+        "explorer-request": ("value", ""),
+        "explorer-text": ("value", ""),
+        "explorer-hide-noise": ("checked", False),
+        "explorer-actionable-only": ("checked", False),
+        "explorer-components": ("value", []),
+        "explorer-prev": ("n_clicks", None),
+        "explorer-next": ("n_clicks", None),
+    }
+    base.update(over)
+    return [(k, p, v) for k, (p, v) in base.items()]
+
+
+def walk(node):
+    yield node
+    children = getattr(node, "children", None)
+    for child in children if isinstance(children, list | tuple) else [children]:
+        if child is not None and not isinstance(child, str):
+            yield from walk(child)
+
+
+def test_layout_prefilled_and_callback(exp, no_tags):
     store, registry = exp
     from logdash.app.main import create_app
 
@@ -122,50 +235,29 @@ def test_layout_prefilled_and_callback(exp):
     assert client.get("/explorer").status_code == 200
     assert client.get("/explorer?template=1&host=eselda14u05s02").status_code == 200
 
-    def call(inputs, state, changed):
-        outs = ["explorer-grid.rowData", "explorer-page.data", "explorer-label.children",
-                "explorer-prev.disabled", "explorer-next.disabled"]  # fmt: skip
-        body = {
-            "output": ".." + "...".join(outs) + "..",
-            "outputs": [{"id": o.split(".")[0], "property": o.split(".")[1]} for o in outs],
-            "inputs": [{"id": i, "property": p, "value": v} for i, p, v in inputs],
-            "state": [{"id": "explorer-page", "property": "data", "value": state}],
-            "changedPropIds": [changed],
-        }
-        resp = client.post(
-            "/_dash-update-component", data=json.dumps(body), content_type="application/json"
-        )
-        assert resp.status_code == 200, resp.get_data()
-        return resp.get_json()["response"]
-
-    def inputs(**over):
-        base = {
-            "filters": ("data", {}),
-            "explorer-link": ("data", {}),
-            "explorer-template": ("value", ""),
-            "explorer-request": ("value", ""),
-            "explorer-text": ("value", ""),
-            "explorer-prev": ("n_clicks", None),
-            "explorer-next": ("n_clicks", None),
-        }
-        base.update(over)
-        return [(k, p, v) for k, (p, v) in base.items()]
-
-    out = call(inputs(), 0, "filters.data")
+    out = post(client, explorer_inputs(), 0, "filters.data")
     assert len(out["explorer-grid"]["rowData"]) == ex.PAGE_SIZE and out["explorer-prev"]["disabled"]
-    nxt = call(inputs(**{"explorer-next": ("n_clicks", 1)}), 0, "explorer-next.n_clicks")
+    nxt = post(
+        client, explorer_inputs(**{"explorer-next": ("n_clicks", 1)}), 0, "explorer-next.n_clicks"
+    )
     assert nxt["explorer-page"]["data"] == 1 and "101-200" in nxt["explorer-label"]["children"]
     # paging past the end steps back one page
-    end = call(
-        inputs(**{"explorer-text": ("value", "bgp session"), "explorer-next": ("n_clicks", 1)}),
+    end = post(
+        client,
+        explorer_inputs(
+            **{"explorer-text": ("value", "bgp session"), "explorer-next": ("n_clicks", 1)}
+        ),
         1,
         "explorer-next.n_clicks",
     )
     assert end["explorer-page"]["data"] == 0 and end["explorer-next"]["disabled"]
-    none = call(inputs(**{"explorer-text": ("value", "zzzz")}), 0, "explorer-text.value")
+    none = post(
+        client, explorer_inputs(**{"explorer-text": ("value", "zzzz")}), 0, "explorer-text.value"
+    )
     assert none["explorer-label"]["children"] == "no matching rows"
-    linked = call(
-        inputs(
+    linked = post(
+        client,
+        explorer_inputs(
             **{
                 "explorer-link": ("data", {"host": "eselda14u05s02"}),
                 "explorer-template": ("value", "1"),
@@ -175,6 +267,11 @@ def test_layout_prefilled_and_callback(exp):
         "explorer-link.data",
     )
     assert all(r["host"] == "eselda14u05s02" for r in linked["explorer-grid"]["rowData"])
+    # without tags the tag controls change nothing
+    for over in ({"explorer-hide-noise": ("checked", True)},
+                 {"explorer-components": ("value", ["auth"])}):  # fmt: skip
+        same = post(client, explorer_inputs(**over), 0, next(iter(over)) + ".x")
+        assert same["explorer-grid"]["rowData"] == out["explorer-grid"]["rowData"]
 
 
 def test_search_page_matches_fetch_page_and_stops_on_budget(exp, con):
@@ -187,3 +284,191 @@ def test_search_page_matches_fetch_page_and_stops_on_budget(exp, con):
     assert more1 and len(first) == 5 and second and second[0] not in first
     none, more0, cut0 = ex.search_page(con, store, Filters(), text="zzzz", budget_s=-1.0)
     assert none == [] and not more0 and cut0 == "00"
+
+
+def test_build_query_tag_clauses():
+    keep, kp = ex.build_query(
+        Filters(), assignments="/a.parquet", template=3, tags=TagRestriction((4, 9), True)
+    )
+    assert "masked_hash IN (SELECT masked_hash FROM read_parquet('/a.parquet') WHERE" in keep
+    assert "template_id IN (?, ?)" in keep and kp == [3, 4, 9]
+    drop, _ = ex.build_query(Filters(), assignments="/a", tags=TagRestriction((4,), False))
+    assert "masked_hash IS NULL OR masked_hash NOT IN (" in drop
+    none, np_ = ex.build_query(Filters(), assignments="/a", tags=TagRestriction((), True))
+    assert "FALSE" in none and np_ == []
+    nothing, _ = ex.build_query(Filters(), assignments="/a", tags=TagRestriction((), False))
+    assert "TRUE" in nothing
+    with pytest.raises(ValueError):
+        ex.build_query(Filters(), tags=TagRestriction((1,), True))
+    a, b = datetime(2023, 1, 1), datetime(2023, 1, 2)
+    sql, params = ex.build_query(Filters(), select=ex.TS_SELECT, window=(a, b), limit=7)
+    assert sql.startswith("SELECT ts FROM events") and "ts >= ? AND ts <= ?" in sql
+    assert params[-2:] == [a, b] and sql.endswith("LIMIT 7")
+
+
+def test_page_slice_and_restriction_helpers():
+    found = [(1, "a"), (1, "b"), (1, "c"), (2, "d"), (3, "e"), (3, "f")]
+    assert ex.page_slice(found, [1, 2, 3]) == [("c",), ("d",), ("e",)]
+    assert ex.page_slice(found, [1, 1, 2]) == [("b",), ("c",), ("d",)]
+    keep, drop = TagRestriction((2,), True), TagRestriction((2,), False)
+    assert keep.excludes(3) and not keep.excludes(2)
+    assert drop.excludes(2) and not drop.excludes(3)
+
+
+def test_window_rows_falls_back(monkeypatch):
+    class Fake:
+        def __init__(self, *results):
+            self.results = list(results)
+            self.calls = 0
+
+        def execute(self, sql, params):
+            self.calls += 1
+            return self
+
+        def fetchall(self):
+            return self.results.pop(0)
+
+    t1, t2 = datetime(2023, 1, 1), datetime(2023, 1, 2)
+    kw = {
+        "assignments": "/a",
+        "template": None,
+        "request_id": None,
+        "text": None,
+        "tags": TagRestriction((1,), True),
+        "page": 0,
+        "size": 2,
+    }
+    assert ex.window_rows(Fake([]), Filters(), **kw) == []
+    same = Fake([(t1,), (t1,)])
+    assert ex.window_rows(same, Filters(), **kw) is None and same.calls == 1
+    monkeypatch.setattr(ex, "WINDOW_CAP", 3)
+    full = Fake([(t1,), (t2,)], [(t1, "a"), (t1, "b"), (t2, "c")])
+    assert ex.window_rows(full, Filters(), **kw) is None
+
+
+def test_tag_restriction(tagged):
+    store, noise, failure = tagged.store, tagged.noise, tagged.failure
+    assert ex.tag_restriction(store, TagFilter()) is None
+    assert ex.tag_restriction(store, TagFilter(hide_noise=True)) == TagRestriction((noise,), False)
+    assert ex.tag_restriction(store, TagFilter(actionable_only=True)) == TagRestriction(
+        (failure,), True
+    )
+    both = tuple(sorted({noise, failure}))
+    assert ex.tag_restriction(store, TagFilter(components=("network",))) == TagRestriction(
+        both, True
+    )
+    assert ex.tag_restriction(store, TagFilter(True, False, ("network",))) == TagRestriction(
+        (failure,), True
+    )
+    assert ex.tag_restriction(store, TagFilter(components=("auth",))) == TagRestriction((), True)
+
+
+def test_tag_restriction_without_tags(no_tags):
+    assert ex.tag_restriction(no_tags, TagFilter(True, True, ("network",))) is None
+
+
+def test_fetch_page_with_tags(tagged, con):
+    store, noise, failure = tagged.store, tagged.noise, tagged.failure
+    big = 100_000
+    total = con.execute("SELECT count(*) FROM events").fetchone()[0]
+    hide = ex.tag_restriction(store, TagFilter(hide_noise=True))
+    rows, _ = page(con, store, tags=hide, size=big)
+    assert all("Duplicate iptables rule" not in (r["payload"] or "") for r in rows)
+    assert len(rows) == total - count(con, store, [noise])
+    act = ex.tag_restriction(store, TagFilter(actionable_only=True))
+    rows, _ = page(con, store, tags=act, size=big)
+    assert len(rows) == count(con, store, [failure])
+    assert all("closed unexpectedly" in r["payload"] for r in rows)
+    assert page(con, store, tags=ex.tag_restriction(store, TagFilter(components=("auth",)))) == (
+        [],
+        False,
+    )
+    host = rows[0]["host"]
+    own, _ = page(con, store, Filters(hosts=(host,)), tags=act)
+    assert own and all(r["host"] == host for r in own)
+    alone = page(con, store, template=failure, size=big)
+    assert page(con, store, template=failure, tags=hide, size=big) == alone
+    assert page(con, store, template=noise, tags=hide) == ([], False)
+
+
+@pytest.mark.parametrize("which", ["hide", "act"])
+def test_two_step_pages_match_one_step(tagged, con, monkeypatch, which):
+    store = tagged.store
+    flt = TagFilter(hide_noise=True) if which == "hide" else TagFilter(actionable_only=True)
+    tags = ex.tag_restriction(store, flt)
+    two = [page(con, store, tags=tags, page=i, size=50) for i in range(4)]
+    monkeypatch.setattr(ex, "WINDOW_CAP", 0)
+    one = [page(con, store, tags=tags, page=i, size=50) for i in range(4)]
+    assert [[r["time"] for r in rows] for rows, _ in two] == [
+        [r["time"] for r in rows] for rows, _ in one
+    ]
+    assert [more for _, more in two] == [more for _, more in one]
+
+
+def test_search_page_with_tags(tagged, con):
+    store = tagged.store
+    hide = ex.tag_restriction(store, TagFilter(hide_noise=True))
+    act = ex.tag_restriction(store, TagFilter(actionable_only=True))
+    assert ex.search_page(con, store, Filters(), text="iptables", tags=hide)[0] == []
+    found = ex.search_page(con, store, Filters(), text="closed", tags=act)[0]
+    expected = page(con, store, text="closed", tags=act)[0]
+    assert found and [r["time"] for r in found] == [r["time"] for r in expected]
+
+
+def test_layout_tag_controls(exp, no_tags):
+    store = exp[0]
+    hidden = Explorer().layout(store)
+    group = next(c for c in walk(hidden) if getattr(c, "id", None) == "explorer-tag-filters")
+    assert group.style == {"display": "none"} and "Tag filters" not in str(hidden)
+
+
+def test_layout_tag_controls_with_tags(exp, tagged):
+    shown = Explorer().layout(tagged.store)
+    group = next(c for c in walk(shown) if getattr(c, "id", None) == "explorer-tag-filters")
+    assert getattr(group, "style", None) is None
+    ids = {getattr(c, "id", None) for c in walk(shown)}
+    assert {"explorer-hide-noise", "explorer-actionable-only", "explorer-components"} <= ids
+    assert "Tag filters" in str(shown)
+
+
+def test_callback_with_tags_over_http(exp, tagged):
+    from logdash.app.main import create_app
+
+    store, registry = exp
+    client = create_app(store, registry).server.test_client()
+
+    def rows(out):
+        return out["explorer-grid"]["rowData"]
+
+    hide = {"explorer-hide-noise": ("checked", True)}
+    out = post(client, explorer_inputs(**hide), 0, "explorer-hide-noise.checked")
+    assert rows(out) and out["explorer-page"]["data"] == 0
+    assert all("Duplicate iptables rule" not in (r["payload"] or "") for r in rows(out))
+    act = {"explorer-actionable-only": ("checked", True)}
+    out = post(client, explorer_inputs(**act), 0, "explorer-actionable-only.checked")
+    assert rows(out) and all("closed unexpectedly" in r["payload"] for r in rows(out))
+    out = post(
+        client,
+        explorer_inputs(**hide, **{"explorer-template": ("value", str(tagged.noise))}),
+        0,
+        "explorer-template.value",
+    )
+    assert rows(out) == []
+    assert out["explorer-label"]["children"] == (
+        f"no matching rows (template {tagged.noise} is excluded by the tag filters)"
+    )
+    out = post(
+        client,
+        explorer_inputs(**act, **{"explorer-template": ("value", str(tagged.failure))}),
+        0,
+        "explorer-template.value",
+    )
+    assert rows(out) and all("closed unexpectedly" in r["payload"] for r in rows(out))
+    out = post(
+        client,
+        explorer_inputs(**hide, filters=("data", {"levels": ["ERROR"]})),
+        0,
+        "filters.data",
+    )
+    assert rows(out) and all(r["level"] == "ERROR" for r in rows(out))
+    assert all("iptables" not in (r["payload"] or "") for r in rows(out))
