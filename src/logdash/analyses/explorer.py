@@ -22,7 +22,14 @@ from dash.development.base_component import Component
 from logdash.analyses.base import ComputeContext, register
 from logdash.app import ui
 from logdash.app.filters import FILTER_STORE_ID, Filters, from_dict, parse_time, where_clause
-from logdash.app.tag_filters import TagFilter, apply_tag_filter, attach_tags, load_tags
+from logdash.app.tag_filters import (
+    TagFilter,
+    apply_tag_filter,
+    attach_tags,
+    load_tags,
+    tag_controls,
+    tag_filter,
+)
 from logdash.cache.store import CacheStore
 
 KEY = "explorer"
@@ -40,6 +47,11 @@ WINDOW_SELECT = (
     "program, logger, python_module, request_id, payload FROM events"
 )
 WINDOW_CAP = 5000  # rows in a two-step window before falling back to one step
+TAGS_DESCRIPTION = (
+    " Tag filters keep the lines whose template carries the chosen semantic tags; "
+    "hide noise keeps lines without tags."
+)
+EXCLUDED = " (template {tid} is excluded by the tag filters)"
 
 
 @dataclass(frozen=True)
@@ -363,6 +375,7 @@ class Explorer:
 
     def layout(self, store: CacheStore, **query: Any) -> Component:
         link = link_from_query(query)
+        with_tags = load_tags(store) is not None
         grid = dag.AgGrid(
             id="explorer-grid",
             rowData=[],
@@ -407,6 +420,7 @@ class Explorer:
                 ],
                 align="flex-end",
             ),
+            tag_controls("explorer", with_tags),
             dmc.Text(describe_link(link), id="explorer-link-text", size="xs", c="dimmed"),
             dmc.Group(
                 [
@@ -421,6 +435,7 @@ class Explorer:
             description=(
                 "Global filters apply, overridden by filters given in the page URL. "
                 f"{PAGE_SIZE} rows per page, ordered by time."
+                f"{TAGS_DESCRIPTION if with_tags else ''}"
             ),
         )
 
@@ -443,6 +458,9 @@ class Explorer:
             Input("explorer-template", "value"),
             Input("explorer-request", "value"),
             Input("explorer-text", "value"),
+            Input("explorer-hide-noise", "checked"),
+            Input("explorer-actionable-only", "checked"),
+            Input("explorer-components", "value"),
             Input("explorer-prev", "n_clicks"),
             Input("explorer-next", "n_clicks"),
             State("explorer-page", "data"),
@@ -453,6 +471,9 @@ class Explorer:
             template: str | None,
             request_id: str | None,
             text: str | None,
+            hide_noise: bool | None,
+            actionable_only: bool | None,
+            components: list[str] | None,
             _prev: int | None,
             _next: int | None,
             page: int | None,
@@ -460,6 +481,9 @@ class Explorer:
             page_index = next_page(ctx.triggered_id, page or 0)
             effective = merge_link(from_dict(filters), link)
             tid = parse_template(template) if template else None
+            restriction = tag_restriction(
+                store, tag_filter(hide_noise, actionable_only, components)
+            )
 
             cut: list[str | None] = [None]
 
@@ -472,6 +496,7 @@ class Explorer:
                         text=text,
                         template=tid,
                         request_id=request_id,
+                        tags=restriction,
                         page=index,
                     )
                     return rows, more
@@ -481,6 +506,7 @@ class Explorer:
                     effective,
                     template=tid,
                     request_id=request_id,
+                    tags=restriction,
                     page=index,
                 )
 
@@ -490,6 +516,13 @@ class Explorer:
                 rows, more = load(page_index)
             first = page_index * PAGE_SIZE + 1
             label = f"rows {first}-{first + len(rows) - 1}" if rows else "no matching rows"
+            if (
+                not rows
+                and tid is not None
+                and restriction is not None
+                and restriction.excludes(tid)
+            ):
+                label += EXCLUDED.format(tid=tid)
             if cut[0] is not None:
                 label += f" (searched through hour {cut[0]} UTC; narrow the time range for more)"
             return rows, page_index, label, page_index == 0, not more

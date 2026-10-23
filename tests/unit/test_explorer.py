@@ -182,7 +182,49 @@ def test_helpers():
     )
 
 
-def test_layout_prefilled_and_callback(exp):
+def post(client, inputs, state, changed):
+    outs = ["explorer-grid.rowData", "explorer-page.data", "explorer-label.children",
+            "explorer-prev.disabled", "explorer-next.disabled"]  # fmt: skip
+    body = {
+        "output": ".." + "...".join(outs) + "..",
+        "outputs": [{"id": o.split(".")[0], "property": o.split(".")[1]} for o in outs],
+        "inputs": [{"id": i, "property": p, "value": v} for i, p, v in inputs],
+        "state": [{"id": "explorer-page", "property": "data", "value": state}],
+        "changedPropIds": [changed],
+    }
+    resp = client.post(
+        "/_dash-update-component", data=json.dumps(body), content_type="application/json"
+    )
+    assert resp.status_code == 200, resp.get_data()
+    return resp.get_json()["response"]
+
+
+def explorer_inputs(**over):
+    base = {
+        "filters": ("data", {}),
+        "explorer-link": ("data", {}),
+        "explorer-template": ("value", ""),
+        "explorer-request": ("value", ""),
+        "explorer-text": ("value", ""),
+        "explorer-hide-noise": ("checked", False),
+        "explorer-actionable-only": ("checked", False),
+        "explorer-components": ("value", []),
+        "explorer-prev": ("n_clicks", None),
+        "explorer-next": ("n_clicks", None),
+    }
+    base.update(over)
+    return [(k, p, v) for k, (p, v) in base.items()]
+
+
+def walk(node):
+    yield node
+    children = getattr(node, "children", None)
+    for child in children if isinstance(children, list | tuple) else [children]:
+        if child is not None and not isinstance(child, str):
+            yield from walk(child)
+
+
+def test_layout_prefilled_and_callback(exp, no_tags):
     store, registry = exp
     from logdash.app.main import create_app
 
@@ -193,50 +235,29 @@ def test_layout_prefilled_and_callback(exp):
     assert client.get("/explorer").status_code == 200
     assert client.get("/explorer?template=1&host=eselda14u05s02").status_code == 200
 
-    def call(inputs, state, changed):
-        outs = ["explorer-grid.rowData", "explorer-page.data", "explorer-label.children",
-                "explorer-prev.disabled", "explorer-next.disabled"]  # fmt: skip
-        body = {
-            "output": ".." + "...".join(outs) + "..",
-            "outputs": [{"id": o.split(".")[0], "property": o.split(".")[1]} for o in outs],
-            "inputs": [{"id": i, "property": p, "value": v} for i, p, v in inputs],
-            "state": [{"id": "explorer-page", "property": "data", "value": state}],
-            "changedPropIds": [changed],
-        }
-        resp = client.post(
-            "/_dash-update-component", data=json.dumps(body), content_type="application/json"
-        )
-        assert resp.status_code == 200, resp.get_data()
-        return resp.get_json()["response"]
-
-    def inputs(**over):
-        base = {
-            "filters": ("data", {}),
-            "explorer-link": ("data", {}),
-            "explorer-template": ("value", ""),
-            "explorer-request": ("value", ""),
-            "explorer-text": ("value", ""),
-            "explorer-prev": ("n_clicks", None),
-            "explorer-next": ("n_clicks", None),
-        }
-        base.update(over)
-        return [(k, p, v) for k, (p, v) in base.items()]
-
-    out = call(inputs(), 0, "filters.data")
+    out = post(client, explorer_inputs(), 0, "filters.data")
     assert len(out["explorer-grid"]["rowData"]) == ex.PAGE_SIZE and out["explorer-prev"]["disabled"]
-    nxt = call(inputs(**{"explorer-next": ("n_clicks", 1)}), 0, "explorer-next.n_clicks")
+    nxt = post(
+        client, explorer_inputs(**{"explorer-next": ("n_clicks", 1)}), 0, "explorer-next.n_clicks"
+    )
     assert nxt["explorer-page"]["data"] == 1 and "101-200" in nxt["explorer-label"]["children"]
     # paging past the end steps back one page
-    end = call(
-        inputs(**{"explorer-text": ("value", "bgp session"), "explorer-next": ("n_clicks", 1)}),
+    end = post(
+        client,
+        explorer_inputs(
+            **{"explorer-text": ("value", "bgp session"), "explorer-next": ("n_clicks", 1)}
+        ),
         1,
         "explorer-next.n_clicks",
     )
     assert end["explorer-page"]["data"] == 0 and end["explorer-next"]["disabled"]
-    none = call(inputs(**{"explorer-text": ("value", "zzzz")}), 0, "explorer-text.value")
+    none = post(
+        client, explorer_inputs(**{"explorer-text": ("value", "zzzz")}), 0, "explorer-text.value"
+    )
     assert none["explorer-label"]["children"] == "no matching rows"
-    linked = call(
-        inputs(
+    linked = post(
+        client,
+        explorer_inputs(
             **{
                 "explorer-link": ("data", {"host": "eselda14u05s02"}),
                 "explorer-template": ("value", "1"),
@@ -246,6 +267,11 @@ def test_layout_prefilled_and_callback(exp):
         "explorer-link.data",
     )
     assert all(r["host"] == "eselda14u05s02" for r in linked["explorer-grid"]["rowData"])
+    # without tags the tag controls change nothing
+    for over in ({"explorer-hide-noise": ("checked", True)},
+                 {"explorer-components": ("value", ["auth"])}):  # fmt: skip
+        same = post(client, explorer_inputs(**over), 0, next(iter(over)) + ".x")
+        assert same["explorer-grid"]["rowData"] == out["explorer-grid"]["rowData"]
 
 
 def test_search_page_matches_fetch_page_and_stops_on_budget(exp, con):
@@ -387,3 +413,62 @@ def test_search_page_with_tags(tagged, con):
     found = ex.search_page(con, store, Filters(), text="closed", tags=act)[0]
     expected = page(con, store, text="closed", tags=act)[0]
     assert found and [r["time"] for r in found] == [r["time"] for r in expected]
+
+
+def test_layout_tag_controls(exp, no_tags):
+    store = exp[0]
+    hidden = Explorer().layout(store)
+    group = next(c for c in walk(hidden) if getattr(c, "id", None) == "explorer-tag-filters")
+    assert group.style == {"display": "none"} and "Tag filters" not in str(hidden)
+
+
+def test_layout_tag_controls_with_tags(exp, tagged):
+    shown = Explorer().layout(tagged.store)
+    group = next(c for c in walk(shown) if getattr(c, "id", None) == "explorer-tag-filters")
+    assert getattr(group, "style", None) is None
+    ids = {getattr(c, "id", None) for c in walk(shown)}
+    assert {"explorer-hide-noise", "explorer-actionable-only", "explorer-components"} <= ids
+    assert "Tag filters" in str(shown)
+
+
+def test_callback_with_tags_over_http(exp, tagged):
+    from logdash.app.main import create_app
+
+    store, registry = exp
+    client = create_app(store, registry).server.test_client()
+
+    def rows(out):
+        return out["explorer-grid"]["rowData"]
+
+    hide = {"explorer-hide-noise": ("checked", True)}
+    out = post(client, explorer_inputs(**hide), 0, "explorer-hide-noise.checked")
+    assert rows(out) and out["explorer-page"]["data"] == 0
+    assert all("Duplicate iptables rule" not in (r["payload"] or "") for r in rows(out))
+    act = {"explorer-actionable-only": ("checked", True)}
+    out = post(client, explorer_inputs(**act), 0, "explorer-actionable-only.checked")
+    assert rows(out) and all("closed unexpectedly" in r["payload"] for r in rows(out))
+    out = post(
+        client,
+        explorer_inputs(**hide, **{"explorer-template": ("value", str(tagged.noise))}),
+        0,
+        "explorer-template.value",
+    )
+    assert rows(out) == []
+    assert out["explorer-label"]["children"] == (
+        f"no matching rows (template {tagged.noise} is excluded by the tag filters)"
+    )
+    out = post(
+        client,
+        explorer_inputs(**act, **{"explorer-template": ("value", str(tagged.failure))}),
+        0,
+        "explorer-template.value",
+    )
+    assert rows(out) and all("closed unexpectedly" in r["payload"] for r in rows(out))
+    out = post(
+        client,
+        explorer_inputs(**hide, filters=("data", {"levels": ["ERROR"]})),
+        0,
+        "filters.data",
+    )
+    assert rows(out) and all(r["level"] == "ERROR" for r in rows(out))
+    assert all("iptables" not in (r["payload"] or "") for r in rows(out))
