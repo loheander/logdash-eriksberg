@@ -17,12 +17,19 @@ if TYPE_CHECKING:
 
     from logdash.cache.store import CacheStore
 
-RESERVED_KEYS = frozenset({"events"})
+RESERVED_KEYS = frozenset(
+    {"events", "tags_memo"}
+)  # tags_memo: memo of model answers (analyses/tags.py)
 
 
 @runtime_checkable
 class Analysis(Protocol):
-    """One dashboard page: precompute in ``compute``, render from the cache afterwards."""
+    """One dashboard page: precompute in ``compute``, render from the cache afterwards.
+
+    Optional class attributes: ``page = False`` (built, but no page, link or card) and
+    ``calls_model = True`` (calls a language model; skipped by ``logdash serve``'s
+    build, see ADR001).
+    """
 
     key: str  # cache subdirectory and URL path
     title: str  # navigation label
@@ -115,6 +122,10 @@ class Registry:
                 if dep not in self._items:
                     raise MissingDependencyError(f"{key!r} depends on unknown {dep!r}")
         return [self._items[k] for k in self._toposort(wanted)]
+
+    def pages(self) -> list[Analysis]:
+        """Analyses with a dashboard page (``page`` attribute, default True), in build order."""
+        return [a for a in self.ordered() if getattr(a, "page", True)]
 
     def _closure(self, keys: Iterable[str]) -> set[str]:
         seen: set[str] = set()

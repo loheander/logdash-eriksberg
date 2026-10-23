@@ -7,6 +7,7 @@ Skipped when ``./cache`` has no built events.
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from functools import partial
@@ -18,12 +19,15 @@ import pytest
 
 from logdash.analyses import anomalies, features, hosts, load_builtin, pca
 from logdash.analyses.base import REGISTRY
-from logdash.analyses.explorer import fetch_page, search_page
+from logdash.analyses.explorer import TagRestriction, fetch_page, search_page, tag_restriction
+from logdash.analyses.tags import tags_frame
 from logdash.analyses.temporal import Temporal
 from logdash.app.filters import from_dict
 from logdash.app.main import create_app, filter_options
+from logdash.app.tag_filters import TagFilter, load_tags
 from logdash.cache.store import CacheStore
 from logdash.config import Settings
+from logdash.tagging.model import COMPONENTS, Tag
 
 pytestmark = pytest.mark.slow
 
@@ -85,7 +89,7 @@ def test_app_start(store: CacheStore) -> None:
 
 
 def test_layouts(store: CacheStore) -> None:
-    for analysis in REGISTRY.ordered():
+    for analysis in REGISTRY.pages():
         measure(f"{analysis.key}.layout", "-", LAYOUT_BUDGET_S, lambda a=analysis: a.layout(store))  # type: ignore[misc]
 
 
@@ -170,6 +174,15 @@ def test_temporal(store: CacheStore) -> None:
     )
 
 
+TAG_FILTER_CASES = (
+    ("no tag filter", False, False, []),
+    ("hide noise", True, False, []),
+    ("actionable only", False, True, []),
+    ("component network", False, False, ["network"]),
+    ("all three", True, True, ["network", "storage"]),
+)
+
+
 def test_templates(store: CacheStore) -> None:
     fns = _recorded(store, "templates")
     rows = [{"template_id": 0}]
@@ -189,6 +202,19 @@ def test_templates(store: CacheStore) -> None:
         str(value),
         CALLBACK_BUDGET_S,
         lambda: fns["draw_params"](value, rows, "light"),
+    )
+    for case, hide, actionable, components in TAG_FILTER_CASES:
+        measure(
+            "templates.filter_grid",
+            case,
+            CALLBACK_BUDGET_S,
+            lambda h=hide, a=actionable, c=components: fns["filter_grid"](h, a, c, rows),  # type: ignore[misc]
+        )
+    measure(
+        "templates.draw_volume",
+        "no selection",
+        CALLBACK_BUDGET_S,
+        lambda: fns["draw_volume"]([], None, "light"),
     )
 
 
@@ -317,6 +343,46 @@ def test_anomalies(store: CacheStore) -> None:
             )
 
 
+ANOMALY_TAG_CASES = (
+    ("hide noise", True, False, []),
+    ("actionable only", False, True, []),
+    ("component network", False, False, ["network"]),
+    ("all three", True, True, ["network", "storage"]),
+)
+
+
+def _anomaly_tags(store: CacheStore) -> tuple[str, pl.DataFrame]:
+    """("real", cached tags) or ("stand-in", tags for every template).
+
+    Stand-ins: template 1 (the largest) is noise, texts that read like a failure are
+    actionable, and the components cycle by id, so every case keeps and drops some rows.
+    """
+    real = load_tags(store)
+    if real is not None:
+        return "real", real
+    templates = store.read_parquet("templates", "templates.parquet")
+    failure = re.compile(r"(?i)error|fail|exception|refused|timeout")
+    stand_in = {
+        text: Tag(bool(failure.search(text)), COMPONENTS[tid % len(COMPONENTS)], tid == 1, "-")
+        for tid, text in templates.select("template_id", "template").iter_rows()
+    }
+    return "stand-in", tags_frame(templates, stand_in)
+
+
+def test_anomalies_tag_filters(store: CacheStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    source, tags = _anomaly_tags(store)
+    monkeypatch.setattr(anomalies, "load_tags", lambda _store: tags)
+    fns = _recorded(store, "anomalies")
+    for name, filters in _cases(store).items():
+        for case, hide, actionable, components in ANOMALY_TAG_CASES:
+            measure(
+                "anomalies.draw",
+                f"tags ({source}) {case}, {name}",
+                CALLBACK_BUDGET_S,
+                partial(fns["draw"], [], "overall", filters, "light", hide, actionable, components),
+            )
+
+
 def test_anomalies_top_100_is_diverse(store: CacheStore) -> None:
     """The plan's bounds on the combined top 100 by ``overall`` (not a latency measurement)."""
     rows = anomalies.sort_rows(anomalies.load_anomalies(store), "overall")
@@ -367,6 +433,60 @@ def test_explorer(store: CacheStore) -> None:
                 con.cursor(), store, from_dict(f), **k
             ),
         )
+
+
+ACTIONABLE_PROXY = r"(?i)error|fail|exception|refused|timeout"
+
+
+def _tag_restrictions(
+    store: CacheStore,
+) -> tuple[str, TagRestriction | None, TagRestriction | None]:
+    """(source, hide noise, actionable only): real tags if cached, else stand-ins.
+
+    Stand-ins: template 1 (the largest) as noise, and the templates whose text reads like a
+    failure as actionable (53 templates, about 119 000 lines on the real cache).
+    """
+    if load_tags(store) is not None:
+        return (
+            "real",
+            tag_restriction(store, TagFilter(hide_noise=True)),
+            tag_restriction(store, TagFilter(actionable_only=True)),
+        )
+    t = store.read_parquet("templates", "templates.parquet")
+    ids = t.filter(pl.col("template").str.contains(ACTIONABLE_PROXY))["template_id"].to_list()
+    return "proxy", TagRestriction((1,), keep=False), TagRestriction(tuple(sorted(ids)), keep=True)
+
+
+def test_explorer_tags(store: CacheStore) -> None:
+    con = store.connect()
+    src, hide, act = _tag_restrictions(store)
+    hour = _hour_filters(store)
+    host = _cases(store)["host"]
+    cases: dict[str, tuple[dict[str, Any] | None, dict[str, Any]]] = {
+        "hide noise": (None, {"tags": hide}),
+        "hide noise, page 50": (None, {"tags": hide, "page": 50}),
+        "hide noise, template 5": (None, {"tags": hide, "template": 5}),
+        "actionable": (None, {"tags": act}),
+        "actionable, page 5": (None, {"tags": act, "page": 5}),
+        "actionable, 1 hour": (hour, {"tags": act}),
+        "actionable, host": (host, {"tags": act}),
+        "actionable, text 'error'": (None, {"tags": act, "text": "error"}),
+    }
+    for name, (filters, kw) in cases.items():
+        measure(
+            "explorer.fetch_page",
+            f"tags ({src}): {name}",
+            CALLBACK_BUDGET_S,
+            lambda f=filters, k=kw: (search_page if "text" in k else fetch_page)(  # type: ignore[misc]
+                con.cursor(), store, from_dict(f), **k
+            ),
+        )
+    measure(
+        "explorer.tag_restriction",
+        "all three",
+        CALLBACK_BUDGET_S,
+        lambda: tag_restriction(store, TagFilter(True, True, ("network", "storage"))),
+    )
 
 
 def test_zz_print_table() -> None:
