@@ -7,6 +7,7 @@ Skipped when ``./cache`` has no built events.
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from functools import partial
@@ -19,11 +20,14 @@ import pytest
 from logdash.analyses import anomalies, features, hosts, load_builtin, pca
 from logdash.analyses.base import REGISTRY
 from logdash.analyses.explorer import fetch_page, search_page
+from logdash.analyses.tags import tags_frame
 from logdash.analyses.temporal import Temporal
 from logdash.app.filters import from_dict
 from logdash.app.main import create_app, filter_options
+from logdash.app.tag_filters import load_tags
 from logdash.cache.store import CacheStore
 from logdash.config import Settings
+from logdash.tagging.model import COMPONENTS, Tag
 
 pytestmark = pytest.mark.slow
 
@@ -336,6 +340,46 @@ def test_anomalies(store: CacheStore) -> None:
                 f"{name}, types={types or 'all'}, sort={sort}",
                 CALLBACK_BUDGET_S,
                 partial(fns["draw"], types, sort, filters, "light"),
+            )
+
+
+ANOMALY_TAG_CASES = (
+    ("hide noise", True, False, []),
+    ("actionable only", False, True, []),
+    ("component network", False, False, ["network"]),
+    ("all three", True, True, ["network", "storage"]),
+)
+
+
+def _anomaly_tags(store: CacheStore) -> tuple[str, pl.DataFrame]:
+    """("real", cached tags) or ("stand-in", tags for every template).
+
+    Stand-ins: template 1 (the largest) is noise, texts that read like a failure are
+    actionable, and the components cycle by id, so every case keeps and drops some rows.
+    """
+    real = load_tags(store)
+    if real is not None:
+        return "real", real
+    templates = store.read_parquet("templates", "templates.parquet")
+    failure = re.compile(r"(?i)error|fail|exception|refused|timeout")
+    stand_in = {
+        text: Tag(bool(failure.search(text)), COMPONENTS[tid % len(COMPONENTS)], tid == 1, "-")
+        for tid, text in templates.select("template_id", "template").iter_rows()
+    }
+    return "stand-in", tags_frame(templates, stand_in)
+
+
+def test_anomalies_tag_filters(store: CacheStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    source, tags = _anomaly_tags(store)
+    monkeypatch.setattr(anomalies, "load_tags", lambda _store: tags)
+    fns = _recorded(store, "anomalies")
+    for name, filters in _cases(store).items():
+        for case, hide, actionable, components in ANOMALY_TAG_CASES:
+            measure(
+                "anomalies.draw",
+                f"tags ({source}) {case}, {name}",
+                CALLBACK_BUDGET_S,
+                partial(fns["draw"], [], "overall", filters, "light", hide, actionable, components),
             )
 
 
