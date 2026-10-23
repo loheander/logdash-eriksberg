@@ -59,3 +59,18 @@ def test_version_flag(capsys):
         main(["--version"])
     assert exc.value.code == 0
     assert __version__ in capsys.readouterr().out
+
+
+def test_serve_builds_without_model(synthetic, cache_dir, monkeypatch):
+    calls: list[dict] = []
+    monkeypatch.setattr("logdash.cli.run_build", lambda s, **kw: calls.append(kw) or [])
+
+    def no_app(store):
+        raise FileNotFoundError("no cache")
+
+    monkeypatch.setattr("logdash.app.main.create_app", no_app)
+    common = ["--data", str(synthetic.data_dir), "--cache", str(cache_dir), "--threads", "2"]
+    assert main(["serve", *common]) == 2
+    assert calls == [{"allow_model": False}]
+    assert main(["serve", *common, "--no-build"]) == 2
+    assert len(calls) == 1

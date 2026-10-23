@@ -97,3 +97,18 @@ def test_register_decorator():
     finally:
         base.REGISTRY.clear()
         base.REGISTRY._items.update(saved)
+
+
+def test_pages_excludes_pageless():
+    reg = Registry()
+    reg.add(Dummy("a"))
+    hidden = Dummy("b", "a")
+    hidden.page = False
+    reg.add(hidden)
+    assert keys(reg.pages()) == ["a"]
+    assert keys(reg.ordered()) == ["a", "b"]
+
+
+def test_reserved_memo_key():
+    with pytest.raises(DuplicateKeyError):
+        Registry().add(Dummy("tags_memo"))
