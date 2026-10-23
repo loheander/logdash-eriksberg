@@ -32,6 +32,10 @@ open branches. Read `.claude/sdlc/protocol.md` first; its rules bind you.
 
 ## 3. Decide the size
 
+If the issue has no Size, get one from Jev first:
+`python3 -I .claude/sdlc/issue_triage.py <n>` (without `--apply` it writes nothing) and
+use its `proposed.Size`. If it fails or lists Size in `unsure`, judge the size yourself.
+
 Split instead of planning whole if any of these hold:
 - the issue is Size L or XL and has parts that can ship separately,
 - the plan would touch more than about 3 modules or exceed about 400 lines,
@@ -105,8 +109,24 @@ Open questions:
 
 ## 5. Hand off
 
-1. If the issue has no Size, set one from the plan:
-   `python3 -I .claude/sdlc/board.py set <n> Size <XS|S|M|L|XL>`.
+1. Classify the issue with Jev, now that the plan comment is posted:
+   `python3 -I .claude/sdlc/issue_triage.py <n> --apply`. It reads the issue and the
+   newest plan and fills only what is empty, by these rules:
+   - **Size** (XS to XL) from the plan, on the same scale as the split rule in step 3.
+   - **Priority** (P0 to P2): a story copies its parent's; otherwise Jev ranks it
+     against the open backlog.
+   - **Risk** (low, medium, high) from the human-review gate's `blast_radius` question
+     and thresholds, so planning and review grade risk the same way. The reviewer's
+     gate overwrites it with the PR's risk.
+   - **Type label** (`bug`, `enhancement` or `documentation`), only if the issue has
+     none of them.
+
+   Never overwrite a value a human set, and never edit the rules or thresholds in the
+   script; that is the retrospective's job. If the script fails (exit 1), or lists a
+   field in `unsure`, decide that field yourself: set Size from the plan
+   (`python3 -I .claude/sdlc/board.py set <n> Size <XS|S|M|L|XL>`) and leave Priority,
+   Risk and the label empty for a human.
 2. `gh issue edit <n> --remove-label needs-replan --remove-label agent-busy`
 3. `python3 -I .claude/sdlc/board.py status <n> Ready`
-4. Report: the plan comment URL, the dependencies, and any open questions.
+4. Report: the plan comment URL, the dependencies, any open questions, and the triage
+   result (each field applied or skipped, with Jev's value and confidence).

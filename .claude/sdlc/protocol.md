@@ -109,6 +109,8 @@ $B status <issue#> "In review"      # move an item
 $B set <issue#> Risk high           # set any single-select field
 $B add <issue#> [Status]            # put an issue on the board (default Backlog)
 $B ensure-labels                    # create the pipeline labels if missing
+python3 -I .claude/sdlc/issue_triage.py <issue#> [--apply]   # Jev: Size, Priority, Risk, type label
+python3 -I .claude/sdlc/human_review_gate.py <pr#> --review-file <f>   # Jev: merge or human
 gh issue view <n> --json number,title,body,labels,comments
 gh pr view <pr> --json number,title,body,headRefName,mergeable,comments,files
 gh issue comment <n> --body-file <file>
