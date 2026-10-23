@@ -1,0 +1,44 @@
+{
+  "model": "typesafe/jev-1.14",
+  "context": "Each item is one pull request in logdash, a Dash dashboard for analysing a 38.8 M-line OpenStack log dataset. A precompute step (ingest, Drain3 templates, analyses, anomaly detectors) writes Parquet and JSON to cache/; the Dash app only reads that cache and must answer every interaction in under 300 ms. Users are cluster operators, SREs and data people who use the pages and anomaly results to make decisions. Each PR was written and reviewed by AI agents. The answers decide whether a human must review the PR before it merges, or whether it can merge automatically. Fields: title, issue (the ticket), plan (the implementation plan summary), files (changed files with added/deleted lines), review (the agent review summary).",
+  "questions": {
+    "impact": {
+      "type": "score",
+      "instructions": "How much does this change affect what users see, trust or decide on?",
+      "criteria": [
+        "None visible: tests, docs, comments, refactors with unchanged behaviour, dev tooling.",
+        "Small and local: a label, layout, tooltip, colour or filter on one page; results unchanged.",
+        "Changes results or behaviour of one feature: a detector's output, a chart's numbers, one page's workflow, a new page that reads existing cache.",
+        "Changes results users rely on across the product, or adds a headline capability: ingest, templates, shared analyses, scoring that several pages show, or a model whose output drives decisions."
+      ],
+      "examples": [
+        {"item": "title: Temporal heatmap: label every host. files: analyses/temporal.py +66 -16, app/ui.py +14, tests +105", "impact": 1},
+        {"item": "title: Detector: severity bursts. files: detectors/severity.py +285 (new), analyses/temporal.py, tests +300", "impact": 2},
+        {"item": "title: Change Drain3 similarity threshold and template ids. files: ingest/templates.py, config.py, every analysis reading template_id", "impact": 3}
+      ]
+    },
+    "blast_radius": {
+      "type": "score",
+      "instructions": "If this change is wrong, how far does the damage spread and how hard is it to undo?",
+      "criteria": [
+        "Contained: one file or one new isolated module, undone by reverting one commit, no cache rebuild.",
+        "One feature: one page or detector and its tests; a revert fixes it; at most one cache stage rebuilds.",
+        "Shared code: config, cache stage layout, app layout or callbacks used by several pages, shared helpers; a mistake breaks or slows several pages or forces several stages to rebuild.",
+        "Cross-cutting: ingest or cache schema, CLI, build orchestration, dependencies (pyproject.toml, uv.lock), CI, security-relevant code, or the agent pipeline itself (.claude/); a mistake corrupts data, breaks every page or needs a full rebuild."
+      ],
+      "examples": [
+        {"item": "title: Tooltip wording on the Templates page. files: app/pages/templates.py +4 -2", "blast_radius": 0},
+        {"item": "title: Detector: novel and rare templates. files: detectors/templates.py +180 (new), detectors/__init__.py +2, tests +150", "blast_radius": 1},
+        {"item": "title: Background training with a new torch dependency. files: pyproject.toml, uv.lock, app/__init__.py, new pages/forecast.py", "blast_radius": 3}
+      ]
+    },
+    "needs_human": {
+      "type": "noul",
+      "instructions": "Would a careful tech lead insist on reading this PR before it merges, rather than reading it afterwards?",
+      "criteria": {
+        "true": "Yes: it changes data correctness, shared behaviour, dependencies, performance-critical paths, security, or makes a product or design decision a human should own; or the review left doubts.",
+        "false": "No: the change is local, well tested, follows an agreed plan, and a mistake would be cheap to spot and revert after merging."
+      }
+    }
+  }
+}
