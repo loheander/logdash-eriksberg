@@ -32,6 +32,7 @@ packages = ["src/logdash"]
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
+extend-exclude = ["plans", "adrs"]  # Markdown docs; ruff formats code blocks in them
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4"]

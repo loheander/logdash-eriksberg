@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from logdash import config
 from logdash.analyses.base import Analysis, Registry
 from logdash.build import run_build
 from logdash.cache.store import CacheStore
 from logdash.config import Settings
+from logdash.tagging import openrouter
 from tests.synthetic import GroundTruth, SyntheticSpec, write_dataset
 
 
@@ -69,3 +72,18 @@ def build_with(built: Built, *analyses: Analysis) -> Registry:
         registry.add(analysis)
     run_build(built.settings, registry=registry, log=lambda _: None)
     return registry
+
+
+@pytest.fixture(autouse=True)
+def _no_model_network(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Never read the developer's .env or reach OpenRouter from a test."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("LOGDASH_TAG_MODEL", raising=False)
+    monkeypatch.setattr(config, "DOTENV_PATH", tmp_path_factory.getbasetemp() / "no.env")
+
+    def refuse(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("tests must not call OpenRouter")
+
+    monkeypatch.setattr(openrouter, "post_json", refuse)

@@ -9,10 +9,12 @@ BUILTIN: tuple[str, ...] = (
     "distributions",
     "temporal",
     "templates",
+    "tags",
     "features",
     "pca",
     "anomalies",
     "hosts",
+    "forecast",
     "explorer",
     "triage",
 )

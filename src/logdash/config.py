@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,26 @@ DEFAULT_RARE_THRESHOLD = 5
 DEFAULT_NOVEL_FRACTION = 0.1
 DEFAULT_JEV_MODEL = "typesafe/jev-1.14"
 DEFAULT_JEV_TIMEOUT_S = 10.0
+DEFAULT_TAG_MODEL = "anthropic/claude-haiku-5.5"
+DOTENV_PATH = Path(".env")
+
+
+def read_dotenv(path: Path) -> dict[str, str]:
+    """Parse ``KEY=value`` lines; no interpolation and no inline comments."""
+    if not path.is_file():
+        return {}
+    out: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        line = line.removeprefix("export ")
+        name, _, value = line.partition("=")
+        name, value = name.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        out[name] = value
+    return out
 
 
 @dataclass(frozen=True)
@@ -42,6 +62,8 @@ class Settings:
     novel_fraction: float = DEFAULT_NOVEL_FRACTION  # first seen in the last fraction of the span
     jev_model: str = DEFAULT_JEV_MODEL  # decision model of the triage page (called live)
     jev_timeout_s: float = DEFAULT_JEV_TIMEOUT_S  # per attempt; the client retries once
+    tag_model: str = DEFAULT_TAG_MODEL  # OpenRouter model ID for semantic tags
+    openrouter_api_key: str | None = field(default=None, repr=False)  # never fingerprinted
 
     def __post_init__(self) -> None:
         if not 0 < self.novel_fraction < 1:
@@ -49,9 +71,14 @@ class Settings:
                 f"novel_fraction must be between 0 and 1 (exclusive), got {self.novel_fraction}"
             )
 
+    @property
+    def tagging_enabled(self) -> bool:
+        return bool(self.openrouter_api_key)
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
-        env = os.environ if env is None else env
+        if env is None:
+            env = {**read_dotenv(DOTENV_PATH), **os.environ}
         return cls(
             data_dir=Path(env.get("LOGDASH_DATA", DEFAULT_DATA)),
             cache_dir=Path(env.get("LOGDASH_CACHE", DEFAULT_CACHE)),
@@ -67,6 +94,8 @@ class Settings:
             novel_fraction=float(env.get("LOGDASH_NOVEL_FRACTION", DEFAULT_NOVEL_FRACTION)),
             jev_model=env.get("LOGDASH_JEV_MODEL", DEFAULT_JEV_MODEL),
             jev_timeout_s=float(env.get("LOGDASH_JEV_TIMEOUT_S", DEFAULT_JEV_TIMEOUT_S)),
+            tag_model=env.get("LOGDASH_TAG_MODEL") or DEFAULT_TAG_MODEL,
+            openrouter_api_key=env.get("OPENROUTER_API_KEY") or None,
         )
 
     def with_overrides(self, **overrides: Any) -> Settings:

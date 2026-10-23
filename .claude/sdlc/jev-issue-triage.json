@@ -1,0 +1,46 @@
+{
+  "model": "typesafe/jev-1.14",
+  "context": "Each item is one issue on the logdash board. logdash is a Dash dashboard for analysing a 38.8 M-line OpenStack log dataset. A precompute step (ingest, Drain3 templates, analyses, anomaly detectors) writes Parquet and JSON to cache/; the Dash app only reads that cache and must answer every interaction in under 300 ms. Users are cluster operators, SREs and data people. Issues are planned and implemented by AI agents, one PR per issue; an issue that is too large for one PR is split into stories. Fields: title, body (the ticket), parent (the epic it belongs to, if any), plan (the implementation plan, if one is written yet). The answers set the issue's Size, Priority, Risk and type label on the board.",
+  "questions": {
+    "size": {
+      "type": "score",
+      "instructions": "How large is the work to deliver this issue, counting production code (tests come on top)?",
+      "criteria": [
+        "XS: a small change in one file: wording, a constant, a config default, or documentation only.",
+        "S: one module and its tests, up to about 150 lines of production code; no new page or cache stage.",
+        "M: two or three modules, up to about 400 lines of production code, for example a new detector or one page feature; fits one PR.",
+        "L: more than about three modules or more than about 400 lines of production code, for example a new page with its own cache stage; usually has parts that can ship separately.",
+        "XL: several features or a new subsystem; must be split into four or more stories."
+      ],
+      "examples": [
+        {"item": "title: Host heatmap: readable host labels with 162 hosts. plan: change the heatmap figure in analyses/temporal.py to one labelled row per host, adjust app/ui.py, add tests.", "size": 1},
+        {"item": "title: Detector: contextual (host vs peers). plan: new detectors/contextual.py, register it in detectors/__init__.py, tests.", "size": 2},
+        {"item": "title: Hosts and services (module 7). plan: new cache stage, new page with host table, service matrix and drill-down, config, README.", "size": 3}
+      ]
+    },
+    "priority": {
+      "type": "score",
+      "instructions": "How urgent is this issue compared with the rest of the backlog listed in the context?",
+      "criteria": [
+        "P2: polish, readability, a nice-to-have or exploratory idea; nothing waits on it.",
+        "P1: an important feature or fix users will notice; planned soon, but no other planned work is blocked on it.",
+        "P0: a core capability of the current phase, a defect that breaks or corrupts results users rely on, or work that other planned issues depend on."
+      ],
+      "examples": [
+        {"item": "title: Host heatmap: readable host labels with 162 hosts", "priority": 0},
+        {"item": "title: Detector: severity bursts. parent: Anomaly detection framework and page", "priority": 1},
+        {"item": "title: Anomaly detection framework and page (module 6)", "priority": 2}
+      ]
+    },
+    "kind": {
+      "type": "choice",
+      "instructions": "Which kind of issue is this?",
+      "criteria": {
+        "bug": "Something isn't working: existing behaviour is wrong, broken, or slower than promised.",
+        "enhancement": "New feature or request: adds a capability or changes what users can do.",
+        "documentation": "Only improves or adds documentation (README, ADRs, docs, comments), with no change in behaviour.",
+        "none": "Anything else: refactoring, cleanup, tooling or pipeline maintenance that is not a feature, a bug or documentation."
+      }
+    }
+  }
+}

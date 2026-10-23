@@ -23,7 +23,7 @@ def home_layout(registry: Registry) -> Component:
             refresh=False,
             underline="never",
         )
-        for a in registry.ordered()
+        for a in registry.pages()
     ]
     return ui.page(
         "logdash",
@@ -67,7 +67,7 @@ def create_app(store: CacheStore, registry: Registry | None = None) -> Dash:
     )
     dash.page_registry.clear()
     dash.register_page("home", path="/", title="logdash", layout=partial(home_layout, registry))
-    for analysis in registry.ordered():
+    for analysis in registry.pages():
         dash.register_page(
             analysis.key,
             path=f"/{analysis.key}",

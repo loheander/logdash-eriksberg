@@ -154,3 +154,22 @@ def test_load_builtin_is_idempotent():
     load_builtin()
     load_builtin()
     assert isinstance(BUILTIN, tuple)
+
+
+class ModelStage(CountLevels):
+    calls_model = True
+
+
+def test_model_stage_skipped_without_allow_model(settings, cache_dir):
+    model, dependent = ModelStage("m"), CountLevels("d", deps=["m"])
+    reg = registry_with(model, dependent)
+    results = run_build(settings, registry=reg, log=quiet, allow_model=False)
+    assert statuses(results) == {"events": "built", "m": "skipped", "d": "built"}
+    assert model.calls == 0
+    manifest = CacheStore(cache_dir).manifest()
+    assert manifest.get("m") is None and manifest.get("d") is not None
+    results = run_build(settings, registry=reg, log=quiet)
+    assert statuses(results)["m"] == "built" and statuses(results)["d"] == "built"
+    assert model.calls == 1 and dependent.calls == 2
+    results = run_build(settings, registry=reg, log=quiet, allow_model=False)
+    assert set(statuses(results).values()) == {"fresh"}
