@@ -1,13 +1,18 @@
 import json
+import shutil
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import polars as pl
 import pytest
 
 from logdash.analyses import templates as tp
+from logdash.analyses.tags import tags_frame
 from logdash.analyses.templates import Templates
 from logdash.app.filters import Filters
+from logdash.app.tag_filters import TagFilter
 from logdash.ingest.masking import mask
+from logdash.tagging.model import Tag
 from tests.conftest import build_with
 from tests.synthetic import utc
 
@@ -16,6 +21,142 @@ from tests.synthetic import utc
 def tpl(built):
     build_with(built, Templates())
     return built.store
+
+
+NOISE = Tag(False, "network", True, "Harmless duplicate firewall rule.")
+FAILURE = Tag(True, "network", False, "A peer closed a connection unexpectedly.")
+ROUTINE = Tag(False, "other", False, "Routine message.")
+
+
+def one_text(templates, needle):
+    hit = templates.filter(pl.col("template").str.contains(needle, literal=True))
+    assert hit.height == 1
+    return hit["template"][0]
+
+
+@pytest.fixture
+def no_tags(tpl):
+    shutil.rmtree(tpl.module_dir("tags"), ignore_errors=True)
+    return tpl
+
+
+@pytest.fixture
+def tagged(tpl):
+    shutil.rmtree(tpl.module_dir("tags"), ignore_errors=True)
+    templates = tpl.read_parquet("templates", "templates.parquet")
+    noise = one_text(templates, "Duplicate iptables rule")
+    failure = one_text(templates, "closed unexpectedly")
+    untagged = one_text(templates, "bgp session reset")
+    mapping = {
+        text: NOISE if text == noise else FAILURE if text == failure else ROUTINE
+        for text in templates["template"]
+        if text != untagged
+    }
+    tpl.write_parquet("tags", "tags.parquet", tags_frame(templates, mapping))
+    tpl.write_json(
+        "tags",
+        "meta.json",
+        {
+            "available": True,
+            "model": "stub",
+            "prompt_version": "1",
+            "templates": templates.height,
+            "tagged": len(mapping),
+            "untagged": 1,
+            "calls": 0,
+            "aborted": None,
+            "failures": [],
+        },
+    )
+
+    def tid(text):
+        return templates.filter(pl.col("template") == text)["template_id"][0]
+
+    yield SimpleNamespace(store=tpl, noise=tid(noise), failure=tid(failure), untagged=tid(untagged))
+    shutil.rmtree(tpl.module_dir("tags"), ignore_errors=True)
+
+
+def walk(node):
+    yield node
+    children = getattr(node, "children", None)
+    for child in children if isinstance(children, list | tuple) else [children]:
+        if child is not None and not isinstance(child, str):
+            yield from walk(child)
+
+
+def find(layout, id_):
+    return next(c for c in walk(layout) if getattr(c, "id", None) == id_)
+
+
+def test_layout_without_tags_is_unchanged(no_tags):
+    layout = Templates().layout(no_tags)
+    grid = find(layout, "templates-grid")
+    assert [c["field"] for c in grid.columnDefs] == [
+        "template_id",
+        "template",
+        "count",
+        "variants",
+        "first_seen",
+        "last_seen",
+    ]
+    assert all("tooltipField" not in c for c in grid.columnDefs)
+    assert all(
+        set(r) == {"template_id", "template", "count", "variants", "first_seen", "last_seen"}
+        for r in grid.rowData
+    )
+    assert find(layout, "templates-tag-filters").style == {"display": "none"}
+    assert "Semantic tags" not in str(layout)
+    templates = no_tags.read_parquet("templates", "templates.parquet")
+    rows, selection = tp.filtered_grid(no_tags, TagFilter(True, True, ("storage",)), None)
+    assert rows == tp.grid_rows(templates) and selection == rows[:1]
+
+
+def test_layout_with_tags_shows_columns_and_tooltip(tagged):
+    layout = Templates().layout(tagged.store)
+    grid = find(layout, "templates-grid")
+    assert [c["field"] for c in grid.columnDefs] == [
+        "template_id",
+        "template",
+        "actionable",
+        "component",
+        "noise",
+        "count",
+        "variants",
+        "first_seen",
+        "last_seen",
+    ]
+    assert grid.columnDefs[1]["tooltipField"] == "summary"
+    assert grid.getRowId
+    by_id = {r["template_id"]: r for r in grid.rowData}
+    noisy = by_id[tagged.noise]
+    assert (noisy["noise"], noisy["component"], noisy["summary"]) == (
+        "yes",
+        "network",
+        NOISE.summary,
+    )
+    if tagged.untagged in by_id:
+        assert by_id[tagged.untagged]["actionable"] == ""
+        assert by_id[tagged.untagged]["summary"] is None
+    assert getattr(find(layout, "templates-tag-filters"), "style", None) is None
+    assert "Semantic tags" in str(layout)
+
+
+def test_filtered_grid_moves_selection(tagged):
+    store = tagged.store
+    noise = [{"template_id": tagged.noise}]
+    failure = [{"template_id": tagged.failure}]
+    rows, sel = tp.filtered_grid(store, TagFilter(hide_noise=True), noise)
+    assert tagged.noise not in [r["template_id"] for r in rows] and sel == rows[:1]
+    rows, sel = tp.filtered_grid(store, TagFilter(actionable_only=True), None)
+    assert [r["template_id"] for r in rows] == [tagged.failure] and sel == rows
+    rows, sel = tp.filtered_grid(store, TagFilter(hide_noise=True), failure)
+    assert sel[0]["template_id"] == tagged.failure
+    assert tp.filtered_grid(store, TagFilter(components=("storage",)), None) == ([], [])
+
+
+def test_no_selection_views(tpl):
+    fig = tp.param_figure(Templates.params(tpl), None, None, None)
+    assert fig.layout.annotations[0].text == tp.NO_SELECTION
 
 
 def test_events_have_masked_hash(built, tpl, synthetic):
@@ -139,7 +280,8 @@ def test_tables_and_helpers(tpl):
     assert tp.short("x" * 500).endswith("…") and tp.short("abc") == "abc"
 
 
-def test_layout_and_callbacks_over_http(tpl, built):
+def test_layout_and_callbacks_over_http(tagged, built):
+    tpl = tagged.store
     from logdash.app.main import create_app
 
     assert "templates-grid" in str(Templates().layout(tpl))
@@ -147,7 +289,7 @@ def test_layout_and_callbacks_over_http(tpl, built):
     client = app.server.test_client()
     assert client.get("/templates").status_code == 200
 
-    def call(outputs, inputs):
+    def call(outputs, inputs, state=()):
         multi = len(outputs) > 1
         body = {
             "output": ".." + "...".join(f"{o}.{p}" for o, p in outputs) + ".."
@@ -157,6 +299,7 @@ def test_layout_and_callbacks_over_http(tpl, built):
             if multi
             else {"id": outputs[0][0], "property": outputs[0][1]},
             "inputs": [{"id": i, "property": p, "value": v} for i, p, v in inputs],
+            "state": [{"id": i, "property": p, "value": v} for i, p, v in state],
             "changedPropIds": [f"{inputs[0][0]}.{inputs[0][1]}"],
         }
         resp = client.post(
@@ -181,3 +324,20 @@ def test_layout_and_callbacks_over_http(tpl, built):
             ("theme", "data", None),
         ],
     )
+    out = call(
+        [("templates-grid", "rowData"), ("templates-grid", "selectedRows")],
+        [
+            ("templates-hide-noise", "checked", True),
+            ("templates-actionable-only", "checked", False),
+            ("templates-components", "value", []),
+        ],
+        state=[("templates-grid", "selectedRows", [{"template_id": int(tagged.noise)}])],
+    )
+    row_data = out["templates-grid"]["rowData"]
+    assert tagged.noise not in [r["template_id"] for r in row_data]
+    assert out["templates-grid"]["selectedRows"][0]["template_id"] == row_data[0]["template_id"]
+    empty = call(
+        [("templates-volume", "figure"), ("templates-link", "href")],
+        [("templates-grid", "selectedRows", []), ("filters", "data", {}), ("theme", "data", None)],
+    )
+    assert empty["templates-link"]["href"] == "/explorer"

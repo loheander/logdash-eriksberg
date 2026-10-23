@@ -67,7 +67,7 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy src
 ```
 
 The benchmark times every page layout and callback (no filter, one hour, host,
-template, text search, brushing, anomaly types and sorts) and asserts each is under 300 ms; run it with `-s`
+template, text search, brushing, anomaly types and sorts, template and explorer tag filters) and asserts each is under 300 ms; run it with `-s`
 to see the timing table.
 
 ## Building elsewhere

@@ -1,4 +1,4 @@
-"""Severity bursts: a surge of WARNING or ERROR lines in one service.
+"""Severity bursts: a surge of WARNING, ERROR or actionable-tagged lines in one service.
 
 This is the *severity* type of ``PLAN.md`` module 6. Only ``rate_60`` of the temporal stage has a
 level (there is no host x level table), so the kind is ``service``. Per service two dense
@@ -40,6 +40,17 @@ with the volume detector's ``merge_periodic`` before incidents are merged (a per
 the threshold (the evidence keeps the strongest z), so it stays visible but cannot rank among
 real bursts.
 
+Semantic signal. With semantic tags in the cache (``analyses/tags.py``, issue #24), a
+third series per service counts the lines of the templates tagged actionable and not
+noise, whatever level they were logged at (``SEMANTIC``, with the ERROR floors: these
+lines are failures). Tags are matched to the current templates by text, not id,
+because ``logdash serve`` may rebuild ``templates`` but never ``tags``. Its rows read
+``ACTIONABLE burst: ...; semantic signal: ...`` and name the template with the most lines.
+A semantic incident that overlaps a non-periodic WARNING or ERROR row of the same
+service gets no row of its own. That row's evidence gains ``; semantic signal agrees:
+...`` and keeps its score. Without tags (no key, not built, nothing tagged) the rows and
+meta are those of the level series alone.
+
 Fleet-wide events: this detector does not use the shared fleet filter
 (``_episodes.drop_fleet_wide``), which removes the windows of a minute in which more than 25 % of
 the active entities are flagged, because a structural score flags windows of every host in a fleet
@@ -52,15 +63,19 @@ services with a burst starting in one minute, so that a fleet-wide surge would s
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, NamedTuple
 
 import numpy as np
 import polars as pl
 from scipy import special, stats
 
+from logdash.analyses import tags as semantic_tags
+from logdash.analyses import templates as tpl
 from logdash.analyses import temporal
+from logdash.analyses.templates import short
 from logdash.analyses.temporal import MISSING, find_bursts, rolling_baseline
+from logdash.cache.store import CacheStore
 from logdash.config import DEFAULT_BURST_K, Settings
 from logdash.detectors import volume
 from logdash.detectors.base import DetectContext, register
@@ -83,6 +98,13 @@ LEVELS = (
     Level("WARNING", ("WARNING",), temporal.MIN_BURST, temporal.MIN_EXCESS),
     Level("ERROR", ("ERROR", "CRITICAL"), 1, 30),  # no peak floor: the tail gate binds
 )
+
+# Lines of the templates tagged actionable and not noise, at any level: failures, so the
+# ERROR floors (no peak floor, 30 extra lines)
+SEMANTIC = Level("ACTIONABLE", (), 1, 30)
+SIGNAL = "semantic signal"
+TOP_CHARS = 80  # template text in the evidence
+PERIODIC_NOTE = "; ranked at the threshold as periodic noise, z is the strongest episode's"
 
 
 def tail_z(peak: float, rate: float, variance: float | None = None) -> tuple[float, float]:
@@ -207,9 +229,8 @@ def burst_rows(
         rows.append(row)
         episode[id(row)] = f
     merged = volume.merge_periodic(rows)
-    note = "; ranked at the threshold as periodic noise, z is the strongest episode's"
     out = [
-        {**r, "raw": settings.burst_k, "evidence": r["evidence"] + note}
+        {**r, "raw": settings.burst_k, "evidence": r["evidence"] + PERIODIC_NOTE}
         for r in merged
         if id(r) not in episode  # a merged row is a new dict
     ]
@@ -234,19 +255,128 @@ def burst_rows(
     return sorted(out, key=lambda r: r["bin"])
 
 
+class Semantic(NamedTuple):
+    """The actionable templates of the current cache and their lines per minute."""
+
+    counts: pl.DataFrame  # template_id, bin, program, n (MISSING program dropped)
+    texts: dict[int, str]  # template_id -> template text
+    templates: int  # number of actionable templates
+
+
+def load_semantic(store: CacheStore) -> Semantic | None:
+    """Templates tagged actionable and not noise, matched to current ids by text.
+
+    ``None`` when there are no tags (no key, not built) or none is tagged: then the
+    detector is the level detector alone. The first row of a repeated text wins.
+    """
+    tags = semantic_tags.read_tags(store)
+    if tags is None or not tags["tagged"].any():
+        return None
+    wanted = (
+        tags.unique(subset="template", keep="first", maintain_order=True)
+        .filter(
+            pl.col("tagged")
+            & pl.col("actionable").fill_null(False)
+            & ~pl.col("noise").fill_null(False)
+        )
+        .select("template")
+    )
+    current = store.read_parquet(tpl.KEY, "templates.parquet").select("template_id", "template")
+    actionable = current.join(wanted, on="template", how="semi")
+    ids = actionable["template_id"].to_list()
+    counts = (
+        pl.scan_parquet(store.path(tpl.KEY, "template_counts.parquet"))
+        .filter(pl.col("template_id").is_in(ids) & (pl.col("program") != MISSING))
+        .collect()
+    )
+    texts = dict(zip(ids, actionable["template"].to_list(), strict=True))
+    return Semantic(counts, texts, len(ids))
+
+
+def semantic_rows(
+    sem: Semantic, t0: datetime, length: int, settings: Settings
+) -> list[dict[str, Any]]:
+    """Burst rows of each service's series of actionable lines (services in name order)."""
+    by_service = sem.counts.group_by("bin", "program").agg(pl.col("n").sum())
+    rows: list[dict[str, Any]] = []
+    for program in sorted(set(by_service["program"].to_list())):
+        part = by_service.filter(pl.col("program") == program)
+        x = temporal.dense_series(part["bin"], part["n"], t0, WINDOW_S, length)
+        rows += burst_rows(x, SEMANTIC, str(program), t0, settings)
+    return rows
+
+
+def signal_text(sem: Semantic, row: dict[str, Any]) -> str:
+    """How many actionable templates the row's window holds and which has the most lines."""
+    lo = row["bin"]
+    hi = lo + timedelta(seconds=row["window_s"])
+    inside = (
+        sem.counts.filter(
+            (pl.col("program") == row["entity"]) & (pl.col("bin") >= lo) & (pl.col("bin") < hi)
+        )
+        .group_by("template_id")
+        .agg(pl.col("n").sum())
+        .sort(["n", "template_id"], descending=[True, False])
+    )
+    k = inside.height
+    text = f"{k} template{'' if k == 1 else 's'} tagged actionable (any log level)"
+    if k:
+        top = sem.texts[int(inside["template_id"][0])]
+        text += f", most lines from '{short(top, TOP_CHARS)}'"
+    return text
+
+
+def overlaps(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    a_end = a["bin"] + timedelta(seconds=a["window_s"])
+    b_end = b["bin"] + timedelta(seconds=b["window_s"])
+    return bool(a["bin"] < b_end and b["bin"] < a_end)
+
+
+def merge_semantic(
+    level_rows: list[dict[str, Any]], found: list[dict[str, Any]], sem: Semantic
+) -> tuple[list[dict[str, Any]], int]:
+    """Level rows plus the semantic rows no level row covers, and how many were merged.
+
+    A semantic row that overlaps a (non-periodic) level row of the same service is
+    written into that row's evidence instead; the level row keeps its score.
+    """
+    out = list(level_rows)
+    alone: list[dict[str, Any]] = []
+    merged = 0
+    for s in found:
+        what = signal_text(sem, s)
+        hits = [
+            i
+            for i, r in enumerate(out)
+            if r["entity"] == s["entity"] and PERIODIC_NOTE not in r["evidence"] and overlaps(r, s)
+        ]
+        if not hits:
+            alone.append({**s, "evidence": f"{s['evidence']}; {SIGNAL}: {what}"})
+            continue
+        merged += 1
+        head = s["evidence"].split("; ")[0]  # the burst sentence, without periodic notes
+        for i in hits:
+            out[i] = {
+                **out[i],
+                "evidence": f"{out[i]['evidence']}; {SIGNAL} agrees: {head}, {what}",
+            }
+    return out + alone, merged
+
+
 @register
 class Severity:
     key = "severity"
     type = "severity"
     title = "Severity burst"
     # the algorithm lives in analyses.temporal (find_bursts) and volume (merge_periodic): their
-    # constants and the ones above are part of the version, so editing any of them invalidates
+    # constants and the ones above (the semantic ones too) are part of the version, so editing
+    # any of them invalidates
     version = (
-        f"2:{WINDOW_S}:{MIN_RATE}:{MERGE_GAP}:{LEVELS}:{temporal.ROLL_WINDOW}:"
-        f"{temporal.MERGE_BINS}:{volume.MIN_REPEATS}:{volume.PERIOD_TOLERANCE}:{volume.MIN_PERIOD}"
+        f"3:{WINDOW_S}:{MIN_RATE}:{MERGE_GAP}:{LEVELS}:{SEMANTIC}:{TOP_CHARS}:"
+        f"{temporal.ROLL_WINDOW}:{temporal.MERGE_BINS}:{volume.MIN_REPEATS}:{volume.PERIOD_TOLERANCE}:{volume.MIN_PERIOD}"
     )
     setting_names: tuple[str, ...] = ("burst_k",)
-    depends_on: tuple[str, ...] = ("temporal",)
+    depends_on: tuple[str, ...] = (temporal.KEY, tpl.KEY, semantic_tags.KEY)
     threshold = DEFAULT_BURST_K
 
     def threshold_for(self, settings: Settings) -> float:
@@ -275,6 +405,19 @@ class Severity:
                     continue
                 x = temporal.dense_series(group["bin"], group["n"], t0, WINDOW_S, length)
                 rows += burst_rows(x, level, str(program), t0, ctx.settings)
+        sem = load_semantic(ctx.store)
+        if sem is not None:
+            found = semantic_rows(sem, t0, length, ctx.settings)
+            rows, merged = merge_semantic(rows, found, sem)
+            ctx.meta["semantic"] = {
+                "actionable_templates": sem.templates,
+                "episodes": len(found) - merged,
+                "merged_into_level_rows": merged,
+            }
+            ctx.log(
+                f"severity: semantic signal from {sem.templates} actionable templates, "
+                f"{len(found) - merged} episodes, {merged} merged into level rows"
+            )
         starting = defaultdict(set)
         for r in rows:
             starting[r["bin"]].add(r["entity"])
