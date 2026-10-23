@@ -170,6 +170,15 @@ def test_temporal(store: CacheStore) -> None:
     )
 
 
+TAG_FILTER_CASES = (
+    ("no tag filter", False, False, []),
+    ("hide noise", True, False, []),
+    ("actionable only", False, True, []),
+    ("component network", False, False, ["network"]),
+    ("all three", True, True, ["network", "storage"]),
+)
+
+
 def test_templates(store: CacheStore) -> None:
     fns = _recorded(store, "templates")
     rows = [{"template_id": 0}]
@@ -189,6 +198,19 @@ def test_templates(store: CacheStore) -> None:
         str(value),
         CALLBACK_BUDGET_S,
         lambda: fns["draw_params"](value, rows, "light"),
+    )
+    for case, hide, actionable, components in TAG_FILTER_CASES:
+        measure(
+            "templates.filter_grid",
+            case,
+            CALLBACK_BUDGET_S,
+            lambda h=hide, a=actionable, c=components: fns["filter_grid"](h, a, c, rows),  # type: ignore[misc]
+        )
+    measure(
+        "templates.draw_volume",
+        "no selection",
+        CALLBACK_BUDGET_S,
+        lambda: fns["draw_volume"]([], None, "light"),
     )
 
 

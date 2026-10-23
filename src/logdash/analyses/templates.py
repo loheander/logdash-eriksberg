@@ -25,7 +25,7 @@ import dash_mantine_components as dmc
 import duckdb
 import plotly.graph_objects as go
 import polars as pl
-from dash import Dash, Input, Output
+from dash import Dash, Input, Output, State
 from dash.development.base_component import Component
 from drain3 import TemplateMiner
 from drain3.template_miner_config import TemplateMinerConfig
@@ -41,6 +41,17 @@ from logdash.app.filters import (
     parse_time,
 )
 from logdash.app.shell import THEME_STORE_ID
+from logdash.app.tag_filters import (
+    TOOLTIP_DELAY_MS,
+    TagFilter,
+    apply_tag_filter,
+    attach_tags,
+    load_tags,
+    tag_cells,
+    tag_column_defs,
+    tag_controls,
+    tag_filter,
+)
 from logdash.cache.store import CacheStore
 from logdash.config import Settings
 from logdash.ingest.masking import MASK_RULES, mask_sql
@@ -61,6 +72,16 @@ MAX_VALUES = 500  # distinct parameter values kept per template position
 PARAM_BARS = 20
 SAMPLE_OVERSHOOT = 3  # sample this many times the wanted rows, then cap exactly
 TEXT_CHARS = 160
+NO_SELECTION = "no template selected"
+DESCRIPTION = (
+    "Drain3 over unique masked lines. Service and time filters apply to the volume "
+    "chart; the tables are not filtered."
+)
+TAGS_DESCRIPTION = (
+    " Semantic tags come from a language model at build time; hover a template for its "
+    "plain-language summary. The tag filters apply to the top templates and the selected "
+    "template, not to the rare and novel tables."
+)
 
 _PARAM_RE = re.compile(
     "|".join(f"(?P<k{i}>{pattern})" for i, (pattern, _) in enumerate(MASK_RULES)), re.ASCII
@@ -281,6 +302,8 @@ def param_figure(
     params: pl.DataFrame, template_id: int | None, choice: str | None, scheme: str | None
 ) -> go.Figure:
     """Distribution of one parameter: log-spaced histogram for numbers, top values otherwise."""
+    if template_id is None:
+        return figures.empty_figure(NO_SELECTION, scheme)
     if not choice or "|" not in choice:
         return figures.empty_figure("this template has no extracted parameters", scheme)
     position, kind = choice.split("|", 1)
@@ -319,8 +342,10 @@ def param_figure(
 
 def grid_rows(templates: pl.DataFrame, limit: int = GRID_ROWS) -> list[dict[str, Any]]:
     top = templates.sort("count", descending=True).head(limit)
-    return [
-        {
+    with_tags = "tagged" in templates.columns
+    rows = []
+    for r in top.iter_rows(named=True):
+        row = {
             "template_id": r["template_id"],
             "template": short(r["template"]),
             "count": r["count"],
@@ -328,8 +353,10 @@ def grid_rows(templates: pl.DataFrame, limit: int = GRID_ROWS) -> list[dict[str,
             "first_seen": f"{r['first_seen']:%Y-%m-%d %H:%M:%S}",
             "last_seen": f"{r['last_seen']:%Y-%m-%d %H:%M:%S}",
         }
-        for r in top.iter_rows(named=True)
-    ]
+        if with_tags:
+            row |= tag_cells(r)
+        rows.append(row)
+    return rows
 
 
 def list_table(df: pl.DataFrame) -> Component:
@@ -348,6 +375,54 @@ def list_table(df: pl.DataFrame) -> Component:
 
 def selected_id(rows: list[dict[str, Any]] | None) -> int | None:
     return int(rows[0]["template_id"]) if rows else None
+
+
+def page_templates(store: CacheStore) -> tuple[pl.DataFrame, bool]:
+    """``templates.parquet``, with the tag columns attached when tags are cached."""
+    templates = store.read_parquet(KEY, "templates.parquet")
+    tags = load_tags(store)
+    return (templates, False) if tags is None else (attach_tags(templates, tags), True)
+
+
+def grid_columns(with_tags: bool) -> list[dict[str, Any]]:
+    """Grid columns; with tags, the tag columns follow the text (which shows the summary)."""
+    text: dict[str, Any] = {"field": "template", "flex": 1, "minWidth": 300}
+    tail: list[dict[str, Any]] = [
+        {
+            "field": "count",
+            "width": 120,
+            "valueFormatter": {"function": "d3.format(',')(params.value)"},
+        },
+        {"field": "variants", "width": 100},
+        {"field": "first_seen", "width": 170},
+        {"field": "last_seen", "width": 170},
+    ]
+    head: list[dict[str, Any]] = [{"field": "template_id", "headerName": "ID", "width": 80}]
+    if not with_tags:
+        return [*head, text, *tail]
+    return [*head, {**text, "tooltipField": "summary"}, *tag_column_defs(), *tail]
+
+
+def keep_selection(
+    rows: list[dict[str, Any]], selected: list[dict[str, Any]] | None
+) -> list[dict[str, Any]]:
+    """The selected row if still shown, else the first row, else nothing."""
+    sid = selected_id(selected)
+    for row in rows:
+        if row["template_id"] == sid:
+            return [row]
+    return rows[:1]
+
+
+def filtered_grid(
+    store: CacheStore, tag_filter: TagFilter, selected: list[dict[str, Any]] | None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Grid rows that pass the tag filter (before the top-N cut) and the selection to show."""
+    templates, with_tags = page_templates(store)
+    if with_tags:
+        templates = apply_tag_filter(templates, tag_filter)
+    rows = grid_rows(templates)
+    return rows, keep_selection(rows, selected)
 
 
 def volume_for(
@@ -381,39 +456,30 @@ class Templates:
 
     def layout(self, store: CacheStore, **_query: Any) -> Component:
         settings = store.settings
-        templates = store.read_parquet(KEY, "templates.parquet")
+        templates, with_tags = page_templates(store)
         meta = store.read_json(KEY, "meta.json")
         lo, hi = datetime.fromisoformat(meta["ts_min"]), datetime.fromisoformat(meta["ts_max"])
         rows = grid_rows(templates)
         grid = dag.AgGrid(
             id="templates-grid",
             rowData=rows,
-            columnDefs=[
-                {"field": "template_id", "headerName": "ID", "width": 80},
-                {"field": "template", "flex": 1, "minWidth": 300},
-                {
-                    "field": "count",
-                    "width": 120,
-                    "valueFormatter": {"function": "d3.format(',')(params.value)"},
-                },
-                {"field": "variants", "width": 100},
-                {"field": "first_seen", "width": 170},
-                {"field": "last_seen", "width": 170},
-            ],
+            columnDefs=grid_columns(with_tags),
+            getRowId="String(params.data.template_id)",
             defaultColDef={"sortable": True, "resizable": True},
             dashGridOptions={
                 "rowSelection": {
                     "mode": "singleRow",
                     "checkboxes": False,
                     "enableClickSelection": True,
-                }
+                },
+                "tooltipShowDelay": TOOLTIP_DELAY_MS,
             },
             selectedRows=rows[:1],
             style={"height": 380},
         )
         return ui.page(
             "Log templates",
-            ui.card("Top templates (click a row)", grid),
+            ui.card("Top templates (click a row)", tag_controls("templates", with_tags), grid),
             ui.grid(
                 [
                     ui.card(
@@ -439,13 +505,29 @@ class Templates:
                 f"Novel templates (first seen in the last {settings.novel_fraction:.0%})",
                 list_table(novel_templates(templates, lo, hi, settings.novel_fraction)),
             ),
-            description=(
-                "Drain3 over unique masked lines. Service and time filters apply to the volume "
-                "chart; the tables are not filtered."
-            ),
+            description=DESCRIPTION + (TAGS_DESCRIPTION if with_tags else ""),
         )
 
     def register_callbacks(self, app: Dash, store: CacheStore) -> None:
+        @app.callback(
+            Output("templates-grid", "rowData"),
+            Output("templates-grid", "selectedRows"),
+            Input("templates-hide-noise", "checked"),
+            Input("templates-actionable-only", "checked"),
+            Input("templates-components", "value"),
+            State("templates-grid", "selectedRows"),
+            prevent_initial_call=True,
+        )
+        def filter_grid(
+            hide_noise: bool | None,
+            actionable_only: bool | None,
+            components: list[str] | None,
+            selected: list[dict[str, Any]] | None,
+        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            return filtered_grid(
+                store, tag_filter(hide_noise, actionable_only, components), selected
+            )
+
         @app.callback(
             Output("templates-volume", "figure"),
             Output("templates-link", "href"),
@@ -457,6 +539,8 @@ class Templates:
             rows: list[dict[str, Any]] | None, filters: dict[str, Any] | None, theme: str | None
         ) -> tuple[go.Figure, str]:
             tid = selected_id(rows)
+            if tid is None:
+                return figures.empty_figure(NO_SELECTION, theme), "/explorer"
             return volume_for(store, from_dict(filters), tid, theme), page_url(
                 "/explorer", template=tid
             )
