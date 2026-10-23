@@ -51,7 +51,17 @@ P2, unset last), then by issue number:
 | 1 | In review, `changes-requested` | `implementer` | `Issue #<n>. Fix mode.` |
 | 2 | In review, no `changes-requested` | `reviewer` | `Issue #<n>.` |
 | 3 | Ready, every "Depends on" issue in its newest plan comment is Done | `implementer` | `Issue #<n>. Implement mode.` |
-| 4 | Backlog (including `needs-replan`) | `planner` | `Issue #<n>.` |
+| 4 | Backlog (including `needs-replan`), every "Depends on" issue has a plan | `planner` | `Issue #<n>.` |
+
+**Planning order (row 4).** A Backlog issue's dependencies are the issues on the
+`Depends on:` line of its body (stories have one; an issue without it has none). A
+dependency **has a plan** when its status is Ready, In progress, In review, Human
+review or Done. A dependency that is an `epic` has a plan when every one of its
+sub-issues has one. Hold an issue back while any dependency has no plan: its
+planner would otherwise design against names that do not exist yet. Within a
+Priority, plan first the issues whose dependencies are all Done, then those that the
+most open issues list in their own `Depends on:` line (they unblock the most work),
+then by issue number.
 
 **Retrospective**: dispatch one `retrospective` agent (prompt: `Run the retrospective.`)
 when `gh pr list --state all --label retro-pending --json number --jq length` is 5 or
@@ -59,7 +69,8 @@ more, no `retrospective` agent is running, and no PR labelled `retrospective` is
 (`gh pr list --label retrospective --state open`). Give it the next free slot ahead of
 row 4. It skips `only` runs.
 
-Limits: at most **3** agents at once (protocol: machine limits), and at most one agent
+Limits: at most **3** agents at once (protocol: machine limits), at most **2** of them
+planners, so a slot stays free for implementers and reviewers, and at most one agent
 per issue. Never start an implementer on two issues whose plans touch the same files at
 the same time; run them one after the other.
 
