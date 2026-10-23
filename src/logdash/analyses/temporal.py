@@ -23,7 +23,7 @@ from dash.development.base_component import Component
 from scipy import ndimage, signal
 
 from logdash.analyses.base import ComputeContext, register
-from logdash.app import figures, ui
+from logdash.app import figures, theme, ui
 from logdash.app.filters import (
     FILTER_STORE_ID,
     Filters,
@@ -33,7 +33,6 @@ from logdash.app.filters import (
     parse_time,
     with_time_range,
 )
-from logdash.app.shell import THEME_STORE_ID
 from logdash.cache.store import CacheStore
 from logdash.ingest.normalize import LEVELS
 
@@ -495,8 +494,8 @@ def rate_figure(
         )  # fmt: skip
     fig.update_yaxes(title=f"events per {_bin_label(bin_s)}")
     fig.update_xaxes(range=[lo, hi])
-    figures.add_note(fig, f"bin {_bin_label(bin_s)}" + (f" ({note})" if note else ""))
-    return figures.style(fig, scheme, dragmode="zoom", height=380)
+    figures.add_note(fig, f"bin {_bin_label(bin_s)}" + (f" ({note})" if note else ""), scheme)
+    return theme.style(fig, scheme, dragmode="zoom", height=380)
 
 
 def _bin_label(seconds: int) -> str:
@@ -572,7 +571,7 @@ def heatmap_figure(
             "zmin": -REL_CLIP,
             "zmax": REL_CLIP,
             "zmid": 0,
-            "colorscale": "RdBu_r",
+            "colorscale": theme.diverging(scheme),
             "colorbar": {
                 **COLORBAR,
                 "title": "vs host median",
@@ -583,7 +582,7 @@ def heatmap_figure(
         if relative
         else {
             "z": np.log1p(z),
-            "colorscale": "Viridis",
+            "colorscale": theme.magnitude(scheme),
             "colorbar": {**COLORBAR, "title": "log(1+n)"},
         }
     )
@@ -608,7 +607,7 @@ def heatmap_figure(
         tickfont={"size": 10},
     )
     fig.update_xaxes(side="top")
-    return figures.style(fig, scheme, height=heatmap_height(len(hosts)))
+    return theme.style(fig, scheme, height=heatmap_height(len(hosts)))
 
 
 def acf_figure(acf: pl.DataFrame, service: str | None, scheme: str | None) -> go.Figure:
@@ -618,7 +617,7 @@ def acf_figure(acf: pl.DataFrame, service: str | None, scheme: str | None) -> go
     fig = go.Figure(go.Scatter(x=part["lag"].to_list(), y=part["acf"].to_list(), mode="lines"))
     fig.update_xaxes(title="lag (seconds)")
     fig.update_yaxes(title="autocorrelation", range=[-1, 1])
-    return figures.style(
+    return theme.style(
         fig, scheme, title=f"{service}: autocorrelation of events per second", showlegend=False
     )
 
@@ -641,7 +640,7 @@ def spectrum_figure(
     )  # fmt: skip
     fig.update_xaxes(type="log", title="period (seconds)")
     fig.update_yaxes(type="log", title="power")
-    return figures.style(fig, scheme, title=f"{service}: periodogram (events per second)")
+    return theme.style(fig, scheme, title=f"{service}: periodogram (events per second)")
 
 
 def brush_range(relayout: dict[str, Any] | None) -> tuple[datetime, datetime] | str | None:
@@ -808,7 +807,7 @@ class Temporal:
             Output("temporal-rate", "figure"),
             Input(FILTER_STORE_ID, "data"),
             Input("temporal-split", "value"),
-            Input(THEME_STORE_ID, "data"),
+            theme.theme_input(),
         )
         def draw_rate(
             filters: dict[str, Any] | None, split: str | None, theme: str | None
@@ -833,7 +832,7 @@ class Temporal:
             Input(FILTER_STORE_ID, "data"),
             Input("temporal-hbin", "value"),
             Input("temporal-hscale", "value"),
-            Input(THEME_STORE_ID, "data"),
+            theme.theme_input(),
         )
         def draw_heatmap(
             filters: dict[str, Any] | None,
@@ -850,7 +849,7 @@ class Temporal:
             Output("temporal-acf", "figure"),
             Output("temporal-spectrum", "figure"),
             Input("temporal-service", "value"),
-            Input(THEME_STORE_ID, "data"),
+            theme.theme_input(),
         )
         def draw_spectra(service: str | None, theme: str | None) -> tuple[go.Figure, go.Figure]:
             acf = store.read_parquet(KEY, "acf.parquet")

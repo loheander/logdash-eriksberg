@@ -37,9 +37,8 @@ from scipy import sparse, special
 
 from logdash.analyses.base import ComputeContext, register
 from logdash.analyses.templates import short
-from logdash.app import figures, ui
+from logdash.app import figures, theme, ui
 from logdash.app.filters import FILTER_STORE_ID, Filters, from_dict, page_url, parse_time
-from logdash.app.shell import THEME_STORE_ID
 from logdash.cache.store import CacheStore
 
 KEY = "features"
@@ -410,15 +409,16 @@ def correlation_figure(
     hover = [[f"{a}<br>{b}" for b in names] for a in names]
     fig = go.Figure(
         go.Heatmap(
-            z=corr.tolist(), x=labels, y=labels, zmin=-1, zmax=1, colorscale="RdBu_r",
+            z=corr.tolist(), x=labels, y=labels, zmin=-1, zmax=1,
+            colorscale=theme.diverging(scheme),
             text=hover, hovertemplate="%{text}<br>r = %{z:.2f}<extra></extra>",
             colorbar={"title": "r"},
         )
     )  # fmt: skip
     fig.update_xaxes(type="category", tickangle=-60)
     fig.update_yaxes(type="category", autorange="reversed")
-    figures.add_note(fig, f"{len(ids)} most frequent templates, {scaling} scaling")
-    return figures.style(fig, scheme, height=560)
+    figures.add_note(fig, f"{len(ids)} most frequent templates, {scaling} scaling", scheme)
+    return theme.style(fig, scheme, height=560)
 
 
 def association_figure(
@@ -444,7 +444,8 @@ def association_figure(
     fig = go.Figure(
         go.Heatmap(
             z=share.tolist(), x=names, y=[label(int(i)) for i in ids],
-            text=[[t] * len(names) for t in _texts(ids, texts)], colorscale="Blues", zmin=0, zmax=1,
+            text=[[t] * len(names) for t in _texts(ids, texts)],
+            colorscale=theme.sequential(scheme), zmin=0, zmax=1,
             hovertemplate="%{text}<br>%{x}: %{z:.0%} of its events<extra></extra>",
             colorbar={"title": "share", "tickformat": ".0%"},
         )
@@ -452,8 +453,8 @@ def association_figure(
     fig.update_xaxes(type="category", tickangle=-60)
     fig.update_yaxes(type="category", autorange="reversed")
     shown = len(busiest)
-    figures.add_note(fig, f"share of each template per {group}, busiest {shown} {group}s")
-    return figures.style(fig, scheme, height=560)
+    figures.add_note(fig, f"share of each template per {group}, busiest {shown} {group}s", scheme)
+    return theme.style(fig, scheme, height=560)
 
 
 def ranking_figure(table: pl.DataFrame, column: str, title: str, scheme: str | None) -> go.Figure:
@@ -472,7 +473,7 @@ def ranking_figure(table: pl.DataFrame, column: str, title: str, scheme: str | N
     )
     fig.update_yaxes(autorange="reversed", type="category")
     fig.update_xaxes(title=title)
-    return figures.style(fig, scheme, height=420)
+    return theme.style(fig, scheme, height=420)
 
 
 def stats_view(table: pl.DataFrame) -> Component:
@@ -724,7 +725,7 @@ class Features:
             Input("features-scale", "value"),
             Input("features-top", "value"),
             Input(FILTER_STORE_ID, "data"),
-            Input(THEME_STORE_ID, "data"),
+            theme.theme_input(),
         )
         def draw(
             window: str | None,
