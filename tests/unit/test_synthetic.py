@@ -1,11 +1,14 @@
 import csv
+import hashlib
 import io
 
 import zstandard
 
 from tests.synthetic import (
     COLUMNS,
+    FORECAST_HOSTS,
     HOSTS,
+    PRECURSOR_RATE,
     SyntheticSpec,
     generate_rows,
     rows_to_csv,
@@ -64,3 +67,21 @@ def test_anomalies_injected(synthetic):
     assert len(rare) == 2 and {r["Hostname"] for r in rare} == {HOSTS[3]}
     by_req = [r for r in rows if r["request_id"] == truth.swapped_request_ids[0]]
     assert len(by_req) == 4
+
+
+def test_forecast_spikes_off_leaves_the_data_unchanged():
+    # sha256 of the default dataset before forecast spikes existed
+    rows, _ = generate_rows(SyntheticSpec())
+    digest = hashlib.sha256(rows_to_csv(rows).encode()).hexdigest()
+    assert digest == "0baa89decad8b682c4c422195dcc3cd01621a8b1bf611a3e3ef6a087528b2f49"
+
+
+def test_forecast_spikes_and_precursors_are_injected():
+    rows, truth = generate_rows(SyntheticSpec(forecast_spikes=24, error_rows=0))
+    assert len(truth.forecast_onsets) == 24
+    assert truth.forecast_onsets == sorted(truth.forecast_onsets)
+    assert all(t.second == 0 and t.microsecond == 0 for t in truth.forecast_onsets)
+    assert truth.forecast_hosts == [h.split(".", 1)[0] for h in FORECAST_HOSTS] * 6
+    precursors = [r for r in rows if r["Payload"].startswith("Memory pressure on hypervisor")]
+    assert len(precursors) == 24 * 3 * PRECURSOR_RATE
+    assert {r["log_level"] for r in precursors} == {"WARNING"}
