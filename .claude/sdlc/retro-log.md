@@ -44,3 +44,23 @@ Findings:
   would have auto-merged (isolated detectors, page filters, heatmap labels).
 - Watch: whether auto-merged PRs later needed a fix (raise caution), and whether
   humans approve Human-review PRs without comments (lower caution).
+
+## 2026-10-23 — baseline: planner triage with Jev
+
+Not a retrospective; the starting point for tuning `issue_triage.py`, which the
+planner now runs at hand-off to fill an empty Size, Priority, Risk and type label.
+Jev `typesafe/jev-1.14`. Piloted read-only on 15 issues against the values humans or
+planners had set. Each issue was left out of its own backlog context.
+
+| Field | Exact match | Off by one level | Notes |
+|---|---|---|---|
+| Priority | 13 of 13 | 0 | Closed #1–#11 and open #23–#26, #44, #50. Confidence 0.32–0.49 on #24 and #44, so #44 would have been `unsure`. |
+| Size | 6 of 14 | 8 | Jev sizes one level larger on 8 issues. On #23–#26, all of which the planner later split into stories, Jev's larger size is arguably the better one; on #2, #8 and #11 it is not. |
+| Risk | 5 of 8 | 3 | Closed #1–#11 only. #7 and #8 sat at blast radius 0.99, just under `medium`. #11 got 1.88, close to the 1.75 the gate gave its PR (#22). |
+| Type label | 15 of 15 | – | All `enhancement`. #58 (ADR and skill cleanup) got `none`; it already had `documentation`. |
+
+Rules: fill only empty fields; a story copies its parent's Priority; Risk uses the
+gate's `blast_radius` question and `risk_level()`; nothing is applied when an answer's
+confidence is below the gate's `MIN_CONFIDENCE` (0.35).
+Watch: whether planners or humans keep correcting Size downwards (tighten the size
+criteria), and whether triage Risk and the gate's PR Risk drift apart.
