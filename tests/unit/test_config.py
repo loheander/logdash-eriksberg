@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from logdash import config
 from logdash.config import Settings
 
 
@@ -81,3 +82,11 @@ def test_read_dotenv_parsing(tmp_path):
         "# comment\n\nA=1\nexport B = two \nC='quoted'\nD=\"dq\"\nno equals here\nE=\nF='\n"
     )
     assert read_dotenv(path) == {"A": "1", "B": "two", "C": "quoted", "D": "dq", "E": "", "F": "'"}
+
+
+def test_runs_dir_from_env_and_default(monkeypatch):
+    monkeypatch.setattr(config, "DEFAULT_RUNS", "runs")
+    assert Settings().runs_dir == Path("runs") == Settings.from_env({}).runs_dir
+    assert Settings.from_env({"LOGDASH_RUNS": "/r"}).runs_dir == Path("/r")
+    assert Settings().with_overrides(runs_dir="x").runs_dir == Path("x")
+    assert "runs_dir" not in Settings().analysis_params(("burst_k",))

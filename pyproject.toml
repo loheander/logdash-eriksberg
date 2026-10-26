@@ -5,7 +5,7 @@ description = "Interactive dashboard for analysing OpenStack logs"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "dash>=4.4.1",
+    "dash[diskcache]>=4.4.1",
     "dash-ag-grid>=35.3.0",
     "dash-mantine-components>=2.8.0",
     "drain3>=0.9.11",

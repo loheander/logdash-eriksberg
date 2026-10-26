@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,19 @@ def build_with(built: Built, *analyses: Analysis) -> Registry:
         registry.add(analysis)
     run_build(built.settings, registry=registry, log=lambda _: None)
     return registry
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _runs_in_tmp(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    """Forecast runs and the background-job cache go to a temporary directory, never ./runs.
+
+    Session scope: module and session fixtures build ``Settings`` before function fixtures run.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(config, "DEFAULT_RUNS", str(tmp_path_factory.getbasetemp() / "runs"))
+    mp.delenv("LOGDASH_RUNS", raising=False)
+    yield
+    mp.undo()
 
 
 @pytest.fixture(autouse=True)
