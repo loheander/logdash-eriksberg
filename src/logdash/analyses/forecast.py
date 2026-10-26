@@ -114,7 +114,8 @@ RUN_NOTE = (
 ACCURACY_NOTE = (
     "About 1 % of the samples have a spike ahead, so a model that never predicts a spike already "
     "reaches an accuracy near 0.99: accuracy is misleading here. PR-AUC and F1 are the numbers "
-    "to read. The threshold applies to F1 and accuracy only."
+    "to read. The threshold applies to F1 and accuracy only. The persistence baseline scores 0 "
+    "or 1, so the threshold does not change its row."
 )
 NO_RUN_TEXT = "No run yet. Pick a horizon and press Run."
 MISSING_RUN_TEXT = "Run {run_id} is no longer in the runs directory. Press Run to start a new one."
@@ -712,7 +713,7 @@ class Forecast:
                     horizon=int(horizon or forecast_params.DEFAULT_HORIZON)
                 )
                 run_id = forecast_job.run_forecast_job(set_progress, store, runs_dir, params)
-            except (OSError, ValueError) as err:
+            except (OSError, ValueError, KeyError) as err:
                 return no_update, f"The run failed: {err}"
             return run_id, f"Run {run_id} finished (horizon {params.horizon} min)."
 

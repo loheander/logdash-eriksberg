@@ -136,7 +136,12 @@ def test_results_states_and_failures(forecast_cache, tmp_path, monkeypatch):
     )
     assert fc.run_note("forecast-cancel") == fc.CANCELLED_TEXT
     assert fc.run_note("forecast-run") == fc.STARTED_TEXT
-    assert rec.funcs["note_run"].__name__ == "note_run"
+
+    def boom(*_a: Any, **_k: Any) -> str:
+        raise KeyError("split")
+
+    monkeypatch.setattr(forecast_job, "run_forecast_job", boom)
+    assert rec.funcs["run_forecast"](lambda _v: None, 1, 5)[1].startswith("The run failed:")
 
 
 def test_threshold_moves_f1_and_accuracy_only():
@@ -179,6 +184,36 @@ def test_results_callback_over_http(forecast_cache, tmp_path):
     )
     assert resp.status_code == 200
     assert "Persistence" in resp.get_data(as_text=True)
+
+
+@pytest.mark.parametrize(
+    ("trigger", "text"),
+    [("forecast-cancel", fc.CANCELLED_TEXT), ("forecast-run", fc.STARTED_TEXT)],
+)
+def test_note_run_over_http(forecast_cache, tmp_path, trigger, text):
+    built, registry, _ = forecast_cache
+    app = create_app(run_store(built, tmp_path), registry)
+    out = next(
+        k
+        for k, v in app.callback_map.items()
+        if "forecast-cancel" in str(v["inputs"])
+        and "forecast-run" in str(v["inputs"])
+        and k.startswith("forecast-message")
+    )
+    body = {
+        "output": out,
+        "outputs": {"id": "forecast-message", "property": "children"},
+        "inputs": [
+            {"id": "forecast-run", "property": "n_clicks", "value": 1},
+            {"id": "forecast-cancel", "property": "n_clicks", "value": 1},
+        ],
+        "changedPropIds": [f"{trigger}.n_clicks"],
+    }
+    resp = app.server.test_client().post(
+        "/_dash-update-component", data=json.dumps(body), content_type="application/json"
+    )
+    assert resp.status_code == 200
+    assert text in resp.get_data(as_text=True)
 
 
 def test_page_still_answers_over_http(forecast_cache, tmp_path):
