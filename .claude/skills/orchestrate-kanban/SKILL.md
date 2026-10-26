@@ -39,7 +39,26 @@ Do these before dispatching, and report each one:
 | `agent-busy`, no agent of this session running on it, issue not updated for 2 h (`gh issue view <n> --json updatedAt`) | remove `agent-busy` and report it as stale; otherwise leave it |
 | In progress without `agent-busy` | report it (a human or an earlier run owns it); don't touch it |
 
-## 3. Dispatch
+## 3. Usage check
+
+Run `python3 -I .claude/sdlc/usage.py check` before **every** dispatch, in this section
+and each time section 5 loops back here. It reads the account's session (5-hour) and
+weekly usage, which the status line saves on every redraw (`usage.py record` as the
+`statusLine` command).
+
+- `"pause": true` (a window is at 90 % or more and has not reset): start nothing new,
+  not even a reviewer. Agents already running go on; reconcile each one as it reports.
+  Once none is running, report the pause and its `resume_at_utc`, then run
+  `python3 -I .claude/sdlc/usage.py wait` with `run_in_background`. It exits after the
+  window resets; then go back to section 1. Under `/loop`, schedule the next wakeup
+  for `resume_at` instead (at most an hour at a time).
+- `"state": "unknown"` (no snapshot, or none for 30 min): report it once and go on.
+- An agent that stops with a usage-limit error (HTTP 429, "session limit") has not
+  failed: it doesn't count for the loop guards and keeps its `agent-busy` claim. After
+  the reset, resume it with `SendMessage` instead of starting a new agent, telling it
+  what changed on `main` meanwhile.
+
+## 4. Dispatch
 
 An issue is **eligible** if it is open, on the board, and has none of `agent-busy`,
 `needs-human` or `epic`, and no agent of yours is running on it. Pick from the
@@ -78,7 +97,7 @@ Start every agent with the Agent tool, `subagent_type` set to its name,
 `isolation: "worktree"`, and only the prompt from the table. The agent's definition
 and skill hold its instructions. Don't add your own guesses about the issue.
 
-## 4. Reconcile
+## 5. Reconcile
 
 Each agent runs in the background and you are notified when it returns. Then:
 
@@ -94,9 +113,9 @@ Each agent runs in the background and you are notified when it returns. Then:
    `## Question for a human` on it when
    - it went back to Backlog with `needs-replan` for the 3rd time, or
    - the same agent failed or stopped on it twice in a row without changing anything.
-4. Take a fresh snapshot and dispatch again (section 3).
+4. Take a fresh snapshot, run the usage check (section 3) and dispatch again (section 4).
 
-## 5. Report
+## 6. Report
 
 When nothing is running and nothing can be dispatched (or after one round with
 `once`), report:
