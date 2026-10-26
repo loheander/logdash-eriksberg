@@ -76,6 +76,9 @@ def test_clips_end():
         ({"start": "12:00", "end": "12:00"}, "end"),
         ({"start": "2023-05-23 00:00", "end": "2023-05-23 01:00"}, "start"),
         ({"end": "2023-05-20 10:00", "last_minutes": 10}, "end"),
+        ({"end": "0001-01-01", "last_minutes": 5}, "end"),
+        ({"start": "0001-01-01T00:00+01:00"}, "start"),
+        ({"end": "today"}, "end"),
     ],
 )
 def test_window_errors(kw, argument):
@@ -86,6 +89,12 @@ def test_window_errors(kw, argument):
     assert error["argument"] == argument
     if kw.get("start") == "yesterday" or kw.get("end") == "25:00":
         assert error["hint"]
+
+
+def test_far_future_end_is_clipped():
+    w = resolve_window(SPAN, start="2023-05-21 10:00", end="9999-12-31T23:59:59")
+    assert w.clipped
+    assert w.end == datetime(2023, 5, 22, 0, 0)
 
 
 def test_window_rule_is_one_paragraph():

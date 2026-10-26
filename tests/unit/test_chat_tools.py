@@ -158,9 +158,14 @@ CASES = [
 def test_aggregates_match_events(store, template, monkeypatch, extra):
     args = {k: (template if v == "T" else v) for k, v in extra.items()}
     args |= {"start": "02:00", "end": "03:00"}
-    fast = call(Toolbox(store), "count_events", args)
-    monkeypatch.setattr(tools, "AGGREGATES", ())
-    slow = call(Toolbox(store), "count_events", args)
+    fast_box, slow_box = Toolbox(store), Toolbox(store)
+    try:
+        fast = call(fast_box, "count_events", args)
+        monkeypatch.setattr(tools, "AGGREGATES", ())
+        slow = call(slow_box, "count_events", args)
+    finally:
+        fast_box.close()
+        slow_box.close()
     assert slow["source"] == "events"
     assert fast["source"] != "events"
     assert fast["total"] == slow["total"] > 0
@@ -279,6 +284,9 @@ def test_errors(box):
     code(call(box, "count_events", {"last_minutes": True}), "bad_argument", "last_minutes")
     code(call(box, "count_events", {"host": 5}), "bad_argument", "host")
     code(call(box, "count_events", {"template": 1.5}), "bad_argument", "template")
+    code(call(box, "count_events", {"start": "0001-01-01T00:00+01:00"}), "bad_argument", "start")
+    r = call(box, "count_events", {"start": "00:30", "end": "9999-12-31T23:59:59"})
+    assert "error" not in r
     code(call(box, "count_events", {"last_minutes": 0}), "bad_argument", "last_minutes")
     code(call(box, "count_events", {"last_minutes": 5000}), "bad_argument", "last_minutes")
     code(call(box, "count_events", {"template": -1}), "bad_argument", "template")

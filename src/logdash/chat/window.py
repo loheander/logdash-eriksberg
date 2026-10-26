@@ -61,6 +61,14 @@ def ceil_minute(dt: datetime) -> datetime:
     return dt if dt == floor_minute(dt) else floor_minute(dt) + MINUTE
 
 
+def safe_ceil_minute(dt: datetime) -> datetime:
+    """ceil_minute, except that the very last representable minute stays as it is."""
+    try:
+        return ceil_minute(dt)
+    except OverflowError:
+        return floor_minute(dt)
+
+
 @dataclass(frozen=True)
 class Window:
     start: datetime  # naive UTC, whole minute, inclusive
@@ -94,7 +102,7 @@ def parse_time_value(text: str, *, argument: str, day: date, now: datetime) -> d
         return datetime.combine(day, time(int(h), int(m), int(s or 0)))
     try:
         return _naive_utc(datetime.fromisoformat(value))
-    except ValueError:
+    except (ValueError, OverflowError):
         raise ToolError(
             BAD_ARGUMENT,
             f"cannot read {argument} '{text}' as a time",
@@ -125,18 +133,34 @@ def resolve_window(
         )
     hi = parse_time_value(end, argument="end", day=day, now=now) if end is not None else now
     if last_minutes is not None:
-        lo = hi - timedelta(minutes=last_minutes)
+        try:
+            lo = hi - timedelta(minutes=last_minutes)
+        except OverflowError:
+            raise ToolError(
+                BAD_ARGUMENT,
+                f"cannot count {last_minutes} minutes back from {format_time(hi)}",
+                argument="end",
+                hint=TIME_HINT,
+            ) from None
     elif start is not None:
         lo = parse_time_value(start, argument="start", day=day, now=now)
     else:
         lo = first
+    if start is None and last_minutes is None and hi <= first:
+        raise ToolError(
+            BAD_ARGUMENT,
+            f"the window end {format_time(hi)} lies before the data, "
+            f"which starts at {format_time(first)} UTC",
+            argument="end",
+            hint="choose a window inside the data span",
+        )
     if hi <= lo:
         raise ToolError(
             BAD_ARGUMENT,
             f"the window end {format_time(hi)} is not after its start {format_time(lo)}",
             argument="end",
         )
-    lo, hi = floor_minute(lo), ceil_minute(hi)
+    lo, hi = floor_minute(lo), safe_ceil_minute(hi)
     if hi <= first or lo >= stop:
         raise ToolError(
             BAD_ARGUMENT,
