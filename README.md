@@ -87,7 +87,7 @@ never reads `data/`.
 
 Issues on the [project board](https://github.com/users/loheander/projects/1) are
 planned, implemented, reviewed and merged by Claude Code agents. See
-[ADR001](adrs/ADR001-agent-orchestrated-sdlc.md) for the design and
+[ADR004](adrs/ADR004-agent-orchestrated-sdlc.md) for the design and
 `.claude/sdlc/protocol.md` for the rules.
 
 ```bash
