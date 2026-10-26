@@ -34,17 +34,18 @@ Definitions shared with the later stories of the lab (import them from here):
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 import dash_mantine_components as dmc
+import diskcache
 import duckdb
 import numpy as np
 import plotly.graph_objects as go
 import polars as pl
-from dash import Dash, Input, Output
+from dash import Dash, DiskcacheManager, Input, Output, State, ctx, dcc, html, no_update
 from dash.development.base_component import Component
 
 from logdash.analyses import templates as templates_mod
@@ -54,6 +55,9 @@ from logdash.analyses.temporal import MISSING, find_bursts, rolling_baseline, sp
 from logdash.app import figures, ui
 from logdash.app.shell import THEME_STORE_ID
 from logdash.cache.store import CacheStore
+from logdash.forecast import metrics as forecast_metrics
+from logdash.forecast import params as forecast_params
+from logdash.forecast import runs
 from logdash.ingest.normalize import LEVELS
 
 KEY = "forecast"
@@ -78,12 +82,44 @@ DESCRIPTION = (
     "What a spike forecast learns from: the spike label and the input features of every host and "
     "minute. A spike minute lies inside a volume spike of its host (the volume detector's "
     "episodes, before periodic repeats are merged). The forecasting lab always uses every host and "
-    "the whole span: the global filters do not apply on this page. No model is trained yet."
+    "the whole span: the global filters do not apply on this page. Run scores forecasts on the "
+    "test period in a background job."
 )
 RATE_NOTE = (
     "Share of samples whose next H minutes contain a spike minute of the host. Samples whose "
     "target window reaches into the next period are dropped."
 )
+HORIZON_ID = "forecast-horizon"
+RUN_BUTTON_ID = "forecast-run"
+CANCEL_BUTTON_ID = "forecast-cancel"
+PROGRESS_ID = "forecast-progress"
+PROGRESS_LABEL_ID = "forecast-progress-label"
+MESSAGE_ID = "forecast-message"
+RUN_STORE_ID = "forecast-run-id"
+THRESHOLD_ID = "forecast-threshold"
+RESULTS_ID = "forecast-results"
+DEFAULT_THRESHOLD = 0.5
+POLL_MS = 500  # how often the page asks for the job's progress
+MODEL_LABELS = {"persistence": "Persistence (repeat the last value)"}  # later stories add theirs
+RESULT_COLUMNS = ("model", "accuracy", "F1", "AUROC", "PR-AUC", "positive rate")
+NA_NO_SPIKES = "n/a (no spikes in the test period)"
+NA_NO_SAMPLES = "n/a (no test samples)"
+NA_NO_NEGATIVES = "n/a (no spike-free samples in the test period)"
+RUN_NOTE = (
+    "A run predicts, for every host and every minute of the test period, whether a spike minute "
+    "follows within the horizon. The persistence baseline repeats the last value: it predicts a "
+    "spike when the host had a spike minute in the last H minutes. The run executes in the "
+    "background; the rest of the dashboard keeps answering."
+)
+ACCURACY_NOTE = (
+    "About 1 % of the samples have a spike ahead, so a model that never predicts a spike already "
+    "reaches an accuracy near 0.99: accuracy is misleading here. PR-AUC and F1 are the numbers "
+    "to read. The threshold applies to F1 and accuracy only."
+)
+NO_RUN_TEXT = "No run yet. Pick a horizon and press Run."
+MISSING_RUN_TEXT = "Run {run_id} is no longer in the runs directory. Press Run to start a new one."
+STARTED_TEXT = "Run started."
+CANCELLED_TEXT = "The run was cancelled. No results were saved."
 
 # --------------------------------------------------------------------------- compute
 
@@ -497,6 +533,61 @@ def rate_table(meta: dict[str, Any]) -> pl.DataFrame:
     return pl.DataFrame(rows, schema=dict.fromkeys(("horizon", *PERIODS), pl.String))
 
 
+def fmt_score(value: float | None, m: Mapping[str, Any]) -> str:
+    """3 decimals, or why the number is undefined (no samples, no spikes, no spike-free samples)."""
+    if value is not None:
+        return f"{value:.3f}"
+    if m["samples"] == 0:
+        return NA_NO_SAMPLES
+    if m["positives"] == 0:
+        return NA_NO_SPIKES
+    return NA_NO_NEGATIVES
+
+
+def results_table(run: runs.Run, threshold: float) -> pl.DataFrame:
+    """One row per model of the run, in ``run.models`` order; String columns ``RESULT_COLUMNS``."""
+    rows = []
+    for model in run.models:
+        m = run.info["metrics"][model]
+        t = forecast_metrics.threshold_metrics(run.labels, run.scores(model), threshold)
+        rate = m["positive_rate"]
+        rows.append(
+            {
+                "model": MODEL_LABELS.get(model, model),
+                "accuracy": fmt_score(t["accuracy"], m),
+                "F1": fmt_score(t["f1"], m),
+                "AUROC": fmt_score(m["auroc"], m),
+                "PR-AUC": fmt_score(m["pr_auc"], m),
+                "positive rate": "-" if rate is None else f"{100 * rate:.2f} %",
+            }
+        )
+    return pl.DataFrame(rows, schema=dict.fromkeys(RESULT_COLUMNS, pl.String))
+
+
+def results_view(run: runs.Run | None, run_id: str | None, threshold: float) -> Component:
+    if not run_id:
+        return dmc.Text(NO_RUN_TEXT, size="sm", c="dimmed")
+    if run is None:
+        return dmc.Text(MISSING_RUN_TEXT.format(run_id=run_id), size="sm", c="dimmed")
+    m = run.info["metrics"][run.models[0]]
+    return dmc.Stack(
+        [
+            dmc.Text(
+                f"Run {run.run_id}: horizon {run.info['settings']['horizon']} min, "
+                f"{ui.fmt_int(m['samples'])} test samples, {ui.fmt_int(m['positives'])} with a "
+                f"spike ahead. Threshold {threshold:.2f}.",
+                size="sm",
+            ),
+            ui.table(results_table(run, threshold)),
+        ],
+        gap="xs",
+    )
+
+
+def run_note(trigger: str | None) -> str:
+    return CANCELLED_TEXT if trigger == CANCEL_BUTTON_ID else STARTED_TEXT
+
+
 @register
 class Forecast:
     key = KEY
@@ -541,6 +632,46 @@ class Forecast:
                 dmc.Text(RATE_NOTE, size="sm", c="dimmed", mb="xs"),
                 ui.table(rate_table(meta)),
             ),
+            ui.card(
+                "Run a forecast",
+                dmc.Text(RUN_NOTE, size="sm", c="dimmed", mb="xs"),
+                dmc.Text("Prediction horizon (minutes)", size="sm"),
+                dmc.Slider(
+                    id=HORIZON_ID,
+                    min=forecast_params.MIN_HORIZON,
+                    max=forecast_params.MAX_HORIZON,
+                    step=1,
+                    value=forecast_params.DEFAULT_HORIZON,
+                    marks=[{"value": v, "label": str(v)} for v in (1, 5, 10, 15)],
+                    mb="xl",
+                ),
+                dmc.Group(
+                    [
+                        dmc.Button("Run", id=RUN_BUTTON_ID),
+                        dmc.Button("Cancel", id=CANCEL_BUTTON_ID, variant="default", disabled=True),
+                    ]
+                ),
+                dmc.Progress(id=PROGRESS_ID, value=0, size="lg", mt="md"),
+                dmc.Text(id=PROGRESS_LABEL_ID, size="sm", c="dimmed"),
+                dmc.Text(id=MESSAGE_ID, size="sm"),
+                dcc.Store(id=RUN_STORE_ID, storage_type="session"),
+            ),
+            ui.card(
+                "Results on the test period",
+                dmc.Text(ACCURACY_NOTE, size="sm", c="dimmed", mb="xs"),
+                dmc.Text("Threshold (a score at or above it predicts a spike)", size="sm"),
+                dmc.Slider(
+                    id=THRESHOLD_ID,
+                    min=0.05,
+                    max=0.95,
+                    step=0.05,
+                    precision=2,
+                    value=DEFAULT_THRESHOLD,
+                    marks=[{"value": v, "label": f"{v:.1f}"} for v in (0.1, 0.5, 0.9)],
+                    mb="xl",
+                ),
+                html.Div(id=RESULTS_ID),
+            ),
             description=DESCRIPTION,
         )
 
@@ -549,3 +680,56 @@ class Forecast:
         def draw_spikes(theme: str | None) -> go.Figure:
             counts = store.read_parquet(KEY, "spike_counts.parquet")
             return spike_figure(counts, store.read_json(KEY, "meta.json"), theme)
+
+        from logdash.forecast import job as forecast_job  # job imports this module: import it here
+
+        runs_dir = store.settings.runs_dir
+        manager = DiskcacheManager(diskcache.Cache(str(runs_dir / runs.JOBS_DIR)))
+        running = [  # later stories append their own entries
+            (Output(RUN_BUTTON_ID, "disabled"), True, False),
+            (Output(CANCEL_BUTTON_ID, "disabled"), False, True),
+        ]
+
+        @app.callback(
+            Output(RUN_STORE_ID, "data"),
+            Output(MESSAGE_ID, "children"),
+            Input(RUN_BUTTON_ID, "n_clicks"),
+            State(HORIZON_ID, "value"),
+            background=True,
+            manager=manager,
+            progress=[Output(PROGRESS_ID, "value"), Output(PROGRESS_LABEL_ID, "children")],
+            progress_default=[0, ""],  # keep the same length as progress
+            running=running,
+            cancel=[Input(CANCEL_BUTTON_ID, "n_clicks")],
+            interval=POLL_MS,
+            prevent_initial_call=True,
+        )
+        def run_forecast(
+            set_progress: forecast_job.ProgressFn, _clicks: int | None, horizon: int | None
+        ) -> tuple[Any, str]:
+            try:
+                params = forecast_params.RunParams(
+                    horizon=int(horizon or forecast_params.DEFAULT_HORIZON)
+                )
+                run_id = forecast_job.run_forecast_job(set_progress, store, runs_dir, params)
+            except (OSError, ValueError) as err:
+                return no_update, f"The run failed: {err}"
+            return run_id, f"Run {run_id} finished (horizon {params.horizon} min)."
+
+        @app.callback(
+            Output(MESSAGE_ID, "children", allow_duplicate=True),
+            Input(RUN_BUTTON_ID, "n_clicks"),
+            Input(CANCEL_BUTTON_ID, "n_clicks"),
+            prevent_initial_call=True,
+        )
+        def note_run(_run: int | None, _cancel: int | None) -> str:
+            return run_note(ctx.triggered_id)
+
+        @app.callback(
+            Output(RESULTS_ID, "children"),
+            Input(RUN_STORE_ID, "data"),
+            Input(THRESHOLD_ID, "value"),
+        )
+        def show_results(run_id: str | None, threshold: float | None) -> Component:
+            t = round(float(DEFAULT_THRESHOLD if threshold is None else threshold), 2)
+            return results_view(runs.load_run(runs_dir, run_id), run_id, t)

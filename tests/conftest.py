@@ -9,6 +9,10 @@ import pytest
 
 from logdash import config
 from logdash.analyses.base import Analysis, Registry
+from logdash.analyses.forecast import Forecast
+from logdash.analyses.hosts import Hosts
+from logdash.analyses.templates import Templates
+from logdash.analyses.temporal import Temporal
 from logdash.build import run_build
 from logdash.cache.store import CacheStore
 from logdash.config import Settings
@@ -58,6 +62,25 @@ def build_with(built: Built, *analyses: Analysis) -> Registry:
         registry.add(analysis)
     run_build(built.settings, registry=registry, log=lambda _: None)
     return registry
+
+
+# error_rows=0: the ERROR burst is a host volume spike of its own, and the checks on the forecast
+# stage say that every spike minute belongs to an injected spike
+FORECAST_SPEC = SyntheticSpec(forecast_spikes=24, error_rows=0)
+
+
+@pytest.fixture(scope="session")
+def forecast_cache(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Built, Registry, GroundTruth]:
+    """A cache of a dataset of its own: injected spikes with precursors (shared data has none)."""
+    data_dir = tmp_path_factory.mktemp("forecast_data")
+    truth = write_dataset(data_dir / "synthetic_preprocessed.csv.zst", FORECAST_SPEC)
+    settings = Settings(data_dir, tmp_path_factory.mktemp("forecast_cache"), "1GB", 2)
+    run_build(settings, registry=Registry(), log=lambda _: None)
+    built = Built(settings, CacheStore(settings.cache_dir, settings))
+    registry = build_with(built, Temporal(), Templates(), Hosts(), Forecast())
+    return built, registry, truth
 
 
 @pytest.fixture(scope="session", autouse=True)
