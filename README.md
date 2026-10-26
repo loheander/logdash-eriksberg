@@ -43,6 +43,7 @@ Environment variables; CLI flags (`--data`, `--cache`, `--memory-limit`, `--thre
 |---|---|---|
 | `LOGDASH_DATA` | `data` | directory with `*.csv.zst` |
 | `LOGDASH_CACHE` | `cache` | precompute output |
+| `LOGDASH_RUNS` | `runs` | forecasting lab runs and the background-job cache (ignored by version control, safe to delete) |
 | `LOGDASH_MEMORY_LIMIT` | `8GB` | DuckDB memory limit |
 | `LOGDASH_THREADS` | `8` | DuckDB threads |
 | `LOGDASH_BURST_K` | `6` | burst threshold in robust sigmas above the rolling median |
@@ -64,6 +65,8 @@ Only `logdash build` calls the model; `serve` builds every other stale stage but
 
 The **Forecasting** page (`/forecast`) is built by the `forecast` stage (after `hosts`; rebuilt when `LOGDASH_BURST_K` changes). The stage writes `cache/forecast/frame.parquet`, one row per host and minute with the spike label and five feature groups (templates, levels, services, peers, lags), and `meta.json`. The page shows the spike minutes over time with the train, validation and test periods (first 7/12, next 1/12, last 1/3 of the span) and the share of positive samples for 1, 5 and 15 minute horizons. Global filters do not apply. Design: [ADR003](adrs/ADR003-spike-forecasting-lab.md).
 
+Below the charts, **Run** scores the persistence baseline (repeat the last value) on the test period for the chosen horizon in a background job, with a progress bar and Cancel. Each run is saved under `LOGDASH_RUNS` (`runs/<run id>/`); the results table reads it, and the threshold slider changes F1 and accuracy without a rerun. Design: [ADR004](adrs/ADR004-forecast-background-runs.md).
+
 ## Tests
 
 ```bash
@@ -73,7 +76,7 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy src
 ```
 
 The benchmark times every page layout and callback (no filter, one hour, host,
-template, text search, brushing, anomaly types and sorts, template and explorer tag filters, forecast chart) and asserts each is under 300 ms; run it with `-s`
+template, text search, brushing, anomaly types and sorts, template and explorer tag filters, forecast chart and results) and asserts each is under 300 ms; run it with `-s`
 to see the timing table.
 
 ## Building elsewhere
