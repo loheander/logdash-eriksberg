@@ -1,8 +1,10 @@
-# ADR001: Agent-orchestrated SDLC on the project board
+# ADR004: Agent-orchestrated SDLC on the project board
 
 ## Status
 
 proposed
+
+Numbered ADR001 until #58. That number belongs to ADR001-language-model-calls-at-build-time.md, which code cites as ADR001.
 
 ## Context
 

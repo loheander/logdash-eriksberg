@@ -73,7 +73,7 @@ Agents find each other's work by these headings, so keep them exact.
 - The plan of record is the newest `## Implementation plan v<n>` comment. The
   implementer also commits it verbatim as `plans/yyyy-mm-dd-<slug>-v<n>.md` (CLAUDE.md).
 - Architectural decisions that bind other issues go in `adrs/ADR<nnn>-<title>.md`
-  (Status, Context, Decision, Consequences), numbered after the highest existing one.
+  (Status, Context, Decision, Consequences), numbered one after the highest ADR on `origin/main` when you commit it. If `main` gains that number before your PR merges, renumber yours and its citations; `tests/unit/test_adrs.py` fails on duplicate numbers, gaps and citations of missing ADRs.
 - Commit messages: imperative subject ending in `(issue #<n>)`, then the attribution
   lines from the session's system instructions. One logical step per commit; review
   fixes are separate commits, never amended or force-pushed.
