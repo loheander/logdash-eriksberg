@@ -53,27 +53,65 @@ Environment variables; CLI flags (`--data`, `--cache`, `--memory-limit`, `--thre
 | `LOGDASH_PARAM_SAMPLE` | `2000` | payloads sampled per top template |
 | `LOGDASH_RARE_THRESHOLD` | `5` | a template with at most this many events is rare |
 | `LOGDASH_NOVEL_FRACTION` | `0.1` | novel: first seen in the last fraction of the span |
-| `LOGDASH_TAG_MODEL` | `anthropic/claude-haiku-5.5` | OpenRouter model for semantic template tags (it must support structured outputs) |
-| `OPENROUTER_API_KEY` | (unset) | enables the `tags` stage; without it the stage is skipped |
+| `LOGDASH_JEV_MODEL` | `typesafe/jev-1.14` | decision model of the triage page |
+| `LOGDASH_JEV_TIMEOUT_S` | `10` | seconds per attempt of a triage call (one retry at most) |
+| `OPENROUTER_API_KEY` | unset | key for the triage page's live calls; without it the page shows a banner |
 
-Variables can also be set in `.env` in the working directory; the real environment wins.
-Only `logdash build` calls the model; `serve` builds every other stale stage but leaves
-`tags` as it is.
+## Anomaly triage (`/triage`)
 
-## Forecasting lab
+The detectors say how unusual a window is, not whether anyone must act. On `/triage`, a
+click on an anomaly (a grid row or a point in the scatter) sends one request to the Jev
+decision model on OpenRouter (`typesafe/jev-1.14`) and shows the answers in a drawer:
 
-The **Forecasting** page (`/forecast`) is built by the `forecast` stage (after `hosts`; rebuilt when `LOGDASH_BURST_K` changes). The stage writes `cache/forecast/frame.parquet`, one row per host and minute with the spike label and five feature groups (templates, levels, services, peers, lags), and `meta.json`. The page shows the spike minutes over time with the train, validation and test periods (first 7/12, next 1/12, last 1/3 of the span) and the share of positive samples for 1, 5 and 15 minute horizons. Global filters do not apply. Design: [ADR003](adrs/ADR003-spike-forecasting-lab.md).
+- **actionable** and **user impact**: P(yes), with a tick at 0.5;
+- **nature**: `error_fault`, `config`, `load`, `periodic`, `lifecycle`, `noise` or `unclear`;
+- **severity**: 0 (informational) to 4 (critical), as a gauge at the expected level;
+- the confidence of each answer, with a "check" badge when it is below 0.5 or the top two
+  probabilities are within 0.1.
+
+The call is live and not cached: a timer runs while it waits, and the delay is split into
+the state query, the Jev call and the rest (about 0.3 to 0.5 s in all). "ask again" repeats
+the call, and "show raw prompt" opens the exact request (context, item and questions) and
+the response as returned. The questions are a constant in `analyses/triage.py`; the drawer footer shows the
+model and the hash of the spec. The subsystem of a row comes from its service name, not
+from the model.
+
+**What is sent.** Each click sends the row's detector, entity (host names and request ids as
+they are), subsystem, window, evidence, the masked text of up to five templates
+(`<IP>`, `<UUID>`, `<PATH>`) and the line counts per level to OpenRouter and TypeSafe. Raw
+payloads are not sent. A call costs about $0.00008.
+
+Set the key before starting the server:
+
+```bash
+export OPENROUTER_API_KEY=...
+uv run logdash serve
+```
+
+Without the key, the page shows a banner, the grid and scatter still work, and the drawer
+shows the error. Failed calls and unexpected answers are shown as errors, never as defaults.
+
+**Demo script.** Three rows show what the model adds to the detector score:
+
+1. `volume`, `neutron-l3-agent`, score 1.0, "96 episodes in all, repeating about every
+   77 min": the highest score, but *periodic*, not actionable, informational.
+2. `severity`, `barbican-api`, score 0.75, "ERROR burst ... over 112 min": a lower rank,
+   but an *error_fault*, actionable, high severity.
+3. `contextual`, host `eselda12u01s09`, "could not open network device (No such device)":
+   a *config* problem on one host, medium severity.
+
+Switching between them shows the bars and the needle move from one answer to the next.
 
 ## Tests
 
 ```bash
-uv run pytest                      # unit and integration tests, 90 % coverage gate
+uv run pytest                      # unit and integration tests, 90 % coverage gate (no model calls)
 uv run pytest -m slow --no-cov     # latency benchmark on the real ./cache (skipped if absent)
 uv run ruff check . && uv run ruff format --check . && uv run mypy src
 ```
 
 The benchmark times every page layout and callback (no filter, one hour, host,
-template, text search, brushing, anomaly types and sorts, template and explorer tag filters, forecast chart) and asserts each is under 300 ms; run it with `-s`
+template, text search, brushing, anomaly types and sorts, the triage page with a fake model) and asserts each is under 300 ms; run it with `-s`
 to see the timing table.
 
 ## Building elsewhere

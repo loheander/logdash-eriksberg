@@ -15,6 +15,21 @@ from logdash.tagging import openrouter
 from tests.synthetic import GroundTruth, SyntheticSpec, write_dataset
 
 
+@pytest.fixture(autouse=True)
+def no_model_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reaches OpenRouter: the key is unset and any real HTTP request fails.
+
+    Tests of the Jev client and the triage page pass a fake poster or opener instead.
+    """
+    import urllib.request
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a test tried to make a real HTTP request")
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+
+
 @dataclass(frozen=True)
 class SyntheticData:
     data_dir: Path
