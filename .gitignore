@@ -1,5 +1,6 @@
 /data/
 /cache/
+/runs/
 .venv/
 __pycache__/
 *.pyc

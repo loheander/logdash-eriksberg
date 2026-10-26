@@ -10,6 +10,7 @@ from typing import Any
 
 DEFAULT_DATA = "data"
 DEFAULT_CACHE = "cache"
+DEFAULT_RUNS = "runs"
 DEFAULT_MEMORY_LIMIT = "8GB"
 DEFAULT_THREADS = 8
 DEFAULT_BURST_K = 6.0
@@ -42,6 +43,11 @@ def read_dotenv(path: Path) -> dict[str, str]:
     return out
 
 
+def _default_runs_dir() -> Path:
+    """``DEFAULT_RUNS`` read at call time, so tests can point it at a temporary directory."""
+    return Path(DEFAULT_RUNS)
+
+
 @dataclass(frozen=True)
 class Settings:
     """Paths and DuckDB resource limits shared by build and serve."""
@@ -60,6 +66,7 @@ class Settings:
     novel_fraction: float = DEFAULT_NOVEL_FRACTION  # first seen in the last fraction of the span
     tag_model: str = DEFAULT_TAG_MODEL  # OpenRouter model ID for semantic tags
     openrouter_api_key: str | None = field(default=None, repr=False)  # never fingerprinted
+    runs_dir: Path = field(default_factory=_default_runs_dir)  # forecasting lab runs and job cache
 
     def __post_init__(self) -> None:
         if not 0 < self.novel_fraction < 1:
@@ -90,6 +97,7 @@ class Settings:
             novel_fraction=float(env.get("LOGDASH_NOVEL_FRACTION", DEFAULT_NOVEL_FRACTION)),
             tag_model=env.get("LOGDASH_TAG_MODEL") or DEFAULT_TAG_MODEL,
             openrouter_api_key=env.get("OPENROUTER_API_KEY") or None,
+            runs_dir=Path(env.get("LOGDASH_RUNS", DEFAULT_RUNS)),
         )
 
     def with_overrides(self, **overrides: Any) -> Settings:
@@ -99,6 +107,8 @@ class Settings:
             given["data_dir"] = Path(given["data_dir"])
         if "cache_dir" in given:
             given["cache_dir"] = Path(given["cache_dir"])
+        if "runs_dir" in given:
+            given["runs_dir"] = Path(given["runs_dir"])
         return replace(self, **given)
 
     def data_files(self) -> list[Path]:

@@ -7,6 +7,7 @@ Skipped when ``./cache`` has no built events.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import time
 from collections.abc import Callable
@@ -27,6 +28,9 @@ from logdash.app.main import create_app, filter_options
 from logdash.app.tag_filters import TagFilter, load_tags
 from logdash.cache.store import CacheStore
 from logdash.config import Settings
+from logdash.forecast import job as forecast_job
+from logdash.forecast import runs
+from logdash.forecast.params import RunParams
 from logdash.tagging.model import COMPONENTS, Tag
 
 pytestmark = pytest.mark.slow
@@ -332,6 +336,42 @@ def test_forecast(store: CacheStore) -> None:
             CALLBACK_BUDGET_S,
             lambda t=theme: fns["draw_spikes"](t),  # type: ignore[misc]
         )
+
+
+@pytest.fixture(scope="module")
+def forecast_run(
+    store: CacheStore, tmp_path_factory: pytest.TempPathFactory
+) -> tuple[CacheStore, str]:
+    """A store whose runs_dir is temporary, and one real run (job called directly).
+
+    Later forecast benchmarks (#52, #54) reuse it.
+    """
+    runs_dir = tmp_path_factory.mktemp("forecast_runs")
+    run_store = CacheStore(store.root, dataclasses.replace(store.settings, runs_dir=runs_dir))
+    t0 = time.perf_counter()
+    run_id = forecast_job.run_forecast_job(lambda _v: None, run_store, runs_dir, RunParams())
+    results.append(("forecast job", "horizon 5", time.perf_counter() - t0, 0.0))
+    return run_store, run_id
+
+
+def test_forecast_results(forecast_run: tuple[CacheStore, str]) -> None:
+    """The threshold callback on a real run (cold, then warm)."""
+    run_store, run_id = forecast_run
+    fns = _recorded(run_store, "forecast")
+    runs.clear_caches()
+    for threshold in (0.5, 0.25):
+        measure(
+            "forecast.show_results",
+            f"threshold {threshold}",
+            CALLBACK_BUDGET_S,
+            lambda t=threshold: fns["show_results"](run_id, t),  # type: ignore[misc]
+        )
+    measure(
+        "forecast.show_results",
+        "no run",
+        CALLBACK_BUDGET_S,
+        lambda: fns["show_results"](None, 0.5),
+    )
 
 
 ANOMALY_CASES = (

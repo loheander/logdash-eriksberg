@@ -10,24 +10,16 @@ import pytest
 
 from logdash.analyses import BUILTIN, load_builtin
 from logdash.analyses import forecast as fc
-from logdash.analyses.base import REGISTRY, Registry
+from logdash.analyses.base import REGISTRY
 from logdash.analyses.forecast import Forecast, Sources
-from logdash.analyses.hosts import Hosts
-from logdash.analyses.templates import MISSING, Templates
-from logdash.analyses.temporal import Temporal
+from logdash.analyses.templates import MISSING
 from logdash.app import ui
 from logdash.app.main import create_app
-from logdash.build import run_build, stage_statuses
-from logdash.cache.store import CacheStore
-from logdash.config import Settings
+from logdash.build import stage_statuses
 from logdash.detectors import volume
 from logdash.detectors.base import DetectContext
-from tests.conftest import Built, build_with
-from tests.synthetic import SyntheticSpec, utc, write_dataset
+from tests.synthetic import utc
 
-# error_rows=0: the ERROR burst is a host volume spike of its own, and the checks below say that
-# every spike minute belongs to an injected spike
-SPEC = SyntheticSpec(forecast_spikes=24, error_rows=0)
 T0 = datetime(2023, 5, 21)
 
 
@@ -263,18 +255,6 @@ def test_dense_cube_leaves_out_unknown_keys_hosts_and_minutes():
 
 
 # ---------------------------------------------------------------------- synthetic cache
-
-
-@pytest.fixture(scope="module")
-def forecast_cache(tmp_path_factory: pytest.TempPathFactory):
-    """A cache of a dataset of its own: injected spikes with precursors (shared data has none)."""
-    data_dir = tmp_path_factory.mktemp("forecast_data")
-    truth = write_dataset(data_dir / "synthetic_preprocessed.csv.zst", SPEC)
-    settings = Settings(data_dir, tmp_path_factory.mktemp("forecast_cache"), "1GB", 2)
-    run_build(settings, registry=Registry(), log=lambda _: None)
-    built = Built(settings, CacheStore(settings.cache_dir, settings))
-    registry = build_with(built, Temporal(), Templates(), Hosts(), Forecast())
-    return built, registry, truth
 
 
 def naive(t: datetime) -> datetime:
