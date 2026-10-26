@@ -26,6 +26,7 @@ from logdash.app.filters import from_dict
 from logdash.app.main import create_app, filter_options
 from logdash.app.tag_filters import TagFilter, load_tags
 from logdash.cache.store import CacheStore
+from logdash.chat.tools import Toolbox
 from logdash.config import Settings
 from logdash.tagging.model import COMPONENTS, Tag
 
@@ -498,6 +499,37 @@ def test_explorer_tags(store: CacheStore) -> None:
         CALLBACK_BUDGET_S,
         lambda: tag_restriction(store, TagFilter(True, True, ("network", "storage"))),
     )
+
+
+def test_chat_tools(store: CacheStore) -> None:
+    host = next(h for h in store.read_json("temporal", "meta.json")["hosts"] if h != "(missing)")
+    cases: list[tuple[str, str, dict[str, Any]]] = [
+        ("count_events, defaults", "count_events", {}),
+        ("count_events, by host", "count_events", {"group_by": "host"}),
+        (
+            "count_events, ERROR on a host, 60 min",
+            "count_events",
+            {"level": "ERROR", "host": host, "last_minutes": 60},
+        ),
+        (
+            "count_events, template 1 by level, 120 min",
+            "count_events",
+            {"template": 1, "group_by": "level", "last_minutes": 120},
+        ),
+        ("explorer_link, defaults", "explorer_link", {}),
+    ]
+    for case, tool, args in cases:
+
+        def run(tool: str = tool, args: dict[str, Any] = args) -> dict[str, Any]:
+            box = Toolbox(store)
+            try:
+                result = box.call(tool, args)
+            finally:
+                box.close()
+            assert "error" not in result, result
+            return result
+
+        measure("chat.Toolbox.call", case, CALLBACK_BUDGET_S, run)
 
 
 def test_zz_print_table() -> None:
